@@ -5,6 +5,7 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createAccessVerifier } from './access-auth.mjs';
 
 // Development-only bridge: stdio MCP -> stateless Streamable HTTP JSON.
 // No public hostname or Cloudflare route is authorized by this module.
@@ -92,11 +93,20 @@ class Peer {
 }
 
 export async function startGateway(options = {}) {
+  const authMode = options.authMode ?? process.env.VPS_COMMANDER_AUTH_MODE ?? 'local';
   const token = options.token ?? process.env.VPS_COMMANDER_TOKEN;
+  if (authMode !== 'local' && authMode !== 'access') throw Error('Unknown authorization mode');
+  const verifyAccess = authMode === 'access' ? createAccessVerifier({
+    issuer: options.accessIssuer ?? process.env.VPS_COMMANDER_ACCESS_ISSUER,
+    audience: options.accessAudience ?? process.env.VPS_COMMANDER_ACCESS_AUD,
+    allowedEmails: options.allowedEmails ?? process.env.VPS_COMMANDER_ALLOWED_EMAILS,
+    keyProvider: options.accessKeyProvider,
+  }) : null;
   const host = options.host ?? process.env.VPS_COMMANDER_HOST ?? '127.0.0.1';
   const port = Number(options.port ?? process.env.VPS_COMMANDER_PORT ?? 8787);
   const executable = path.resolve(options.executorFile ?? process.env.VPS_COMMANDER_EXECUTOR_FILE ?? DEFAULT_EXECUTOR);
-  if (typeof token !== 'string' || Buffer.byteLength(token) < 32 || Buffer.byteLength(token) > 4096)
+  if (authMode === 'local' &&
+      (typeof token !== 'string' || Buffer.byteLength(token) < 32 || Buffer.byteLength(token) > 4096))
     throw Error('VPS_COMMANDER_TOKEN must contain 32-4096 bytes');
   if (host !== '127.0.0.1' && host !== '::1') throw Error('Loopback bind required');
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw Error('Invalid port');
@@ -107,8 +117,11 @@ export async function startGateway(options = {}) {
     // No browser cross-origin requests. Also do not leak MCP methods without auth.
     if (req.headers.origin) return reply(res, 403, { error: 'Origin forbidden' });
     if (req.url !== '/mcp' && req.url !== '/healthz') return reply(res, 404, { error: 'Not found' });
-    if (!matchesBearer(req.headers.authorization, token)) {
-      res.setHeader('www-authenticate', 'Bearer');
+    const authorized = authMode === 'access'
+      ? await verifyAccess(req.headers['cf-access-jwt-assertion'])
+      : matchesBearer(req.headers.authorization, token);
+    if (!authorized) {
+      if (authMode === 'local') res.setHeader('www-authenticate', 'Bearer');
       return reply(res, 401, { error: 'Unauthorized' });
     }
     if (req.url === '/healthz') return reply(res, peer.dead ? 503 : 200, { status: peer.dead ? 'down' : 'ready' });
