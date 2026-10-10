@@ -21,6 +21,8 @@ test('fail-closed secret and listen host', async () => {
   await assert.rejects(startGateway({token,executorFile:mock,host:'0.0.0.0',port:0}), /Loopback/);
 });
 test('MCP init, tools and auth through HTTP-to-stdio', async () => {
+  // Force the sensitive value into the parent's environment: the child must not inherit it.
+  process.env.VPS_COMMANDER_TOKEN = token;
   const app = await startGateway({token,executorFile:mock,port:0});
   try {
     const bad = await fetch(app.address + '/mcp', {method:'POST',headers:{'content-type':'application/json'},body:'{}'});
@@ -46,5 +48,5 @@ test('MCP init, tools and auth through HTTP-to-stdio', async () => {
     assert.equal(noGet.status,405);
     const health = await fetch(app.address+'/healthz',{headers:{authorization:'Bearer '+token}});
     assert.equal(health.status,200);
-  } finally { await app.close(); }
+  } finally { await app.close(); delete process.env.VPS_COMMANDER_TOKEN; }
 });
