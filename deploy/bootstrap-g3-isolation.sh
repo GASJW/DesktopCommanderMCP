@@ -19,8 +19,11 @@ cd "$BASE"
 /opt/vps-commander/bin/node --check gateway/server.mjs
 /opt/vps-commander/bin/node --check gateway/executor-socket.mjs
 /opt/vps-commander/bin/node --test gateway/test/*.test.mjs deploy/test/*.test.mjs
-groupadd --system vpsc-ipc
-useradd --system --gid vpsc-ipc --home-dir /var/lib/vps-commander-gateway --create-home --shell /usr/sbin/nologin vpsc-gateway
+getent group vpsc-ipc >/dev/null || groupadd --system vpsc-ipc
+if ! id -u vpsc-gateway >/dev/null 2>&1; then
+  useradd --system --gid vpsc-ipc --home-dir /var/lib/vps-commander-gateway --create-home --shell /usr/sbin/nologin vpsc-gateway
+fi
+if [[ "$(id -gn vpsc-gateway)" != "vpsc-ipc" ]]; then echo 'Unexpected gateway primary group'; exit 9; fi
 chmod 0700 /var/lib/vps-commander-gateway
 install -d -m 0700 "$BACKUP"
 install -m 0600 "$GW_UNIT" "$BACKUP/vps-commander.service"
