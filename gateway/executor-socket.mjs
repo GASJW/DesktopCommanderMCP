@@ -24,9 +24,15 @@ export async function startExecutor(options = {}) {
     cwd: options.cwd ?? process.cwd(), shell: false, stdio: ['pipe', 'pipe', 'inherit'], env,
   });
   let closing = false;
-  child.on('error', () => { if (!closing) { process.exitCode = 1; server.close(); } });
-  child.on('exit', () => { if (!closing) { process.exitCode = 1; server.close(); } });
   let current = null;
+  const fail = () => {
+    if (closing) return;
+    process.exitCode = 1;
+    current?.destroy();
+    server.close();
+  };
+  child.on('error', fail);
+  child.on('exit', fail);
   const server = createServer(socket => {
     if (current) { socket.destroy(); return; }
     current = socket;
