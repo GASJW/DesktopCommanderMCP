@@ -1,3 +1,22 @@
+## Git bootstrap incident: single-branch checkout (2026-10-10)
+
+First owner SSH cutover attempt FAILED **before running any G3 bootstrap**.
+The original G1 checkout was cloned with `--single-branch` and tracks only
+`+refs/heads/feat/vps-commander-foundation:refs/remotes/origin/feat/vps-commander-foundation`.
+`git fetch origin` did not fetch `feat/g3-executor-isolation`; therefore `git switch --track origin/feat/g3-executor-isolation` returned `fatal: invalid reference` and the bootstrap path was absent.
+
+Evidence via Commander: remote `ls-remote` confirms branch `feat/g3-executor-isolation` exists at e5f488f195cad49920978866a7913dc43eb77237; existing services `vps-commander.service` and `cloudflared-vps-commander.service` both active; checkout tree clean; worker unit absent. No production migration occurred.
+
+Remedy over owner direct SSH (run in this order):
+```bash
+sudo git -c safe.directory=/opt/vps-commander/code -C /opt/vps-commander/code remote set-branches --add origin feat/g3-executor-isolation
+sudo git -c safe.directory=/opt/vps-commander/code -C /opt/vps-commander/code fetch origin
+sudo git -c safe.directory=/opt/vps-commander/code -C /opt/vps-commander/code switch --track origin/feat/g3-executor-isolation
+sudo bash /opt/vps-commander/code/deploy/bootstrap-g3-isolation.sh
+```
+Do not call the bootstrap if branch switch fails. The script restarts the MCP briefly and should be run only over direct SSH. After bootstrap, certify OAuth tools and secret isolation from this chat.
+
+---
 # G3.1 — Gateway/Executor Isolation (2026-10-10)
 
 ## Current status
