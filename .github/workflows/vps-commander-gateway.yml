@@ -1,0 +1,24 @@
+name: VPS Commander Gateway Tests
+on:
+  pull_request:
+    paths:
+      - 'gateway/**'
+      - '.github/workflows/vps-commander-gateway.yml'
+  push:
+    branches:
+      - 'feat/vps-commander-foundation'
+    paths:
+      - 'gateway/**'
+      - '.github/workflows/vps-commander-gateway.yml'
+permissions:
+  contents: read
+jobs:
+  gateway-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --check gateway/server.mjs
+      - run: node --test gateway/test/gateway.test.mjs
