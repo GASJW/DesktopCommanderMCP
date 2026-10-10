@@ -21,7 +21,7 @@ export async function startExecutor(options = {}) {
   for (const k of Object.keys(env)) if (k.startsWith('VPS_COMMANDER_ACCESS_') ||
       k === 'VPS_COMMANDER_TOKEN' || k === 'VPS_COMMANDER_ALLOWED_EMAILS') delete env[k];
   const child = spawn(process.execPath, [executorFile, '--no-onboarding'], {
-    cwd: path.dirname(executorFile), shell: false, stdio: ['pipe', 'pipe', 'inherit'], env,
+    cwd: options.cwd ?? process.cwd(), shell: false, stdio: ['pipe', 'pipe', 'inherit'], env,
   });
   let closing = false;
   child.on('error', () => { if (!closing) { process.exitCode = 1; server.close(); } });
