@@ -22,5 +22,5 @@ test('audit bootstrap preserves service identity and supports fail-closed rollba
   assert.match(bootstrap,/systemctl show -P User vps-commander.service/);
   assert.match(bootstrap,/journalctl -u vps-commander.service/);
   assert.match(bootstrap,/G3_2_AUDIT_SYSTEMD=BOOTSTRAP_GREEN/);
-  assert.match(bootstrap,/install -m 0644 "\$BACKUP\/vps-commander.service" "\$GW_UNIT"/);
+  assert.match(bootstrap,/install -o root -g root -m 0644 "\$BACKUP\/vps-commander.service" "\$GW_UNIT"/);
 });
