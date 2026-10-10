@@ -32,6 +32,8 @@ test('MCP init, tools and auth through HTTP-to-stdio', async () => {
     assert.equal((await list.json()).result.tools[0].name,'echo');
     const call = await post(app.address,request(3,'tools/call',{name:'echo',arguments:{text:'test passed'}}));
     assert.equal((await call.json()).result.content[0].text,'test passed');
+    const secretCheck = await post(app.address,request(4,'tools/call',{name:'inspect-env',arguments:{}}));
+    assert.equal((await secretCheck.json()).result.content[0].text,'NO_TOKEN');
     const concurrent = await Promise.all(Array.from({length:5},(_,i)=>post(app.address,request(i+10,'tools/call',{name:'echo',arguments:{text:'t'+i}}))));
     for (let i=0;i<5;i++) {
       const response = await concurrent[i].json();
