@@ -23,8 +23,9 @@ export async function startExecutor(options = {}) {
   const child = spawn(process.execPath, [executorFile, '--no-onboarding'], {
     cwd: path.dirname(executorFile), shell: false, stdio: ['pipe', 'pipe', 'inherit'], env,
   });
-  child.on('error', () => { process.exitCode = 1; server.close(); });
-  child.on('exit', () => { process.exitCode = 1; server.close(); });
+  let closing = false;
+  child.on('error', () => { if (!closing) { process.exitCode = 1; server.close(); } });
+  child.on('exit', () => { if (!closing) { process.exitCode = 1; server.close(); } });
   let current = null;
   const server = createServer(socket => {
     if (current) { socket.destroy(); return; }
@@ -46,7 +47,7 @@ export async function startExecutor(options = {}) {
     chmodSync(socketPath, 0o660);
   } catch (error) { child.kill('SIGTERM'); throw error; }
   return { socketPath, close: async () => {
-    current?.destroy(); child.kill('SIGTERM');
+    closing = true; current?.destroy(); child.kill('SIGTERM');
     await new Promise(resolve => server.close(resolve));
     if (existsSync(socketPath) && lstatSync(socketPath).isSocket()) unlinkSync(socketPath);
   } };
