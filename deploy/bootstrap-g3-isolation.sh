@@ -35,7 +35,7 @@ systemctl daemon-reload
 rollback() {
   echo 'G3 cutover failure: restoring gateway unit' >&2
   systemctl stop vps-commander.service || true
-  systemctl stop vps-commander-executor.service || true
+  systemctl disable --now vps-commander-executor.service || true
   install -m 0644 "$BACKUP/vps-commander.service" "$GW_UNIT"
   if test -f "$BACKUP/gateway.env"; then
     install -o vpscommander -g vpscommander -m 0600 "$BACKUP/gateway.env" "$TOKEN"
