@@ -21,6 +21,7 @@ cd "$BASE"
 /opt/vps-commander/bin/node --test gateway/test/*.test.mjs deploy/test/*.test.mjs
 groupadd --system vpsc-ipc
 useradd --system --gid vpsc-ipc --home-dir /var/lib/vps-commander-gateway --create-home --shell /usr/sbin/nologin vpsc-gateway
+chmod 0700 /var/lib/vps-commander-gateway
 install -d -m 0700 "$BACKUP"
 install -m 0600 "$GW_UNIT" "$BACKUP/vps-commander.service"
 if test -f "$TOKEN"; then install -m 0600 "$TOKEN" "$BACKUP/gateway.env"; fi
@@ -38,6 +39,9 @@ rollback() {
   fi
   systemctl daemon-reload
   systemctl restart vps-commander.service || true
+  if ! systemctl is-active --quiet cloudflared-vps-commander.service; then
+    systemctl restart cloudflared-vps-commander.service || true
+  fi
 }
 trap rollback ERR
 systemctl stop vps-commander.service
@@ -52,6 +56,10 @@ for i in {1..40}; do
   sleep 0.25
 done
 test "${status:-000}" = 401
+if ! systemctl is-active --quiet cloudflared-vps-commander.service; then
+  systemctl restart cloudflared-vps-commander.service
+fi
+systemctl is-active --quiet cloudflared-vps-commander.service
 test "$(systemctl show -P User vps-commander.service)" = vpsc-gateway
 test "$(systemctl show -P User vps-commander-executor.service)" = vpscommander
 gw_pid=$(systemctl show -P MainPID vps-commander.service)
