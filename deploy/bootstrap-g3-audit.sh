@@ -52,7 +52,7 @@ fi
 systemctl is-active --quiet cloudflared-vps-commander.service
 audit_found=0
 for i in {1..10}; do
-  if journalctl -u vps-commander.service --since "$stamp" -o cat --no-pager | grep -Fq '"event":"vps_commander_audit"'; then
+  if journalctl -u vps-commander.service --since "$stamp" -o cat --no-pager | grep -F '"event":"vps_commander_audit"' >/dev/null; then
     audit_found=1; break
   fi
   sleep 0.2
