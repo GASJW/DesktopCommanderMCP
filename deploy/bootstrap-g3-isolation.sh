@@ -69,6 +69,9 @@ gw_pid=$(systemctl show -P MainPID vps-commander.service)
 if runuser -u vpscommander -- test -r "/proc/$gw_pid/environ"; then
   echo 'G3 FAIL: executor can read gateway process environment' >&2; false
 fi
+if runuser -u vpscommander -- test -r /var/lib/vps-commander-gateway; then
+  echo 'G3 FAIL: executor can read gateway private home' >&2; false
+fi
 # Legacy bearer file is no longer consumed in Access mode; preserve root-only rollback copy.
 if test -f "$TOKEN"; then rm -- "$TOKEN"; fi
 trap - ERR
