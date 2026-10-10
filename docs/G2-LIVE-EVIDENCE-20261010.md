@@ -1,3 +1,20 @@
+# G2 follow-up — Publicação controlada e smoke público (2026-10-10)
+
+**Status atual: G2 EDGE/DNS GREEN, OAuth real de proprietário PENDENTE.** O estado abaixo substitui as condições de "túnel inactive" e "sem DNS" que eram verdadeiras nas fases anteriores deste registro; essas fases são preservadas como histórico cronológico.
+
+- Bootstrap por SSH executado pelo proprietário: `cloudflared-vps-commander.service` **active (running)** com `cloudflared --no-autoupdate tunnel run --token-file /etc/cloudflared/vps-commander-private/token`. Logs mostraram `Registered tunnel connection` (QUIC, GRU) e carregamento da configuração ingress com Access requerido.
+- API Cloudflare confirmou o túnel `vps-commander` **healthy, 4 conexões**; `cofre` independente também **healthy**.
+- Após confirmar origin `vps-commander.service` ativo (somente `127.0.0.1:8787`), GET anônimo de `/healthz` e `/mcp` locais = 401; JWT local falsificado = 401.
+- Foi criado somente o registro DNS `commander.supercerebro.me` do tipo CNAME, `proxied=true`, conteúdo `9a11c3d5-cc76-4427-a6d6-b85722f0e4db.cfargotunnel.com`. Registro ID `ce7134e6bf3715589925528fea8fd158`. Nenhum outro DNS alterado.
+- HTTP **externo**, via `curl` na VPS: GET `https://commander.supercerebro.me/mcp` = 401; POST JSON `tools/list` sem credencial = 401; POST com bearer inválido = 401; GET `/healthz` = 401.
+- OAuth metadata do Cloudflare Access: GET `/.well-known/oauth-protected-resource` e `/.well-known/oauth-authorization-server` = 200; `/.well-known/oauth-protected-resource/mcp` e `/.well-known/cloudflare-access-protected-resource/mcp` também = 200. O challenge de `/mcp` inclui `WWW-Authenticate: Bearer` apontando para o metadata de recurso. O servidor de autorização anuncia `registration_endpoint`, `S256` PKCE e authorization code.
+- Nota operacional: `curl` com User-Agent `Python-urllib/3.12` recebe 403 de borda, enquanto User-Agents `ModelContextProtocol/1.0` e `ChatGPT` recebem discovery 200 e `/mcp` 401; não foi realizado teste de handshake real usando cliente ChatGPT.
+- Cloudflare Access Managed OAuth `enabled=true`, política única `VPS Commander Owner Only` com email específico, nenhuma política `everyone`.
+- **G2 não completamente certificado**: falta fluxo real OAuth de usuário autorizado e `tools/list` pela conexão do ChatGPT; seguir sem antecipar PASS. O endpoint não retorna ferramentas sem login.
+- PR #1 permanece Draft; não mexer nos demais serviços (Pantheon, Hermes, OpenMausBot) ou no túnel `cofre`.
+
+---
+
 # G2 — Cloudflare Managed OAuth + origem JWT (10/10/2026)
 
 ## Estado: G2 PARTIAL / BLOQUEADO NO BOOTSTRAP DO CONECTOR
