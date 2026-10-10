@@ -59,18 +59,18 @@ export function createAccessVerifier(options = {}) {
     return cache;
   }
 
-  return async function verifyAccess(assertion) {
+  async function verifyPrincipal(assertion) {
     if (typeof assertion !== 'string' || assertion.length < 30 || assertion.length > MAX_JWT_LENGTH)
-      return false;
+      return null;
     const segments = assertion.split('.');
-    if (segments.length !== 3) return false;
+    if (segments.length !== 3) return null;
     try {
       const [h, p, s] = segments;
       const header = segmentJson(h);
       if (!header || header.alg !== 'RS256' || typeof header.kid !== 'string' ||
-          header.kid.length === 0 || header.kid.length >= 256) return false;
+          header.kid.length === 0 || header.kid.length >= 256) return null;
       const payload = segmentJson(p);
-      if (!payload || typeof payload !== 'object') return false;
+      if (!payload || typeof payload !== 'object') return null;
       const now = Math.floor(Date.now() / 1000);
       if (payload.iss !== c.issuer ||
           !(payload.aud === c.audience || (Array.isArray(payload.aud) && payload.aud.includes(c.audience))) ||
@@ -78,20 +78,24 @@ export function createAccessVerifier(options = {}) {
           !Number.isInteger(payload.iat) || payload.iat > now + ALLOW_CLOCK_SKEW ||
           (payload.nbf != null && (!Number.isInteger(payload.nbf) || payload.nbf > now + ALLOW_CLOCK_SKEW)) ||
           typeof payload.email !== 'string' || !c.emails.has(payload.email.toLowerCase()) ||
-          typeof payload.sub !== 'string' || payload.sub.length < 1) return false;
+          typeof payload.sub !== 'string' || payload.sub.length < 1) return null;
       let keys = await getKeys();
       let jwk = keys.find(k => k.kid === header.kid);
       if (!jwk) {
         keys = await getKeys(true);
         jwk = keys.find(k => k.kid === header.kid);
       }
-      if (!jwk) return false;
+      if (!jwk) return null;
       const signature = Buffer.from(s, 'base64url');
-      if (signature.toString('base64url') !== s) return false;
-      return verifySignature('RSA-SHA256', Buffer.from(h + '.' + p),
+      if (signature.toString('base64url') !== s) return null;
+      const verified = verifySignature('RSA-SHA256', Buffer.from(h + '.' + p),
         createPublicKey({ key: jwk, format: 'jwk' }), signature);
+      return verified ? { issuer: c.issuer, subject: payload.sub } : null;
     } catch {
-      return false; // Every parsing, network, signature and clock failure denies access.
+      return null; // Every parsing, network, signature and clock failure denies access.
     }
-  };
+  }
+  const verifyAccess = async assertion => Boolean(await verifyPrincipal(assertion));
+  verifyAccess.verifyPrincipal = verifyPrincipal;
+  return verifyAccess;
 }
