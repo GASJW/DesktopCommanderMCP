@@ -121,7 +121,9 @@ export async function startGateway(options = {}) {
   const host = options.host ?? process.env.VPS_COMMANDER_HOST ?? '127.0.0.1';
   const port = Number(options.port ?? process.env.VPS_COMMANDER_PORT ?? 8787);
   const executable = path.resolve(options.executorFile ?? process.env.VPS_COMMANDER_EXECUTOR_FILE ?? DEFAULT_EXECUTOR);
-  const executorSocket = options.executorSocket ?? process.env.VPS_COMMANDER_EXECUTOR_SOCKET ?? null;
+  // Explicit test executor takes precedence over a production socket inherited from the environment.
+  const executorSocket = options.executorSocket !== undefined
+    ? options.executorSocket : (options.executorFile ? null : process.env.VPS_COMMANDER_EXECUTOR_SOCKET ?? null);
   if (executorSocket && (!path.isAbsolute(executorSocket) || executorSocket.length > 105)) throw Error('Invalid executor socket path');
   if (authMode === 'local' &&
       (typeof token !== 'string' || Buffer.byteLength(token) < 32 || Buffer.byteLength(token) > 4096))
