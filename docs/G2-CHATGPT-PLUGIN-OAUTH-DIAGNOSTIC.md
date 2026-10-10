@@ -1,3 +1,23 @@
+# Atualização — causa de DCR identificada e ajuste Cloudflare (10/10/2026)
+
+Os prints do assistente de plugins comprovaram que o ChatGPT já detectava **DCR** como método de registro, sem suporte CIMD; Authorization URL, Token URL, Registration URL, issuer e `resource=https://commander.supercerebro.me/mcp` estavam preenchidos corretamente; escopos padrão não anunciados e OIDC opcional não habilitado. **A orientação anterior de selecionar DCR como remediação era insuficiente: DCR já estava selecionado.**
+
+Consulta da aplicação Access `VPS Commander MCP`: `oauth_configuration.dynamic_client_registration.enabled=true`, `allow_any_on_localhost=true`, `allow_any_on_loopback=true`, mas **`allowed_uris` ausente**. A documentação Cloudflare exige allowlist para callbacks HTTPS externos no DCR; a documentação oficial OpenAI apresenta `https://chatgpt.com/connector/oauth/{callback_id}` (callback específico) e `https://chatgpt.com/connector_platform_oauth_redirect` (estável).
+
+**Mutação mínima aplicada apenas à aplicação Access do VPS Commander:** `oauth_configuration.dynamic_client_registration.allowed_uris` recebeu exatamente:
+- `https://chatgpt.com/connector/oauth/*`
+- `https://chatgpt.com/connector_platform_oauth_redirect`
+
+A API confirmou essas duas entradas; issuer, domínio, audience, sessão e a única política restrita ao proprietário foram preservados. Nenhuma política de autenticação foi enfraquecida; túnel e origin não alterados. A causa ainda depende de comprovação end-to-end ao pressionar "Criar como plugin" novamente: não afirmar sucesso antes disso.
+
+**Próxima ação do usuário:** manter conexão URL do servidor `https://commander.supercerebro.me/mcp`, autenticação OAuth, método DCR, escopos básicos vazios, OIDC desabilitado. Repetir criação do plugin. Se falhar, capturar HTTP status/código de erro sanitizado do request do ChatGPT, sem cookies nem tokens.
+
+Fontes:
+- https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/managed-oauth/
+- https://developers.openai.com/plugins/build/auth
+
+---
+
 # G2 — Diagnóstico de cadastro do plugin ChatGPT (2026-10-10)
 
 ## Sintoma
