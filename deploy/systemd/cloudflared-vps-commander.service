@@ -1,0 +1,28 @@
+[Unit]
+Description=Dedicated Cloudflare Tunnel for VPS Commander MCP
+After=network-online.target vps-commander.service
+Wants=network-online.target
+Requires=vps-commander.service
+
+[Service]
+Type=notify
+User=vpscommander-tunnel
+Group=vpscommander-tunnel
+ExecStart=/usr/local/bin/cloudflared --no-autoupdate tunnel --token-file /etc/cloudflared/vps-commander-private/token run
+Restart=on-failure
+RestartSec=8s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+TasksMax=96
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
