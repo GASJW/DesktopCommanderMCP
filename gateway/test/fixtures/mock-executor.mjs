@@ -9,6 +9,6 @@ for await (const line of createInterface({ input: process.stdin })) {
   else if (request.method === 'tools/list')
     result = { tools: [{ name: 'echo', description: 'Deterministic mock', inputSchema: { type: 'object', properties: { text: { type: 'string' } } } }] };
   else if (request.method === 'tools/call')
-    result = { content: [{ type: 'text', text: String(request.params?.arguments?.text ?? '') }] };
+    result = { content: [{ type: 'text', text: request.params?.name === 'inspect-env' ? String(process.env.VPS_COMMANDER_TOKEN ?? 'NO_TOKEN') : String(request.params?.arguments?.text ?? '') }] };
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\n');
 }
