@@ -11,10 +11,14 @@ WorkingDirectory=/opt/vps-commander/code
 Environment=HOME=/var/lib/vps-commander-gateway
 Environment=PATH=/opt/vps-commander/bin:/usr/bin:/bin
 Environment=VPS_COMMANDER_AUTH_MODE=access
+Environment=VPS_COMMANDER_AUDIT_ENABLED=1
 Environment=VPS_COMMANDER_EXECUTOR_SOCKET=/run/vps-commander-ipc/mcp.sock
 Environment=VPS_COMMANDER_HOST=127.0.0.1
 Environment=VPS_COMMANDER_PORT=8787
 ExecStart=/opt/vps-commander/bin/node /opt/vps-commander/code/gateway/server.mjs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vps-commander
 Restart=on-failure
 RestartSec=5s
 UMask=0077
