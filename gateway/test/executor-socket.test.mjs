@@ -21,7 +21,7 @@ test('isolated executor over Unix socket preserves MCP and strips gateway secret
   try {
     worker = await startExecutor({ socketPath: sock, executorFile: fixture });
     assert.equal(statSync(sock).mode & 0o777, 0o660);
-    gateway = await startGateway({executorSocket:sock, token, port:0});
+    gateway = await startGateway({executorSocket:sock, authMode:'local', token, port:0});
     const post = async (id, method, params={}) => {
       const res=await fetch(gateway.address+'/mcp',{method:'POST',
         headers:{authorization:'Bearer '+token,'content-type':'application/json'},
