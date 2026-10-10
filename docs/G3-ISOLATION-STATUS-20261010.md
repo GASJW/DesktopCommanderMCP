@@ -1,3 +1,31 @@
+# G3.1 — CERTIFICAÇÃO LIVE GREEN (2026-10-10)
+
+**Estado operacional atual: G3.1 GREEN para isolamento dos dois serviços e smoke MCP autenticado.** As seções históricas abaixo descrevem os estados anteriores ao cutover e não devem ser interpretadas como status atuais.
+
+## Evidência do bootstrap efetuado pelo owner via SSH
+- `git fetch` corrigido incluindo a branch G3 no refspec; `switch --track origin/feat/g3-executor-isolation` feito; 11/11 testes no bootstrap PASS.
+- Bootstrap reportado: `G3_EXECUTOR_ISOLATION=BOOTSTRAP_GREEN`; unidades systemd criadas/reiniciadas e verificadas.
+- Inspeção posterior **pelo próprio plugin ChatGPT Commander**: `vps-commander.service` active com `User=vpsc-gateway`; `vps-commander-executor.service` active com `User=vpscommander`.
+- `cloudflared-vps-commander.service` e `cloudflared.service` ativos na VPS. API Cloudflare confirmou **vps-commander healthy (4 conexões)** e **cofre healthy (4 conexões)**.
+- IPC: `/run/vps-commander-ipc/mcp.sock` é socket Unix, proprietário `vpscommander`, grupo `vpsc-ipc`, permissões `0660`.
+- Shell remoto autenticado via plugin: `id` retornou UID 994 `vpscommander` e GID `vpsc-ipc`; `G3_REAL_CHATGPT_TERMINAL_GREEN` executou com sucesso.
+- Falha original corrigida (checagem de permissões sem ler credenciais):
+  - `test -r /proc/<gateway-main-pid>/environ` executado pelo plugin como `vpscommander`: **DENIED**.
+  - `test -r /var/lib/vps-commander-gateway`: **DENIED**.
+  - `test -r /var/lib/vps-commander/.config/vps-commander/gateway.env`: **DENIED** (arquivo removido no bootstrap, com cópia rollback root-only segundo script).
+- `read_file /etc/os-release`: PASS (Ubuntu 24.04.4 LTS).
+- `write_file` em `/var/lib/vps-commander/workspace/g3-chatgpt-e2e-20261010.txt`: PASS; leitura de volta comprovou `G3_1_E2E_WRITE_GREEN` e `TRANSPORT=CHATGPT_CUSTOM_MCP`.
+- A utilização do plugin com essas chamadas comprova fluxo autenticado ChatGPT → Cloudflare Access → gateway → Unix socket → executor.
+- Uma checagem suplementar contendo vários comandos em um único `start_process` foi bloqueada por configurações da plataforma OpenAI; não houve tentativa de contorná-la. Isso não invalidou as checagens individuais anteriores.
+
+## Limites do aceite
+- G3.1 certifica isolamento de identidades e os caminhos sensíveis **efetivamente testados**; não prova segurança absoluta nem elimina ataques possíveis através de ferramentas do sistema ou permissões futuras.
+- Ainda não fizemos os gates de auditoria de comandos (G3.2), resiliência/failover (G3.3), limites e contenção (G3.4), e testes de autorização abrangentes (G3.5).
+- **PR #2 continua Draft** até revisão governada e decisão de integração. G2 PR #1 permanece separado.
+- Pantheon, Hermes, OpenMausBot, políticas e DNS existentes não foram alterados por esse cutover.
+
+---
+
 ## Git bootstrap incident: single-branch checkout (2026-10-10)
 
 First owner SSH cutover attempt FAILED **before running any G3 bootstrap**.
@@ -20,7 +48,7 @@ Do not call the bootstrap if branch switch fails. The script restarts the MCP br
 # G3.1 — Gateway/Executor Isolation (2026-10-10)
 
 ## Current status
-**RED observed in current G2 production, implementation GREEN in tests, G3.1 not deployed.**
+**Histórico pré-cutover:** RED observado no G2, implementação candidata GREEN, G3.1 ainda não implantado naquele momento.
 Tests and candidate code must not be confused with OS-level isolation certification.
 
 ## Problem (real, read-only)
