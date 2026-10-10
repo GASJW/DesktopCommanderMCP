@@ -24,5 +24,8 @@ jobs:
           node-version: '22'
       - run: node --check gateway/server.mjs
       - run: node --check gateway/access-auth.mjs
+      - run: node --check gateway/audit.mjs
+      - run: node --check deploy/manual-smoke-g3-audit.mjs
       - run: node --test gateway/test/*.test.mjs deploy/test/*.test.mjs
       - run: bash -n deploy/bootstrap-g3-isolation.sh
+      - run: bash -n deploy/bootstrap-g3-audit.sh
