@@ -46,3 +46,13 @@ Cloudflare Tunnel / Zero Trust Free podem ser usados sem custo incremental nos l
 - https://github.com/wonderwhy-er/DesktopCommanderMCP/blob/main/SECURITY.md
 - https://developers.cloudflare.com/tunnel/
 - https://developers.cloudflare.com/cloudflare-one/access-controls/ai-controls/secure-mcp-servers/
+
+## Progresso de implementação 2026-10-10
+- Gateway MCP HTTP para executor stdio implementado em `gateway/server.mjs`, bind forçado a loopback e autenticação bearer obrigatória.
+- Testes isolados versionados em `gateway/test/gateway.test.mjs` com mock em `gateway/test/fixtures/mock-executor.mjs`.
+- GitHub Actions: `VPS Commander Gateway Tests` GREEN em https://github.com/GASJW/DesktopCommanderMCP/actions/runs/38087630397 (teste com simulação, não VPS real).
+- Guia local: `gateway/README.md`.
+- DNS `commander.supercerebro.me`: sem registro existente na verificação, permanece NÃO CRIADO.
+- Bloqueador crítico: o bearer estático do protótipo não é OAuth Access. Adicionar Managed OAuth para aplicativo MCP + validar JWT Cloudflare no origin (assinatura JWKS, emissor, audiência, expiração), conforme https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/managed-oauth/ .
+- Nenhuma instalação ou mutação na VPS e nenhuma chamada RDC realizada nesta etapa.
+- PR continua Draft. Não publicar hostname/serviço antes de falha fechada com testes reais de autorização.
