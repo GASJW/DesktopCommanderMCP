@@ -1,0 +1,37 @@
+[Unit]
+Description=VPS Commander authenticated HTTP gateway (isolated)
+Requires=vps-commander-executor.service
+After=network.target vps-commander-executor.service
+
+[Service]
+Type=simple
+User=vpsc-gateway
+Group=vpsc-ipc
+WorkingDirectory=/opt/vps-commander/code
+Environment=HOME=/var/lib/vps-commander-gateway
+Environment=PATH=/opt/vps-commander/bin:/usr/bin:/bin
+Environment=VPS_COMMANDER_AUTH_MODE=access
+Environment=VPS_COMMANDER_EXECUTOR_SOCKET=/run/vps-commander-ipc/mcp.sock
+Environment=VPS_COMMANDER_HOST=127.0.0.1
+Environment=VPS_COMMANDER_PORT=8787
+ExecStart=/opt/vps-commander/bin/node /opt/vps-commander/code/gateway/server.mjs
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+InaccessiblePaths=/var/lib/vps-commander
+CapabilityBoundingSet=
+AmbientCapabilities=
+TasksMax=64
+MemoryMax=250M
+
+[Install]
+WantedBy=multi-user.target
