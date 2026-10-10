@@ -31,7 +31,7 @@ class Peer {
   constructor(file) { this.file = file; this.pending = new Map(); this.sequence = 0; this.dead = false; }
   async start() {
     // Do not hand the gateway's authentication secret to the executor shell.
-    const childEnv = { ...process.env, DC_REMOTE_DEVICE: 'true' };
+    const childEnv = { ...process.env, DC_REMOTE_DEVICE: 'true', VPS_COMMANDER_DISABLE_BROWSER_INIT: '1' };
     delete childEnv.VPS_COMMANDER_TOKEN;
     this.child = spawn(process.execPath, [this.file, '--no-onboarding'], {
       shell: false, cwd: path.dirname(this.file), stdio: ['pipe', 'pipe', 'inherit'],
