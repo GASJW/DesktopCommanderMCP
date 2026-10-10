@@ -19,8 +19,12 @@ chown root:"$USER_NAME" "$(dirname "$TOKEN")" "$TOKEN"
 chmod 0750 "$(dirname "$TOKEN")"
 chmod 0640 "$TOKEN"
 install -o root -g root -m 0644 "$BASE/deploy/systemd/$UNIT" "/etc/systemd/system/$UNIT"
+systemd-analyze verify "/etc/systemd/system/$UNIT"
 systemctl daemon-reload
-systemctl enable --now "$UNIT"
+systemctl enable "$UNIT"
+# Also repairs an existing failed or auto-restarting instance after unit upgrades.
+systemctl reset-failed "$UNIT" || true
+systemctl restart "$UNIT"
 test "$(systemctl is-active "$UNIT")" = active || { echo 'Tunnel service failed: do not create DNS' >&2; exit 8; }
 echo G2_TUNNEL_SYSTEMD=ACTIVE
 echo MCP_ORIGIN=127.0.0.1:8787
