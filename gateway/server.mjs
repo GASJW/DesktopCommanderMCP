@@ -30,9 +30,12 @@ function fault(id, code, message) {
 class Peer {
   constructor(file) { this.file = file; this.pending = new Map(); this.sequence = 0; this.dead = false; }
   async start() {
+    // Do not hand the gateway's authentication secret to the executor shell.
+    const childEnv = { ...process.env, DC_REMOTE_DEVICE: 'true' };
+    delete childEnv.VPS_COMMANDER_TOKEN;
     this.child = spawn(process.execPath, [this.file, '--no-onboarding'], {
       shell: false, cwd: path.dirname(this.file), stdio: ['pipe', 'pipe', 'inherit'],
-      env: { ...process.env, DC_REMOTE_DEVICE: 'true' },
+      env: childEnv,
     });
     this.child.on('exit', () => this.fail());
     this.child.on('error', () => this.fail());
