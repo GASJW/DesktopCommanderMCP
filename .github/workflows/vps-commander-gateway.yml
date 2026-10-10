@@ -3,12 +3,14 @@ on:
   pull_request:
     paths:
       - 'gateway/**'
+      - 'deploy/**'
       - '.github/workflows/vps-commander-gateway.yml'
   push:
     branches:
       - 'feat/vps-commander-foundation'
     paths:
       - 'gateway/**'
+      - 'deploy/**'
       - '.github/workflows/vps-commander-gateway.yml'
 permissions:
   contents: read
@@ -21,4 +23,5 @@ jobs:
         with:
           node-version: '22'
       - run: node --check gateway/server.mjs
-      - run: node --test gateway/test/gateway.test.mjs
+      - run: node --check gateway/access-auth.mjs
+      - run: node --test gateway/test/*.test.mjs deploy/test/*.test.mjs
