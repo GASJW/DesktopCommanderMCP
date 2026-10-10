@@ -17,13 +17,13 @@ test('fail-closed secret and listen host', async () => {
   assert.equal(matchesBearer('Bearer '+token, token), true);
   assert.equal(matchesBearer('Bearer invalid', token), false);
   assert.equal(matchesBearer(undefined, token), false);
-  await assert.rejects(startGateway({token:'short',executorFile:mock,port:0}), /32-4096/);
-  await assert.rejects(startGateway({token,executorFile:mock,host:'0.0.0.0',port:0}), /Loopback/);
+  await assert.rejects(startGateway({authMode:'local',token:'short',executorFile:mock,port:0}), /32-4096/);
+  await assert.rejects(startGateway({authMode:'local',token,executorFile:mock,host:'0.0.0.0',port:0}), /Loopback/);
 });
 test('MCP init, tools and auth through HTTP-to-stdio', async () => {
   // Force the sensitive value into the parent's environment: the child must not inherit it.
   process.env.VPS_COMMANDER_TOKEN = token;
-  const app = await startGateway({token,executorFile:mock,port:0});
+  const app = await startGateway({authMode:'local',token,executorFile:mock,port:0});
   try {
     const bad = await fetch(app.address + '/mcp', {method:'POST',headers:{'content-type':'application/json'},body:'{}'});
     assert.equal(bad.status,401);
