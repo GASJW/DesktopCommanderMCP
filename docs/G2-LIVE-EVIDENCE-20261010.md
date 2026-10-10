@@ -48,3 +48,15 @@ Este documento registra estado OBSERVADO. Não usar "GREEN" como sinônimo de ac
 - Os artefatos Git permanecem na branch de trabalho; PR #1 deve continuar Draft até certificação G2 completa.
 
 Fontes: https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/managed-oauth/ e https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/validating-json/ .
+
+## Incidente G2 — primeiro bootstrap do conector falhou (10/10/2026)
+
+O operador executou por SSH o script `deploy/bootstrap-g2-tunnel.sh`. Criou a unidade `cloudflared-vps-commander.service`, mas o `systemd` reportou `Result: protocol`. A observação em `systemctl status` e `journalctl` mostrou:
+
+- `Type=notify`; `ExecStart` encerrava com `status=0/SUCCESS` quase imediatamente.
+- A saída do `cloudflared` era a **tela completa de help** (opções de `tunnel run`), não uma tentativa de conexão.
+- Causa: `--token-file` tinha sido passado como `cloudflared tunnel --token-file PATH run`; a posição correta é `cloudflared tunnel run --token-file PATH`.
+- **Correção versionada:** unit `deploy/systemd/cloudflared-vps-commander.service` com a ordem corrigida; bootstrap agora faz `systemd-analyze verify` e `systemctl restart` explicitamente em reexecuções.
+- Testes regressivos de sintaxe/configuração em `deploy/test/tunnel-unit.test.mjs` e workflow CI ampliado para `gateway/test/*.test.mjs` + `deploy/test/*.test.mjs`.
+
+A correção ainda **não foi instalada nem validada após o primeiro bootstrap falho**. Operador deve usar SSH e reexecutar o script corrigido após `git pull`; só depois observar `active/healthy` e considerar DNS. O túnel `cofre` permanece independente.
