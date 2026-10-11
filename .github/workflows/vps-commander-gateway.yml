@@ -29,3 +29,5 @@ jobs:
       - run: node --test gateway/test/*.test.mjs deploy/test/*.test.mjs
       - run: bash -n deploy/bootstrap-g3-isolation.sh
       - run: bash -n deploy/bootstrap-g3-audit.sh
+      - run: bash -n deploy/bootstrap-g3-recovery.sh
+      - run: node --check deploy/manual-smoke-g3-recovery.mjs
