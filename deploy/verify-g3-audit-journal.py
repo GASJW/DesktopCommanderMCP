@@ -43,9 +43,9 @@ for line in sys.stdin:
         if not (re.fullmatch(r'cf_[a-f0-9]{24}', entry['identity']) or
                 entry['identity'] in ('anonymous', 'local-authenticated')):
             raise ValueError('bad identity')
-        if entry['route'] not in ALLOWED_ROUTES or
+        if (entry['route'] not in ALLOWED_ROUTES or
                 entry['http_method'] not in ('GET', 'POST', 'OPTIONS', 'HEAD', 'DELETE', 'other') or
-                entry['outcome'] not in ALLOWED_OUTCOMES:
+                entry['outcome'] not in ALLOWED_OUTCOMES):
             raise ValueError('bad metadata')
         if not isinstance(entry['operation'], str) or len(entry['operation']) > 60:
             raise ValueError('bad operation')
