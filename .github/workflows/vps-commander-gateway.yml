@@ -1,17 +1,11 @@
 name: VPS Commander Gateway Tests
+# Both checks are required by main branch protection. Do not path-filter PR
+# events, otherwise docs-only PRs are permanently stuck with a missing check.
 on:
   pull_request:
-    paths:
-      - 'gateway/**'
-      - 'deploy/**'
-      - '.github/workflows/vps-commander-gateway.yml'
   push:
     branches:
-      - 'feat/vps-commander-foundation'
-    paths:
-      - 'gateway/**'
-      - 'deploy/**'
-      - '.github/workflows/vps-commander-gateway.yml'
+      - main
 permissions:
   contents: read
 jobs:
