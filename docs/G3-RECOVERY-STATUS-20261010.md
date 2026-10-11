@@ -1,3 +1,47 @@
+# G3.3 — CERTIFICAÇÃO LIVE DEFINITIVA GREEN (10/10/2026 local / 11/10 UTC)
+
+**Estado operacional atual: G3.3 GREEN para recuperação automática após queda do executor systemd, sem restart do gateway.** Os estados RED e pendentes abaixo são históricos e foram superados pelo reparo `Requires → Wants` e pela repetição bem-sucedida do ensaio.
+
+## Evidência do ensaio real governado via SSH root
+
+O proprietário executou `sudo bash /opt/vps-commander/code/deploy/verify-g3-systemd-recovery.sh --accept-controlled-executor-restart`, e o script retornou:
+
+```text
+G3_3_DRILL_START=CONTROLLED_SINGLE_EXECUTOR_MAIN_SIGKILL
+G3_3_RECOVERY_EVENTS=6
+G3_3_PHASE_DISCONNECTED=PASS
+G3_3_PHASE_RETRY_SCHEDULED=PASS
+G3_3_PHASE_RECONNECTED=PASS
+G3_3_RECOVERY_SCHEMA_VIOLATIONS=0
+G3_3_SYSTEMD_RECOVERY_EVENTS=GREEN
+G3_3_GATEWAY_PID_UNCHANGED=PASS
+G3_3_EXECUTOR_PID_ROTATED=PASS
+G3_3_BOTH_TUNNELS_ACTIVE=PASS
+G3_3_REAL_SYSTEMD_DRILL=GREEN
+```
+
+O script gerou uma falha apenas no processo principal do executor. A telemetria `vps_commander_recovery` registrou desconexão, tentativa e reconexão sem apresentar payloads ou tokens. O script confirmou PID estável no gateway, rotação no executor, e ambos os túneis ativos.
+
+## Verificação independente após o ensaio, via plugin ChatGPT Commander (sem RDC)
+
+- `G3_3_POST_DRILL_REAL_CHATGPT=GREEN`, `HOST=gui`, `USER=vpscommander` e branch `feat/g3-recovery`.
+- Serviço gateway `vps-commander.service=active`, `User=vpsc-gateway`, **MainPID=1617612** (preservado).
+- Serviço executor `vps-commander-executor.service=active`, **MainPID=1650485** (reiniciado).
+- `cloudflared-vps-commander.service=active`, `cloudflared.service=active`.
+- `VPS_COMMANDER_AUDIT_ENABLED=1` confirmado.
+- `Wants=vps-commander-executor.service` no gateway; `Requires` forte removida no hotfix prévio.
+- MCP real autenticado: `start_process` PASS, `read_file /etc/os-release` PASS, `write_file` e read-back em `/var/lib/vps-commander/workspace/g3-recovery-live-acceptance-20261010.txt` PASS (`G3_3_LIVE_POST_DRILL_FILE_GREEN`).
+- Acesso não autorizado: `GET /healthz` local sem JWT = HTTP 401.
+- API Cloudflare: túneis **vps-commander healthy** (4 conexões) e **cofre healthy** (4 conexões).
+
+## Escopo da certificação
+
+GREEN demonstra recuperação do gateway sem reiniciar após a queda controlada do processo principal do executor, rastreabilidade dos três eventos de transição, preservação do tráfego autenticado e dos dois túneis. Não comprova reboot completo da VPS, falhas de rede prolongadas, falha permanente do gateway, nem idempotência de comandos que estavam em andamento na queda. Operações com efeitos colaterais não são repetidas automaticamente (safety). Esses cenários ficam fora do aceite específico e devem ser cobertos por gates posteriores.
+
+**Governança:** PR #4 permanece Draft até revisão e integração protegida. Não houve alteração de DNS, Cloudflare Access, túnel cofre, Pantheon, Hermes ou OpenMausBot no ensaio. Próximo marco proposto: G3.4 limites operacionais, contenção e controle de concorrência.
+
+---
+
 # G3.3 — HOTFIX SYSTEMD APLICADO E VERIFICADO (2026-10-10 local / 2026-10-11 UTC)
 
 **Estado atual:** correção da dependência gateway→executor **GREEN** em produção; G3.3 recuperação após falha real ainda **PENDENTE** de repetição do drill com a nova dependência.
