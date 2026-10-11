@@ -1,3 +1,41 @@
+# G4 — PUBLICAÇÃO DOS PRs #1–#6 CONCLUÍDA (2026-10-10 local / 2026-10-11 UTC)
+
+**Estado novo, prevalece sobre a auditoria inicial abaixo:** main está PROTECTED e os seis PRs de G1/G2 e G3.1–G3.5 foram integrados por MERGE COMMITS, sem bypass de checks e sem redeploy da VPS. O texto abaixo sobre `main` desprotegida e PRs em Draft registra exclusivamente o estágio anterior.
+
+## Proteção administrativa comprovada
+- Executado com GitHub CLI da conta **GASJW** autenticada no dispositivo administrativo `gui`, com permissão `admin=true` verificada, sem revelar credencial.
+- Branch protection `main`: `protected=true`, required pull request para merge, required checks `gateway-tests` e `Check for spelling errors`, `strict=true` (branch up-to-date), enforce admins true, conversation resolution required, force push false, deletion false.
+- `required_approving_review_count=0`: não havia revisor independente confirmado, portanto nenhuma aprovação humana obrigatória foi inventada. O gate PR + checks permanece obrigatório.
+- GitHub confirmou a proteção com retorno da API, sem exceções administrativas nem bypass.
+
+## Seis PRs integrados pela proteção (em ordem)
+| PR | Conteúdo | SHA do merge em main |
+|---|---|---|
+| [#1](https://github.com/GASJW/DesktopCommanderMCP/pull/1) | G1/G2 fundação + OAuth/Cloudflare | `54d725144aab1ae28bb9eec341f2d9ead56f44bc` |
+| [#2](https://github.com/GASJW/DesktopCommanderMCP/pull/2) | G3.1 isolamento | `6ea8833b1a752faf131530ea9eb8d72c346b9cb3` |
+| [#3](https://github.com/GASJW/DesktopCommanderMCP/pull/3) | G3.2 journald | `ac6d78f4824c771e5435d7c8240392acfd75939b` |
+| [#4](https://github.com/GASJW/DesktopCommanderMCP/pull/4) | G3.3 recuperação | `21d71614813a26a825f32b766c9ea271da81b335` |
+| [#5](https://github.com/GASJW/DesktopCommanderMCP/pull/5) | G3.4 limites | `71fe6457afe16eb1433f755eea7e7e7a71bfb189` |
+| [#6](https://github.com/GASJW/DesktopCommanderMCP/pull/6) | G3.5 OAuth e autorização | `cf4a0618b0ee01861b3e5a86593da9eca320386a` |
+
+- Antes de cada merge: filho foi redirecionado à base `main`, atualizado com o merge protegido anterior, e os dois checks concluíram GREEN no HEAD novo. PR foi retirado de Draft somente após verificar gates. Método `merge`, não squash nem rebase.
+- GitHub confirmou todos seis PRs fechados com `merged_at` preenchido. A árvore do merge #6 em main é **idêntica** à árvore de HEAD do PR #6 aprovado (`tree SHA 656f3e3811a7dde3c5fb9d77591d393fc1299e9e`).
+- Release workflow em main só dispara em tag `v*` ou `workflow_dispatch`; merges não disparam publicação npm/MCP Registry.
+
+## Preservação do ambiente ativo
+- Após os seis merges, `vps-commander.service`, `vps-commander-executor.service`, `cloudflared-vps-commander.service` e túnel independente `cloudflared.service` seguiam `active`; HTTP local sem JWT 401.
+- VPS permaneceu executando G3.5 em `feat/g3-access-hardening` no checkout operacional. Não fizemos `git switch`/`git pull` na instalação nem reiniciamos serviços, porque a equivalência funcional dos módulos e a árvore de PR6 foram evidenciadas. Alinhamento futuro do checkout deve ser feito como migração governada, não automaticamente no ato do merge.
+
+## G4.1 — Check obrigatório nos PRs que alteram só documentação
+- Problema encontrado na auditoria pós-merge: workflow `VPS Commander Gateway Tests` só rodava quando paths `gateway/**`, `deploy/**` ou o próprio workflow mudavam. Como o check é obrigatório em `main`, PRs apenas de docs ficariam eternamente bloqueados por check não executado.
+- Correção em PR separado `chore/g4-ci-governance`: executar `gateway-tests` em **todos os pull_requests** e pushes de **main**; Codespell já roda em PRs empilhados e main (skip apenas operacional `docs/` em português).
+- Teste automatizado `deploy/test/g4-protected-checks.test.mjs` garante que os dois checks exigidos não são omitidos em PRs doc-only.
+- Nenhuma mudança no runtime nem em Cloudflare é necessária para esta correção.
+
+## Estado de saída
+- **G4 merge #1–#6 = GREEN, main protegida.** G4.1 CI cobertura de PR docs-only é uma correção de governança separada, para integrar após checks GREEN. Preservar provas de operação G3.1–G3.5 em Notion.
+
+---
 # G4 — Consolidação e publicação governada do VPS Commander
 
 **Data:** 2026-10-10 horário local / 2026-10-11 UTC.
