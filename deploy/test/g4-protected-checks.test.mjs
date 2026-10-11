@@ -14,5 +14,5 @@ test('branch-protection required checks always run for docs-only and stacked PRs
   assert.doesNotMatch(gateway,/^  pull_request:\n    paths:/m);
   assert.match(spelling,/^  pull_request:$/m);
   assert.match(spelling,/^    name: Check for spelling errors$/m);
-  assert.match(spelling,/^          skip: \.\/docs$/m);
+  assert.match(spelling,/^          skip: \.\/docs(?:,.*)?$/m);
 });

@@ -13,7 +13,9 @@ function httpMethod(value) {
   return ['GET', 'POST', 'OPTIONS', 'HEAD', 'DELETE'].includes(value) ? value : 'other';
 }
 function routeName(value) {
-  return value === '/mcp' ? 'mcp' : value === '/healthz' ? 'healthz' : 'other';
+  return value === '/mcp' ? 'mcp' : value === '/healthz' ? 'healthz' :
+    (value === '/dashboard' || value === '/dashboard/' || value === '/dashboard/metrics' ||
+      value === '/dashboard/app.js' || value === '/dashboard/style.css') ? 'dashboard' : 'other';
 }
 function outcomeName(value) {
   return ['ok', 'denied', 'invalid_request', 'tool_error', 'rpc_error', 'unavailable', 'disconnected', 'busy', 'limit_exceeded'].includes(value) ? value : 'other';
@@ -24,7 +26,7 @@ export function verifiedPrincipalId(principal) {
   return 'cf_' + createHash('sha256').update(principal.issuer).update('\0').update(principal.subject).digest('hex').slice(0, 24);
 }
 
-export function createAuditRecorder({ sink = line => process.stdout.write(line) , now = () => new Date(), monotonic = () => process.hrtime.bigint() } = {}) {
+export function createAuditRecorder({ sink = line => process.stdout.write(line), onEntry = () => {}, now = () => new Date(), monotonic = () => process.hrtime.bigint() } = {}) {
   return function beginRequest(request, response) {
     const requestId = randomUUID();
     const startedAt = now().toISOString();
@@ -55,6 +57,7 @@ export function createAuditRecorder({ sink = line => process.stdout.write(line) 
         http_status: httpStatus,
         outcome: outcomeName(result),
       };
+      try { onEntry(entry); } catch { /* metrics never affect serving or raw audit */ }
       try { sink(JSON.stringify(entry) + '\n'); } catch { /* logging failure must not leak untrusted content */ }
     }
     response.once('finish', record);

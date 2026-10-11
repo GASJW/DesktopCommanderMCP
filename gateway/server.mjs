@@ -7,6 +7,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createAccessVerifier } from './access-auth.mjs';
 import { createAuditRecorder } from './audit.mjs';
+import { createDashboardMetrics } from './dashboard/metrics.mjs';
+import { DASHBOARD_PATHS, serveDashboard } from './dashboard/http.mjs';
 
 // Development-only bridge: stdio MCP -> stateless Streamable HTTP JSON.
 // No public hostname or Cloudflare route is authorized by this module.
@@ -256,13 +258,16 @@ export async function startGateway(options = {}) {
     : new Peer(executable, executorSocket, maxUpstreamLineBytes);
   await peer.start();
   const auditEnabled = options.auditEnabled ?? process.env.VPS_COMMANDER_AUDIT_ENABLED === '1';
-  const beginAudit = auditEnabled ? createAuditRecorder({ sink: options.auditSink }) : null;
+  const metrics = createDashboardMetrics({now:options.metricsNow});
+  const beginAudit = auditEnabled ? createAuditRecorder({ sink:options.auditSink,
+    onEntry:entry => metrics.record(entry) }) : null;
   let inFlight = 0;
   const server = createServer(async (req, res) => {
     const audit = beginAudit?.(req, res);
     // No browser cross-origin requests. Also do not leak MCP methods without auth.
     if (req.headers.origin) return reply(res, 403, { error: 'Origin forbidden' });
-    if (req.url !== '/mcp' && req.url !== '/healthz') return reply(res, 404, { error: 'Not found' });
+    const isDashboard = DASHBOARD_PATHS.has(req.url);
+    if (req.url !== '/mcp' && req.url !== '/healthz' && !isDashboard) return reply(res, 404, { error: 'Not found' });
     const principal = authMode === 'access'
       ? await verifyAccess.verifyPrincipal(req.headers['cf-access-jwt-assertion']) : null;
     const authorized = authMode === 'access'
@@ -275,6 +280,13 @@ export async function startGateway(options = {}) {
     if (authMode === 'access') audit?.principal(principal);
     else audit?.local();
     if (req.url === '/healthz') return reply(res, peer.dead ? 503 : 200, { status: peer.dead ? 'down' : 'ready' });
+    // Dashboard is restricted to the same verified Cloudflare Access owner session.
+    // Local development bearer auth cannot expose an administrative browser UI.
+    if (isDashboard) {
+      if (authMode !== 'access') return reply(res, 404, {error:'Not found'});
+      try { return await serveDashboard(req,res,{metrics,peerUp:()=>!peer.dead,inFlight:()=>inFlight}); }
+      catch { return reply(res,503,{error:'Dashboard temporarily unavailable'}); }
+    }
     if (req.method !== 'POST') {
       res.setHeader('allow', 'POST');
       return reply(res, 405, { error: 'Only POST is implemented' });

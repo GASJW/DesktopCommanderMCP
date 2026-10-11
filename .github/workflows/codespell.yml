@@ -24,5 +24,6 @@ jobs:
       - name: Codespell
         uses: codespell-project/actions-codespell@v2
         with:
-          # Operational docs are Portuguese; keep English spellcheck enabled for code and scripts.
-          skip: ./docs
+          # Portuguese-language docs and UI strings are not English spelling errors.
+          # Continue checking gateway backend, deployment scripts and workflows.
+          skip: ./docs,./gateway/dashboard/index.html,./gateway/dashboard/app.js
