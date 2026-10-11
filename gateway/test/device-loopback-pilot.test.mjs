@@ -7,6 +7,7 @@ import { startLoopbackAgentPilot } from '../devices/loopback-pilot.mjs';
 import { createEphemeralPairingIdentity } from '../../packages/vpsc-agent/src/pairing.mjs';
 import { createLoopbackAgentClient } from '../../packages/vpsc-agent/src/loopback-client.mjs';
 import { signedAgentRequest } from '../../packages/vpsc-agent/src/frame.mjs';
+import { request as httpRequest } from 'node:http';
 
 const pause=()=>new Promise(resolve=>setTimeout(resolve,10));
 async function setup(options={}){
@@ -210,4 +211,55 @@ test('client is loopback-only and denies external hosts regardless of transport'
     'http://127.0.0.1:12345/path','http://user:pass@127.0.0.1:1001']) {
     assert.throws(()=>createLoopbackAgentClient({url,identity,deviceId:'any'}),/Loopback pilot/);
   }
+});
+
+test('split multibyte UTF-8 is decoded without changing the signed body',async()=>{
+  const s=await setup();
+  try{
+    const conn=await s.client.connect();
+    const pathname='/agent/heartbeat';
+    const bodyText='{"name":"ação"}';
+    const bytes=Buffer.from(bodyText,'utf8');
+    const split=bytes.indexOf(0xc3)+1; // Split inside the two-byte ã or ç.
+    assert.ok(split>0 && split<bytes.length);
+    const signature=s.identity.signFrame(signedAgentRequest({
+      pathname,deviceId:s.deviceId,sessionId:conn.sessionId,sequence:1,bodyText,
+    }));
+    const response=await new Promise((resolve,reject)=>{
+      const req=httpRequest(s.pilot.url+pathname,{method:'POST',headers:{
+        'content-type':'application/json',
+        'x-vpsc-device-id':s.deviceId,
+        'x-vpsc-session-id':conn.sessionId,
+        'x-vpsc-sequence':'1',
+        'x-vpsc-signature':signature,
+      }},res=>{
+        const parts=[];
+        res.on('data',x=>parts.push(x));
+        res.on('end',()=>resolve({status:res.statusCode,body:Buffer.concat(parts).toString()}));
+      });
+      req.on('error',reject);
+      req.write(bytes.subarray(0,split));
+      req.end(bytes.subarray(split));
+    });
+    assert.equal(response.status,200);
+    assert.deepEqual(JSON.parse(response.body),{status:'alive',deviceId:s.deviceId});
+  }finally{await s.close();}
+});
+test('malformed UTF-8 is denied before signature validation',async()=>{
+  const s=await setup();
+  try{
+    const payload=Buffer.from([0x7b,0x22,0x78,0x22,0x3a,0x22,0xc3,0x28,0x22,0x7d]);
+    const response=await new Promise((resolve,reject)=>{
+      const req=httpRequest(s.pilot.url+'/agent/heartbeat',{method:'POST',
+        headers:{'content-type':'application/json'}},res=>{
+        const parts=[];
+        res.on('data',x=>parts.push(x));
+        res.on('end',()=>resolve({status:res.statusCode,body:Buffer.concat(parts).toString()}));
+      });
+      req.on('error',reject);
+      req.end(payload);
+    });
+    assert.equal(response.status,400);
+    assert.match(response.body,/Invalid UTF-8/);
+  }finally{await s.close();}
 });

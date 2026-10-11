@@ -32,13 +32,21 @@ export async function startLoopbackAgentPilot({
     if (!/^application\/json(?:;|$)/i.test(req.headers['content-type']??'')) {
       return reject(res,415,'JSON required');
     }
-    let raw='';
+    // Keep request bytes intact until after the size check. Decoding each
+    // network chunk independently may replace a split UTF-8 codepoint, which
+    // would silently change the body that is being authenticated.
+    const chunks=[];
+    let total=0;
     try {
       for await(const chunk of req) {
-        raw+=chunk;
-        if (Buffer.byteLength(raw,'utf8')>MAX_REQUEST) return reject(res,413,'Request too large');
+        total+=chunk.length;
+        if (total>MAX_REQUEST) return reject(res,413,'Request too large');
+        chunks.push(chunk);
       }
     }catch {return reject(res,400,'Invalid request');}
+    let raw;
+    try {raw=new TextDecoder('utf-8',{fatal:true}).decode(Buffer.concat(chunks,total));}
+    catch {return reject(res,400,'Invalid UTF-8');}
     let body;
     try {body=JSON.parse(raw)}catch {return reject(res,400,'Invalid JSON');}
     if (!validBody(body)) return reject(res,400,'Invalid payload');

@@ -14,7 +14,7 @@ In this isolated pilot, an agent starts requests to an **ephemeral local HTTP li
 - `/agent/heartbeat` establishes observed liveness and attaches the router to the exact authenticated device session; `/agent/poll` obtains a queued tool-request frame; `/agent/result` verifies authenticated responses bound to requestId/deviceId/sessionId and never replays a mutating call automatically.
 - Outbound polling is intentionally short-lived in this pilot; remote transport and WebSocket economics/idle timeout decisions are not yet accepted.
 - A real loopback HTTP test uses a synthetic mock response; this does NOT prove local Desktop Commander child execution.
-- Reject browser Origin, unsupported method/routes, invalid media, malformed/oversized bodies, missing signatures, tampering, duplicate/reordered sequences, wrong keys, revoked/stale sessions and offline devices.
+- Reject browser Origin, unsupported method/routes, invalid media, malformed/oversized bodies, missing signatures, tampering, duplicate/reordered sequences, wrong keys, revoked/stale sessions and offline devices. The pilot bounds raw bytes before decoding, uses strict UTF-8 decoding, and verifies signed request contents independently of network chunk boundaries; malformed UTF-8 is rejected.
 - All pilot entry points require explicit `enableLoopbackPilot:true`, bind to `127.0.0.1`, and demand port 0 (OS-assigned ephemeral). Client refuses non-loopback URL, TLS hostnames, and embedded credentials in its test helper.
 
 ## Files
