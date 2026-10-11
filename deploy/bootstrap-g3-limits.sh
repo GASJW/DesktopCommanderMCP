@@ -3,14 +3,13 @@
 set -Eeuo pipefail
 umask 077
 BASE=/opt/vps-commander/code
-BACKUP=/root/vps-commander-g3-limits-backup
+BACKUP=''
 GW=vps-commander.service
 WK=vps-commander-executor.service
 if [[ "$EUID" -ne 0 ]]; then echo 'Requires root SSH'; exit 2; fi
 g=(git -c safe.directory="$BASE" -C "$BASE")
 [[ "$("${g[@]}" branch --show-current)" = feat/g3-operational-limits ]] || { echo 'Wrong branch'; exit 3; }
 [[ -z "$("${g[@]}" status --porcelain)" ]] || { echo 'Dirty checkout'; exit 3; }
-[[ ! -e "$BACKUP" ]] || { echo 'Backup already exists; reconcile manually'; exit 4; }
 for unit in "$GW" "$WK" cloudflared-vps-commander.service cloudflared.service; do
   systemctl is-active --quiet "$unit" || { echo "Inactive $unit"; exit 5; }
 done
@@ -20,15 +19,56 @@ done
 [[ " $(systemctl show -P Requires "$GW") " != *" $WK "* ]] || exit 7
 [[ "$(systemctl show -P Environment "$GW")" = *VPS_COMMANDER_AUDIT_ENABLED=1* ]] || exit 7
 cd "$BASE"
+# Root's umask 077 may create tracked 100644 modules as mode 0600 during git switch.
+# Repair ONLY the three public-source runtime modules. Never chmod a secret or a directory.
+ensure_gateway_sources_readable() {
+  local p expected
+  for p in gateway/server.mjs gateway/audit.mjs gateway/access-auth.mjs; do
+    expected=$("${g[@]}" ls-files --stage -- "$p" | awk '{print $1}')
+    [[ "$expected" = 100644 && -f "$BASE/$p" && ! -L "$BASE/$p" ]] || {
+      echo "Refused unexpected source entry: $p" >&2
+      return 1
+    }
+    chmod 0644 "$BASE/$p"
+    runuser -u vpsc-gateway -- test -r "$BASE/$p" || {
+      echo "Gateway cannot read module $p" >&2
+      return 1
+    }
+  done
+}
+ensure_gateway_sources_readable
 /opt/vps-commander/bin/node --check gateway/server.mjs
 /opt/vps-commander/bin/node --test gateway/test/*.test.mjs deploy/test/*.test.mjs
-install -d -o root -g root -m 0700 "$BACKUP"
+BACKUP=$(mktemp -d /root/vps-commander-g3-limits-backup.XXXXXXXX)
 "${g[@]}" rev-parse --verify origin/feat/g3-recovery > "$BACKUP/previous-commit"
 chmod 0600 "$BACKUP/previous-commit"
 rollback() {
+  trap - ERR
   echo 'G3.4 gate RED, restoring prior gateway release' >&2
-  "${g[@]}" switch feat/g3-recovery || true
-  systemctl restart "$GW" || true
+  if ! "${g[@]}" switch feat/g3-recovery; then
+    echo 'G3_4_ROLLBACK=RED_BRANCH_RESTORE_FAILED' >&2
+    return 1
+  fi
+  if ! ensure_gateway_sources_readable; then
+    echo 'G3_4_ROLLBACK=RED_SOURCE_PERMISSIONS' >&2
+    return 1
+  fi
+  systemctl reset-failed "$GW" || true
+  if ! systemctl restart "$GW"; then
+    echo 'G3_4_ROLLBACK=RED_RESTART_FAILED' >&2
+    return 1
+  fi
+  local status=000
+  for _ in {1..120}; do
+    status=$(curl -s --max-time 1 -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/healthz || true)
+    [[ "$status" = 401 ]] && break
+    sleep 0.25
+  done
+  if [[ "$status" = 401 ]] && systemctl is-active --quiet "$GW"; then
+    echo 'G3_4_ROLLBACK=GREEN_G3_3_RESTORED'
+  else
+    echo 'G3_4_ROLLBACK=RED_NOT_HEALTHY' >&2
+  fi
   if ! systemctl is-active --quiet cloudflared-vps-commander.service; then
     systemctl restart cloudflared-vps-commander.service || true
   fi
@@ -37,8 +77,8 @@ trap rollback ERR
 wk_pid_before=$(systemctl show -P MainPID "$WK")
 systemctl restart "$GW"
 status=000
-for _ in {1..40}; do
-  status=$(curl -sS --max-time 1 -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/healthz || true)
+for _ in {1..120}; do
+  status=$(curl -s --max-time 1 -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/healthz || true)
   [[ "$status" = 401 ]] && break
   sleep 0.25
 done
