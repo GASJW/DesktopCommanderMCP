@@ -22,9 +22,10 @@ test('G3.3 cutover is gateway-only, preserves isolation and rollback',()=>{
   assert.match(unit,/^Environment=VPS_COMMANDER_AUDIT_ENABLED=1$/m);
 });
 
-test('systemd gateway and worker have independent failure restart policies',()=>{
+test('gateway is not deactivated when its independently restarting worker fails',()=>{
   assert.match(unit,/^Restart=on-failure$/m);
   assert.match(worker,/^Restart=on-failure$/m);
-  assert.match(unit,/^Requires=vps-commander-executor.service$/m);
+  assert.match(unit,/^Wants=vps-commander-executor.service$/m);
+  assert.doesNotMatch(unit,/^Requires=vps-commander-executor.service$/m);
   assert.match(unit,/^Environment=VPS_COMMANDER_EXECUTOR_SOCKET=\/run\/vps-commander-ipc\/mcp.sock$/m);
 });
