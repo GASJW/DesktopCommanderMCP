@@ -1,3 +1,41 @@
+# G3.4 — PRIMEIRO DEPLOY RED, G3.3 RESTAURADO, BOOTSTRAP CORRIGIDO (10/10/2026 local / 11/10 UTC)
+
+**Estado atual: produção G3.3 GREEN; G3.4 candidato GREEN, mas implantação G3.4 NÃO certificada.** Este relatório substitui o status de candidato inicial indicado abaixo. Não repetir o antigo bootstrap sem obter os commits corretivos.
+
+## Incidente observado
+
+O operador executou `deploy/bootstrap-g3-limits.sh`: 29/29 testes PASS, mas o probe da porta `127.0.0.1:8787` não conseguiu conectar durante a janela curta; o bootstrap emitiu `G3.4 gate RED, restoring prior gateway release` e trocou o repositório de volta para `feat/g3-recovery`. Isso **não é** `G3_4_GATEWAY_DEPLOY=BOOTSTRAP_GREEN`.
+
+Um primeiro teste via plugin Commander falhou internamente. Por contingência, utilizou-se Remote Desktop Commander **somente na VPS gui**, sem alterar serviços externos: `vps-commander.service` estava em restart-loop, sem porta 8787; executor e túnel cofre permaneciam ativos, e o túnel dedicado tentava reconectar.
+
+O `journalctl` root revelou `Error: EACCES: permission denied, open '/opt/vps-commander/code/gateway/server.mjs'`. `stat` confirmou `gateway/server.mjs` e `gateway/audit.mjs` em **mode 0600 root:root**, incompatíveis com o UID runtime `vpsc-gateway`. Git os registra como 100644. **O `umask 077` do bootstrap combinado a `git switch` root no rollback pôde criar os módulos como 0600**. Isso explica inequivocamente o *rollback quebrado*, mas não permite atribuir a falha da prontidão inicial do G3.4 apenas a permissões.
+
+Evidência adicional do journal: em 01:16:51 UTC houve uma inicialização G3.4 com `MCP gateway: http://127.0.0.1:8787` e evento de auditoria HTTP 401; em 01:16:52 UTC iniciou-se o restart do rollback e apareceram falhas EACCES. Portanto a inicialização da versão candidata ocorreu **tardiamente**, próxima do rollback. A janela anterior de prontidão era 40 × 0,25 s (~10 s); a relação exata entre atraso de inicialização e probe ainda não foi reproduzida sob root em produção.
+
+## Recuperação executada
+
+Como root via contingência, alterou-se **apenas o modo de dois arquivos não secretos e versionados** para `0644`:
+- `/opt/vps-commander/code/gateway/server.mjs`
+- `/opt/vps-commander/code/gateway/audit.mjs`
+
+Sem `chown` recursivo, sem credenciais lidas, sem alterações em Cloudflare. O `systemd` se recuperou por `Restart=on-failure`, com `vps-commander.service=active`, executor e túneis ativos, `GET /healthz` anônimo HTTP 401 e real ChatGPT Commander `start_process` + `read_file /etc/os-release` PASS (`G3_3_ROLLBACK_RECOVERED=GREEN`).
+
+## Correção de engenharia G3.4 entregue mas ainda não implantada
+
+`deploy/bootstrap-g3-limits.sh` foi corrigido para:
+- validar via Git (`100644`) a natureza dos três módulos do gateway (`server.mjs`, `audit.mjs`, `access-auth.mjs`) e ajustar **somente** esses arquivos não secretos para `0644`, testando `runuser -u vpsc-gateway -- test -r` antes do restart;
+- aplicar a mesma verificação após `git switch` de rollback, pois o script roda com `umask 077`;
+- criar um backup root-only **único por tentativa** com `mktemp -d` sem sobrescrever a evidência da falha anterior;
+- ampliar o probe de prontidão para até ~30 segundos, suprimindo ruído dos `curl` transitórios;
+- confirmar explicitamente o HTTP 401 e o estado `active` do gateway **após o rollback**, anunciando `G3_4_ROLLBACK=GREEN_G3_3_RESTORED` ou RED correspondente;
+- manter validação de usuários Linux isolados, worker PID inalterado, auditoria, dependência `Wants` sem `Requires`, e túneis preservados.
+
+A suite ampliada de regressão passou **30/30 testes** na VPS em checkout candidato isolado; `bash -n` do bootstrap passou. O daemon de produção permanece G3.3. O último comando composto de teste retornou exit 128 **após os testes** porque o usuário restrito do Commander tentou consultar `.git` do checkout root-owned; isso não é erro da suíte nem do gateway e não se deve alterar a permissão do `.git` para contorná-lo.
+
+**G3.4 permanece RED no gate de implantação real até novo cutover e smoke autenticado**, agendados apenas após revisão. Não efetuar teste volumoso ou fault injection no endpoint público.
+
+---
+
 # G3.4 — Limites operacionais / proteção contra sobrecarga (10/10/2026)
 
 **Estado: candidato GREEN (29/29 testes VPS + smoke Desktop Commander real); NÃO implantado na unidade ativa.**
