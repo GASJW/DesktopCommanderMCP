@@ -7,6 +7,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createAccessVerifier } from './access-auth.mjs';
+import { createAuditRecorder } from './audit.mjs';
 
 // Development-only bridge: stdio MCP -> stateless Streamable HTTP JSON.
 // No public hostname or Cloudflare route is authorized by this module.
@@ -120,7 +121,9 @@ export async function startGateway(options = {}) {
   const host = options.host ?? process.env.VPS_COMMANDER_HOST ?? '127.0.0.1';
   const port = Number(options.port ?? process.env.VPS_COMMANDER_PORT ?? 8787);
   const executable = path.resolve(options.executorFile ?? process.env.VPS_COMMANDER_EXECUTOR_FILE ?? DEFAULT_EXECUTOR);
-  const executorSocket = options.executorSocket ?? process.env.VPS_COMMANDER_EXECUTOR_SOCKET ?? null;
+  // Explicit test executor takes precedence over a production socket inherited from the environment.
+  const executorSocket = options.executorSocket !== undefined
+    ? options.executorSocket : (options.executorFile ? null : process.env.VPS_COMMANDER_EXECUTOR_SOCKET ?? null);
   if (executorSocket && (!path.isAbsolute(executorSocket) || executorSocket.length > 105)) throw Error('Invalid executor socket path');
   if (authMode === 'local' &&
       (typeof token !== 'string' || Buffer.byteLength(token) < 32 || Buffer.byteLength(token) > 4096))
@@ -130,17 +133,24 @@ export async function startGateway(options = {}) {
   if (!executorSocket && !existsSync(executable)) throw Error('Build missing: expected Desktop Commander dist/index.js');
   const peer = new Peer(executable, executorSocket);
   await peer.start();
+  const auditEnabled = options.auditEnabled ?? process.env.VPS_COMMANDER_AUDIT_ENABLED === '1';
+  const beginAudit = auditEnabled ? createAuditRecorder({ sink: options.auditSink }) : null;
   const server = createServer(async (req, res) => {
+    const audit = beginAudit?.(req, res);
     // No browser cross-origin requests. Also do not leak MCP methods without auth.
     if (req.headers.origin) return reply(res, 403, { error: 'Origin forbidden' });
     if (req.url !== '/mcp' && req.url !== '/healthz') return reply(res, 404, { error: 'Not found' });
+    const principal = authMode === 'access'
+      ? await verifyAccess.verifyPrincipal(req.headers['cf-access-jwt-assertion']) : null;
     const authorized = authMode === 'access'
-      ? await verifyAccess(req.headers['cf-access-jwt-assertion'])
-      : matchesBearer(req.headers.authorization, token);
+      ? Boolean(principal) : matchesBearer(req.headers.authorization, token);
     if (!authorized) {
+      audit?.outcome('denied');
       if (authMode === 'local') res.setHeader('www-authenticate', 'Bearer');
       return reply(res, 401, { error: 'Unauthorized' });
     }
+    if (authMode === 'access') audit?.principal(principal);
+    else audit?.local();
     if (req.url === '/healthz') return reply(res, peer.dead ? 503 : 200, { status: peer.dead ? 'down' : 'ready' });
     if (req.method !== 'POST') {
       res.setHeader('allow', 'POST');
@@ -161,6 +171,7 @@ export async function startGateway(options = {}) {
     try { message = JSON.parse(body); } catch { return reply(res, 400, fault(null, -32700, 'Invalid JSON')); }
     if (!message || Array.isArray(message) || message.jsonrpc !== '2.0' || typeof message.method !== 'string')
       return reply(res, 400, fault(message?.id, -32600, 'Invalid request'));
+    audit?.operation(message.method, message.params?.name);
     if (message.method === 'initialize' && Object.hasOwn(message, 'id')) {
       const init = peer.initialization;
       return reply(res, 200, {
@@ -174,8 +185,10 @@ export async function startGateway(options = {}) {
     }
     try {
       const result = await peer.call(message.method, message.params ?? {});
+      audit?.outcome(result?.error ? 'rpc_error' : result?.result?.isError ? 'tool_error' : 'ok');
       return reply(res, 200, { ...result, id: message.id });
     } catch {
+      audit?.outcome('unavailable');
       return reply(res, peer.dead ? 503 : 502, fault(message.id, -32000, 'Executor unavailable, busy or timed out'));
     }
   });
