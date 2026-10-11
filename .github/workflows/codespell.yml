@@ -5,8 +5,8 @@ name: Codespell
 on:
   push:
     branches: [main]
+  # Validate stacked PRs too, even when their base is another feature branch.
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read
@@ -23,3 +23,6 @@ jobs:
         uses: codespell-project/codespell-problem-matcher@v1
       - name: Codespell
         uses: codespell-project/actions-codespell@v2
+        with:
+          # Operational docs are Portuguese; keep English spellcheck enabled for code and scripts.
+          skip: ./docs

@@ -1,0 +1,8 @@
+# Copy into /etc/systemd/system/vps-commander.service.d/20-access.conf
+# Fill all placeholders using values from YOUR Cloudflare Access application.
+# The real file on the VPS already has G2 values. Do not publish owner emails or tokens.
+[Service]
+Environment=VPS_COMMANDER_AUTH_MODE=access
+Environment=VPS_COMMANDER_ACCESS_ISSUER=https://YOUR-TEAM.cloudflareaccess.com
+Environment=VPS_COMMANDER_ACCESS_AUD=YOUR_64_HEX_APP_AUDIENCE
+Environment=VPS_COMMANDER_ALLOWED_EMAILS=owner@example.com

@@ -132,7 +132,9 @@ async function runServer() {
       transport.sendLog('info', 'MCP fully initialized, all startup messages sent');
 
       // Preemptively check/download Chrome for PDF generation (runs in background)
-      ensureChromeAvailable();
+      if (process.env.VPS_COMMANDER_DISABLE_BROWSER_INIT !== '1') {
+        ensureChromeAvailable();
+      }
     };
 
     await server.connect(transport);

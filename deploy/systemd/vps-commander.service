@@ -1,0 +1,35 @@
+[Unit]
+Description=VPS Commander MCP local-only gateway
+After=network.target
+
+[Service]
+Type=simple
+User=vpscommander
+Group=vpscommander
+WorkingDirectory=/opt/vps-commander/code
+Environment=HOME=/var/lib/vps-commander
+Environment=PATH=/opt/vps-commander/bin:/usr/bin:/bin
+Environment=VPS_COMMANDER_HOST=127.0.0.1
+Environment=VPS_COMMANDER_PORT=8787
+EnvironmentFile=/var/lib/vps-commander/.config/vps-commander/gateway.env
+ExecStart=/opt/vps-commander/bin/node /opt/vps-commander/code/gateway/server.mjs
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/vps-commander
+CapabilityBoundingSet=
+AmbientCapabilities=
+TasksMax=128
+MemoryMax=900M
+
+[Install]
+WantedBy=multi-user.target
