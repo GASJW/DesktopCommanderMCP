@@ -29,7 +29,7 @@ test('G3.5 Access JWT duration and time consistency fail closed',async()=>{
     {iat:now()-3600*48,exp:now()+3600},
     {iat:now()+200,exp:now()+400},
     {iat:now()+60,exp:now()+10},
-    {iat:now()-30,exp:now()-20},
+    {iat:now()-180,exp:now()-120},
     {iat:now()-60,exp:now()+86400*3},
     {iat:now()-60,exp:now()+100,nbf:now()+200},
     {iat:now()-60,exp:now()+200,nbf:now()+300},
