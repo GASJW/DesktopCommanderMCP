@@ -1,3 +1,28 @@
+# G3.3 — HOTFIX SYSTEMD APLICADO E VERIFICADO (2026-10-10 local / 2026-10-11 UTC)
+
+**Estado atual:** correção da dependência gateway→executor **GREEN** em produção; G3.3 recuperação após falha real ainda **PENDENTE** de repetição do drill com a nova dependência.
+
+O proprietário aplicou por SSH `deploy/repair-g3-gateway-dependency.sh`, que reportou:
+```text
+G3_3_DEPENDENCY_REPAIR=GREEN
+G3_3_GATEWAY_PID_UNCHANGED=PASS
+G3_3_EXECUTOR_PID_UNCHANGED=PASS
+G3_3_ORIGIN_ANONYMOUS_HTTP=401
+```
+
+Certificação independente via plugin **ChatGPT Commander**, read-only, após o hotfix:
+- `systemctl show -P Requires vps-commander.service`: **não inclui** `vps-commander-executor.service`.
+- `systemctl show -P Wants vps-commander.service`: **inclui** `vps-commander-executor.service`.
+- `systemctl show -P After vps-commander.service`: **inclui** `vps-commander-executor.service`.
+- Gateway e executor **active**, PIDs preservados `1617612` e `1617600` respectivamente; `cloudflared-vps-commander.service` e `cloudflared.service` **active**.
+- `/healthz` anônimo HTTP 401, shell remoto `G3_3_AFTER_DEPENDENCY_REPAIR_GREEN`.
+- API Cloudflare confirmou **ambos** os túneis `vps-commander` e `cofre` **healthy, 4 conexões cada**.
+- Nenhuma reinicialização foi necessária ou observada para instalar essa mudança. Autenticação, isolamento e auditoria preservados.
+
+**Próximo gate (ainda não executado desde o reparo):** operador SSH root, sem operações mutantes/em andamento, executar `sudo bash /opt/vps-commander/code/deploy/verify-g3-systemd-recovery.sh --accept-controlled-executor-restart`. O script aprovado agora falha imediatamente caso o PID do gateway seja alterado e não reinicia serviços saudáveis durante rollback. Só aceitar `G3_3_REAL_SYSTEMD_DRILL=GREEN` após observação real de eventos de recovery e execução posterior pelo ChatGPT. Se houver RED, diagnosticar por journal administrativo antes de novo retry.
+
+---
+
 # G3.3 — PRIMEIRO ENSAIO SYSTEMD RED, CORREÇÃO MÍNIMA PREPARADA (2026-10-10 local / 2026-10-11 UTC)
 
 **Estado atual: operação restaurada/saudável; recuperação sem reiniciar gateway NÃO certificada.**
