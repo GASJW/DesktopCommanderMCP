@@ -125,6 +125,16 @@ export function createDeviceRegistry({
     return true;
   }
 
+  // G7.2: server-internal session validation for routing, never exposed to clients.
+  // A new handshake, revocation, disconnect or stale heartbeat fences old channels.
+  function isLiveSession(deviceId, sessionId) {
+    const d = entry(deviceId);
+    if (!d?.session || d.lastSeenAt === null ||
+        !sameSession(sessionId, d.session.sessionId)) return false;
+    const t = timestamp();
+    return t >= d.lastSeenAt && t - d.lastSeenAt <= heartbeatTtlMs;
+  }
+
   function listDevices() {
     const t = timestamp();
     return Array.from(devices.values(), d => {
@@ -140,5 +150,5 @@ export function createDeviceRegistry({
   }
 
   return Object.freeze({ trustDevice, beginHandshake, completeHandshake,
-    heartbeat, disconnect, revokeDevice, listDevices });
+    heartbeat, disconnect, revokeDevice, listDevices, isLiveSession });
 }
