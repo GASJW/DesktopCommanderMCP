@@ -1,3 +1,41 @@
+# G3.5 — CERTIFICAÇÃO LIVE GREEN (10/10/2026 local / 11/10 UTC)
+
+**Estado operacional: G3.5 GREEN para autenticação Cloudflare Access owner-only e restrição de métodos MCP.** As seções abaixo sobre candidato/implantação pendente são históricas, anteriores a este aceite.
+
+## Implantação
+
+Efetuada diretamente no dispositivo VPS **gui** por operador administrativo, usando o bootstrap restrito `deploy/bootstrap-g3-access.sh`. Branch `feat/g3-access-hardening` (código `1bc99bf`), PR #6 Draft, base G3.4. O script executou **37/37 testes PASS** e reportou:
+
+```text
+G3_5_TUNNEL_STABILIZATION=PASS
+G3_5_GATEWAY_DEPLOY=BOOTSTRAP_GREEN
+G3_5_EXECUTOR_PID_UNCHANGED=PASS
+G3_5_ANONYMOUS_ORIGIN_HTTP=401
+```
+
+Ao reiniciar só o gateway, `vps-commander-executor.service` manteve o mesmo processo e PID. A versão G3.4 permaneceu disponível como alvo de rollback, sem precisar utilizá-lo.
+
+## Verificação REAL pelo ChatGPT após o deploy
+
+- `mcp__Commander__start_process` autenticado: `G3_5_REAL_CHATGPT_OAUTH=GREEN`, host `gui`, executor `vpscommander`.
+- `read_file /etc/os-release`: PASS (Ubuntu 24.04.4 LTS).
+- `write_file` + `read_file` de `/var/lib/vps-commander/workspace/g3-5-oauth-live-acceptance-20261010.txt`: conteúdo esperado `G3_5_REAL_CHATGPT_WRITE=GREEN`.
+- Gateway `vps-commander.service` ativo, Linux User `vpsc-gateway`, PID `1698874`, `NRestarts=0`; executor ativo User `vpscommander`, PID `1650485` (não reiniciado).
+- `cloudflared-vps-commander.service` e `cloudflared.service` active; Cloudflare API relatou **vps-commander healthy 4 conexões** e **cofre healthy 4 conexões**.
+- Auditoria `VPS_COMMANDER_AUDIT_ENABLED=1` preservada, módulos JS visíveis ao usuário gateway mode 0644.
+- `GET /healthz` local sem JWT: HTTP **401**.
+- Prova administrativa read-only de metadados no journald, últimos 10 minutos (inclui todas as chamadas da janela e não apenas o teste G3.5): **22/22 eventos válidos**, 19 com identidade pseudonimizada verificada, 3 respostas negadas, `start_process`, `read_file`, `write_file` **PASS**, **0 violações**; `G3_2_JOURNAL_CERTIFICATION=GREEN`.
+
+## Escopo do GREEN
+
+Confirmado: configuração do Cloudflare owner-only + origin-JWT obrigatório, controles locais de assinatura e claims, restrições de métodos MCP, smoke real via ChatGPT após atualização, negativa HTTP sem JWT, logs redacted, isolamento dos dois usuários, recuperação e túnel mantidos.
+
+Testes negativos de tokens forjados, email divergente, métodos não permitidos e nomes/args inválidos ocorreram **somente no ambiente isolado** com JWT RSA sintético e executor real; não houve fuzz contra o endpoint público. Os checks do CI/teste não substituem um pentest externo, nem alteram as permissões Linux das 26 ferramentas autorizadas.
+
+**Governança:** PR #6 permanece Draft até revisão e merge protegido. O código ativo contém o commit `1bc99bf`, equivalente funcionalmente aos commits de documentação posteriores. Não houve alterações em Access policies/DNS, nem no túnel `cofre`, Hermes, Pantheon ou OpenMausBot.
+
+---
+
 # G3.5 — Cloudflare Access OAuth e autorização MCP (2026-10-10/11)
 
 **Estado inicial:** implementação candidata e testes GREEN; deploy real ainda NÃO realizado na data deste registro. Produção permanece G3.4.
