@@ -1,3 +1,41 @@
+# G5.1 — CERTIFICADO LIVE GREEN (2026-10-11 UTC)
+
+**Estado atualizado:** G5.1 operacionalmente **GREEN**, acima do histórico de candidato/preparação abaixo. Nenhum serviço foi reiniciado ou redeployado, e os UIDs e limites G3 foram preservados.
+
+## Evidências de código e CI
+
+- [PR #8](https://github.com/GASJW/DesktopCommanderMCP/pull/8) integrado ao `main` protegido, merge SHA `4af5b60e34e3bfdd61d112ac22d8b8ac1d084b9f`.
+- Required checks no HEAD e no merge `main`: `gateway-tests=success` e `Check for spelling errors=success`. Execuções de main: [gateway](https://github.com/GASJW/DesktopCommanderMCP/actions/runs/38108493607) e [Codespell](https://github.com/GASJW/DesktopCommanderMCP/actions/runs/38108493630).
+- Suíte completa 43/43 PASS na VPS em checkout isolado `feat/g5-operations`; G5 scripts sintaticamente corretos.
+- `deploy/g5-health.sh` executado pelo ChatGPT Commander não-root: `G5_HEALTH=GREEN_WITH_WARNINGS`, unidades active, Access/audit enabled, socket disponível, bind privado e HTTP anônimo 401. Único aviso: disco raiz 87%; `G5_MEMORY_PSI_SOME_AVG10=0.00`.
+
+## Evidências reais do backup
+
+- Três scripts G5 foram extraídos diretamente por `git show <SHA protegido em main>:deploy/<script>` em diretório temporário **root-only**; nunca foram executados como root a partir do workspace controlável pelo executor.
+- `deploy/g5-backup.sh` executado no host `gui` sob conta administrativa root, após verificar `main.protected=true` e ambos checks SHA-specific success.
+- `G5_BACKUP=GREEN`, `G5_BACKUP_SELF_CHECK=PASS`. Snapshot local: `/var/backups/vps-commander/snapshot.7IuqlqY2`.
+- Verificação independente: `/var/backups/vps-commander` e diretório snapshot root:700; tar e manifest root:600; SHA-256 recalculado igual ao manifest; **4 arquivos** no arquivo (3 unidades Commander + drop-in Access). O usuário `vpscommander` **não consegue ler** o manifest.
+- `G5_BACKUP_OFFSITE=NO` e `G5_BACKUP_CLOUDFLARED_TOKEN=NOT_COPIED`. É um backup local restrito, **não** prova de restauração nem recuperação de desastre.
+- Nenhuma informação sensível do archive, drop-in, e-mail permitido ou token foi copiada para GitHub ou Notion.
+
+## Decisão real sobre atualização
+
+- `deploy/g5-release-guard.sh`, extraído do mesmo commit protegido, executado apenas no canal administrativo e sem operações de checkout/restart.
+- `G5_MAIN_SHA=4af5b60e34e3bfdd61d112ac22d8b8ac1d084b9f`, `G5_ACTIVE_SHA=1bc99bf308112ac711039874f1409163f883c6af`.
+- `G5_MAIN_PROTECTED=PASS`, `G5_REQUIRED_CHECKS=PASS`, `G5_RUNTIME_DELTA=NONE`, `G5_RELEASE_GUARD=GREEN_NO_DEPLOY_NEEDED`.
+- `main` está atualizado em GitHub; checkout do serviço continua na branch operacional `feat/g3-access-hardening`, por não existir diferença de runtime. **Não trocar a branch em produção sob root umask 077 apenas para mudar metadados.**
+
+## Pós-check operacional
+
+- `vps-commander.service=active`, gateway PID `1698874`, usuário `vpsc-gateway`.
+- `vps-commander-executor.service=active`, executor PID `1650485`, usuário `vpscommander`.
+- Ambos `cloudflared-vps-commander.service` e `cloudflared.service` ativos.
+- Cloudflare API: `vps-commander` e `cofre` **healthy**, quatro conexões por túnel.
+- Anonymous local `/healthz=401`; ChatGPT Commander continuou capaz de executar comandos durante toda a auditoria.
+- `G5.1=GREEN`; próximo G5.2 exige planejamento de **cópia offsite criptografada e procedimento de restauração testável**, sem ampliar os privilégios do plugin MCP. Nenhum agendamento automático foi criado.
+
+---
+
 # G5 — Governed Commander Operations (2026-10-11 UTC)
 
 ## Scope and operational evidence
