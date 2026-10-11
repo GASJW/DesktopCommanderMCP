@@ -1,3 +1,33 @@
+# G3.3 — DEPLOY REAL GREEN, ENSAIO DE FALHA SYSTEMD PENDENTE (2026-10-10)
+
+**O operador executou por SSH root a implantação do gateway G3.3.** Print da sessão reporta `G3_3_GATEWAY_DEPLOY=BOOTSTRAP_GREEN` e 19/19 testes PASS. O gateway foi reiniciado nessa implantação e retomou serviço; não há evidência ainda de falha induzida do executor do systemd real.
+
+## Verificação pós-deploy autenticada (ChatGPT Commander)
+- `mcp__Commander__start_process`: `G3_3_CHATGPT_REAL_SHELL=GREEN`, `HOST=gui`, `USER=vpscommander`, branch `feat/g3-recovery`.
+- `vps-commander.service` active e usuário `vpsc-gateway`; `vps-commander-executor.service` active e usuário `vpscommander`.
+- `cloudflared-vps-commander.service` active; `VPS_COMMANDER_AUDIT_ENABLED=1` presente na configuração do gateway.
+- `read_file /etc/os-release` PASS (Ubuntu 24.04.4 LTS).
+- `write_file` + `read_file` de `/var/lib/vps-commander/workspace/g3-recovery-postdeploy-20261010.txt` PASS: `G3_3_CHATGPT_WRITE=GREEN`.
+- Cloudflare API: `vps-commander` healthy, quatro conexões; `cofre` healthy, quatro conexões.
+- Teste de falha real **não executado** nessa certificação, por não disparar root/falhas via o Commander de baixo privilégio.
+
+## Ensaio real controlado preparado, NÃO executado
+- `deploy/verify-g3-systemd-recovery.sh`: execução apenas por SSH root e argumento explícito `--accept-controlled-executor-restart`; atua apenas sobre o processo principal de `vps-commander-executor.service` via `systemctl kill --kill-whom=main --signal=SIGKILL`. Não usar `systemctl stop`, que pode parar gateway dependente.
+- Pré-condições: ambos serviços, ambos túneis ativos; usuários separados; auditoria habilitada; gateway PID existente. Executar somente sem comandos mutantes/longos ativos.
+- Validações: executor recebe PID novo e retorna active; gateway fica active com MESMO PID; journald contém, em ordem, eventos `disconnected`, `retry_scheduled`, `reconnected` com esquema restrito; ambos túneis continuam active.
+- Falha em qualquer gate provoca tentativa de recuperação dos serviços via `systemctl restart`. Não realiza rollback do código porque o corte do gateway já está GREEN; inspecionar uma falha antes de novas ações.
+- `deploy/verify-g3-recovery-events.py`: verificador de metadados que não imprime linhas de journal ou tokens.
+- Inspeção do candidato na VPS: **21/21 testes automatizados PASS**, scripts Bash/Python sintaticamente válidos e eventos sintéticos testados `G3_3_SYSTEMD_RECOVERY_EVENTS=GREEN`; **esses eventos são sintéticos e não substituem ensaio real**.
+
+### Execução governada pelo owner SSH
+```bash
+sudo git -c safe.directory=/opt/vps-commander/code -C /opt/vps-commander/code pull --ff-only
+sudo bash /opt/vps-commander/code/deploy/verify-g3-systemd-recovery.sh --accept-controlled-executor-restart
+```
+Esperado: `G3_3_REAL_SYSTEMD_DRILL=GREEN`. Depois executar chamada autêntica de ferramenta via ChatGPT Commander e reinspecionar o estado Cloudflare. **G3.3 não é GREEN final até esse ensaio real passar**; a implantação/smoke do gateway já é GREEN.
+
+---
+
 # G3.3 — Resiliência/recuperação do VPS Commander (2026-10-10)
 
 **Status: candidato GREEN / deployment real ainda não feito.** G3.2 produção e dois túneis continuam saudáveis; não houve fault injection em serviço produtivo.
