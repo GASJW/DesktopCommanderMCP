@@ -79,12 +79,14 @@ class Peer {
     } catch (error) { this.close(); throw error; }
   }
   fail() {
+    if (this.dead) return;
     this.dead = true;
     for (const item of this.pending.values()) {
       clearTimeout(item.timer);
       item.reject(new Error('Executor unavailable'));
     }
     this.pending.clear();
+    this.onDisconnect?.();
   }
   call(method, params = {}) {
     if (this.dead || !this.input?.writable) return Promise.reject(Error('Executor disconnected'));
@@ -106,6 +108,74 @@ class Peer {
     }
   }
   close() { this.fail(); this.socket?.destroy(); this.child?.kill('SIGTERM'); }
+}
+
+
+class RecoveringPeer {
+  constructor(file, socketPath, options = {}) {
+    this.file = file;
+    this.socketPath = socketPath;
+    this.current = null;
+    this.connecting = null;
+    this.stopping = false;
+    this.retry = null;
+    this.retries = 0;
+    this.initialDelay = options.initialDelay ?? 250;
+    this.maxDelay = options.maxDelay ?? 8000;
+  }
+  get dead() { return !this.current || this.current.dead; }
+  get initialization() { return this.current?.initialization; }
+  call(method, params) {
+    if (this.dead) return Promise.reject(new Error('Executor unavailable'));
+    return this.current.call(method, params);
+  }
+  async start() { await this.connect(); }
+  async connect() {
+    if (this.stopping) return;
+    const candidate = new Peer(this.file, this.socketPath);
+    this.connecting = candidate;
+    try {
+      await candidate.start();
+    } catch (error) {
+      candidate.close();
+      throw error;
+    } finally {
+      if (this.connecting === candidate) this.connecting = null;
+    }
+    if (this.stopping) { candidate.close(); return; }
+    this.current = candidate;
+    this.retries = 0;
+    candidate.onDisconnect = () => this.disconnected(candidate);
+    if (candidate.dead) this.disconnected(candidate);
+  }
+  disconnected(candidate) {
+    if (this.stopping || this.current !== candidate) return;
+    this.current = null;
+    candidate.close();
+    this.schedule();
+  }
+  schedule() {
+    if (this.stopping || this.retry || this.connecting) return;
+    const delay = Math.min(this.maxDelay, this.initialDelay * 2 ** Math.min(this.retries++, 8));
+    this.retry = setTimeout(async () => {
+      this.retry = null;
+      if (this.stopping) return;
+      try {
+        await this.connect();
+      } catch {
+        this.schedule();
+      }
+    }, delay);
+    this.retry.unref?.();
+  }
+  close() {
+    this.stopping = true;
+    if (this.retry) clearTimeout(this.retry);
+    this.retry = null;
+    this.connecting?.close();
+    this.current?.close();
+    this.current = null;
+  }
 }
 
 export async function startGateway(options = {}) {
@@ -131,7 +201,9 @@ export async function startGateway(options = {}) {
   if (host !== '127.0.0.1' && host !== '::1') throw Error('Loopback bind required');
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw Error('Invalid port');
   if (!executorSocket && !existsSync(executable)) throw Error('Build missing: expected Desktop Commander dist/index.js');
-  const peer = new Peer(executable, executorSocket);
+  const peer = executorSocket
+    ? new RecoveringPeer(executable, executorSocket, { initialDelay: options.recoveryInitialDelay, maxDelay: options.recoveryMaxDelay })
+    : new Peer(executable, executorSocket);
   await peer.start();
   const auditEnabled = options.auditEnabled ?? process.env.VPS_COMMANDER_AUDIT_ENABLED === '1';
   const beginAudit = auditEnabled ? createAuditRecorder({ sink: options.auditSink }) : null;
