@@ -46,7 +46,7 @@ test('ephemeral proof cannot be used twice for same pairing request',()=>{
 });
 test('agent identity object never exposes private key or environment secrets',()=>{
   const {identity}=scenario();
-  assert.deepEqual(Object.keys(identity).sort(),['fingerprint','prove','publicKeyPem']);
+  assert.deepEqual(Object.keys(identity).sort(),['fingerprint','prove','proveDeviceChallenge','publicKeyPem','signFrame']);
   assert.equal(Object.isFrozen(identity),true);
   assert.equal(JSON.stringify(identity).includes('PRIVATE KEY'),false);
 });

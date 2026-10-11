@@ -135,6 +135,29 @@ export function createDeviceRegistry({
     return t >= d.lastSeenAt && t - d.lastSeenAt <= heartbeatTtlMs;
   }
 
+  // G7.2c: authenticate a signed transport frame, with replay protection.
+  // Signature is bound to method, route, body digest and monotonically increasing sequence
+  // by the caller-supplied canonical frame. No session token alone authorizes a request.
+  function acceptSignedFrame(deviceId, sessionId, sequence, frameBytes, signatureBase64url) {
+    const d = entry(deviceId);
+    const session = d?.session;
+    if (!session || !sameSession(sessionId, session.sessionId) ||
+        !Number.isSafeInteger(sequence) || sequence <= session.lastSequence || sequence < 1 ||
+        !Buffer.isBuffer(frameBytes) || frameBytes.length < 32 || frameBytes.length > 1024 ||
+        typeof signatureBase64url !== 'string' ||
+        !/^[A-Za-z0-9_-]{86}$/.test(signatureBase64url)) return false;
+    const t = timestamp();
+    const lastAt = d.lastSeenAt ?? session.connectedAt;
+    if (t < lastAt || t - lastAt > heartbeatTtlMs) {
+      d.session = null;
+      return false;
+    }
+    if (!verify(null, frameBytes, d.key, Buffer.from(signatureBase64url, 'base64url'))) return false;
+    session.lastSequence = sequence;
+    d.lastSeenAt = t;
+    return true;
+  }
+
   function listDevices() {
     const t = timestamp();
     return Array.from(devices.values(), d => {
@@ -150,5 +173,5 @@ export function createDeviceRegistry({
   }
 
   return Object.freeze({ trustDevice, beginHandshake, completeHandshake,
-    heartbeat, disconnect, revokeDevice, listDevices, isLiveSession });
+    heartbeat, disconnect, revokeDevice, listDevices, isLiveSession, acceptSignedFrame });
 }
