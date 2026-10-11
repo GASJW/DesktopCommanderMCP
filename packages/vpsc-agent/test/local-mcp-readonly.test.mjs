@@ -49,15 +49,21 @@ test('write_file, start_process, get_config and shell are rejected before MCP di
     }
   });
 });
-test('filesystem traversal, relative paths and symlinks escaping root denied',async()=>{
+test('filesystem traversal and relative paths escaping root denied',async()=>{
   await sandbox(async({executor,file,other,approved})=>{
     for(const p of [other,path.join(approved,'..','outside','private.txt'),'demo.txt']){
       await assert.rejects(executor.handle(frame({path:p})),e=>withResult(e,'DENIED'));
     }
+    assert.match(JSON.stringify(await executor.handle(frame({path:file}))),/vpsc-readonly/);
+  });
+});
+test('symlink to file outside allowed root denied',{
+  skip:process.platform==='win32',
+},async()=>{
+  await sandbox(async({executor,other,approved})=>{
     const link=path.join(approved,'shortcut');
     symlinkSync(other,link);
     await assert.rejects(executor.handle(frame({path:link})),e=>withResult(e,'DENIED'));
-    assert.match(JSON.stringify(await executor.handle(frame({path:file}))),/vpsc-readonly/);
   });
 });
 test('bad parameters, network URL and extra injected parameters denied',async()=>{

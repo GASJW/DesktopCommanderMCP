@@ -34,3 +34,7 @@ This module is **not imported into gateway/server.mjs or the published agent CLI
 - Real non-root `read_file` integration on VPS with *actual* Desktop Commander binary PASS, including signed loopback routing.
 - Windows Gui-PC local MCP child pilot + own Agent HTTPS + owner approval must be validated in separately governed steps.
 - No merge or deployment should be construed as enabling remote execution: module and tests are inert unless a dedicated test harness invokes them.
+
+## Cross-platform local test result
+
+Gui-PC (Windows Node 24.16.0): base read-only, injection/traversal, size limits, signed mock loopback routing passed. Creating a symlink returned EPERM without developer/admin privilege, so symlink escape is now an explicitly skipped POSIX-only test on Windows; do not claim Windows symlink/junction safety is certified. No persistent service or npx package was installed.
