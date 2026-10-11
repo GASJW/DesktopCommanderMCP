@@ -72,7 +72,7 @@ class Peer {
       const init = await this.call('initialize', {
         protocolVersion: '2025-03-26', capabilities: {},
         clientInfo: { name: 'vps-commander-gateway', version: '0.1.0' },
-      });
+      }, 8_000);
       if (init.error || !init.result?.capabilities) throw Error('Upstream MCP initialization failed');
       this.initialization = init.result;
       this.notify('notifications/initialized', {});
@@ -88,14 +88,14 @@ class Peer {
     this.pending.clear();
     this.onDisconnect?.();
   }
-  call(method, params = {}) {
+  call(method, params = {}, timeoutMs = TIMEOUT_MS) {
     if (this.dead || !this.input?.writable) return Promise.reject(Error('Executor disconnected'));
     if (this.pending.size >= MAX_PENDING) return Promise.reject(Error('Executor busy'));
     const id = 'vpsc-' + ++this.sequence + '-' + randomUUID();
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id); reject(Error('Executor timeout'));
-      }, TIMEOUT_MS);
+      }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       this.input.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n', error => {
         if (error) { clearTimeout(timer); this.pending.delete(id); reject(error); }
@@ -122,6 +122,13 @@ class RecoveringPeer {
     this.retries = 0;
     this.initialDelay = options.initialDelay ?? 250;
     this.maxDelay = options.maxDelay ?? 8000;
+    this.recoverySink = options.recoverySink ?? (line => process.stderr.write(line));
+  }
+  logRecovery(phase, attempt = 0, retryDelayMs = 0) {
+    const record = {
+      event: 'vps_commander_recovery', version: 1, phase, attempt, retry_delay_ms: retryDelayMs,
+    };
+    try { this.recoverySink(JSON.stringify(record) + '\n'); } catch { /* best effort */ }
   }
   get dead() { return !this.current || this.current.dead; }
   get initialization() { return this.current?.initialization; }
@@ -144,6 +151,7 @@ class RecoveringPeer {
     }
     if (this.stopping) { candidate.close(); return; }
     this.current = candidate;
+    if (this.retries > 0) this.logRecovery('reconnected', this.retries);
     this.retries = 0;
     candidate.onDisconnect = () => this.disconnected(candidate);
     if (candidate.dead) this.disconnected(candidate);
@@ -152,11 +160,13 @@ class RecoveringPeer {
     if (this.stopping || this.current !== candidate) return;
     this.current = null;
     candidate.close();
+    this.logRecovery('disconnected');
     this.schedule();
   }
   schedule() {
     if (this.stopping || this.retry || this.connecting) return;
     const delay = Math.min(this.maxDelay, this.initialDelay * 2 ** Math.min(this.retries++, 8));
+    this.logRecovery('retry_scheduled', this.retries, delay);
     this.retry = setTimeout(async () => {
       this.retry = null;
       if (this.stopping) return;
@@ -202,7 +212,7 @@ export async function startGateway(options = {}) {
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw Error('Invalid port');
   if (!executorSocket && !existsSync(executable)) throw Error('Build missing: expected Desktop Commander dist/index.js');
   const peer = executorSocket
-    ? new RecoveringPeer(executable, executorSocket, { initialDelay: options.recoveryInitialDelay, maxDelay: options.recoveryMaxDelay })
+    ? new RecoveringPeer(executable, executorSocket, { initialDelay: options.recoveryInitialDelay, maxDelay: options.recoveryMaxDelay, recoverySink: options.recoverySink })
     : new Peer(executable, executorSocket);
   await peer.start();
   const auditEnabled = options.auditEnabled ?? process.env.VPS_COMMANDER_AUDIT_ENABLED === '1';
