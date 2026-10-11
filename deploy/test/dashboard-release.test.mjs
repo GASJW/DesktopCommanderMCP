@@ -15,6 +15,8 @@ test('Dashboard deployment script is syntactically valid and checks protected ma
   assert.match(script,/branches\/main --jq \.protected/);
   assert.match(script,/gateway-tests/);
   assert.match(script,/Check for spelling errors/);
+  assert.match(script,/gateway\/test\/dashboard\.test\.mjs/);
+  assert.match(script,/DASH_DEPLOY=RED_UNEXPECTED_RUNTIME_DELTA/);
   assert.match(script,/DASH_DEPLOY=BOOTSTRAP_GREEN/);
   assert.match(script,/DASH_ROUTE_ANONYMOUS=401/);
   assert.match(script,/refs\/heads\/feat\/g3-access-hardening|refs\/heads\/feat\/g3-access-hardening|refs\/heads\/main|feat\/g3-access-hardening/);

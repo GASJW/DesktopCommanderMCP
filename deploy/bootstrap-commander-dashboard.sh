@@ -27,7 +27,7 @@ BASELINE=$("${g[@]}" rev-parse refs/heads/feat/g3-access-hardening)
 while IFS= read -r changed;do
   [[ -z "$changed" ]] && continue
   case "$changed" in
-    gateway/server.mjs|gateway/audit.mjs|gateway/dashboard/*) :;;
+    gateway/server.mjs|gateway/audit.mjs|gateway/dashboard/*|gateway/test/dashboard.test.mjs) :;;
     *) echo "DASH_DEPLOY=RED_UNEXPECTED_RUNTIME_DELTA";exit 8;;
   esac
 done < <("${g[@]}" diff --name-only "$BASELINE" "$SHA" -- gateway/ src/ deploy/systemd/ package.json package-lock.json tsconfig.json)
