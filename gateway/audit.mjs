@@ -16,7 +16,7 @@ function routeName(value) {
   return value === '/mcp' ? 'mcp' : value === '/healthz' ? 'healthz' : 'other';
 }
 function outcomeName(value) {
-  return ['ok', 'denied', 'invalid_request', 'tool_error', 'rpc_error', 'unavailable', 'disconnected'].includes(value) ? value : 'other';
+  return ['ok', 'denied', 'invalid_request', 'tool_error', 'rpc_error', 'unavailable', 'disconnected', 'busy', 'limit_exceeded'].includes(value) ? value : 'other';
 }
 
 export function verifiedPrincipalId(principal) {
