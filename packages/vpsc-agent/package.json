@@ -1,0 +1,17 @@
+{
+  "name": "@gasjw/vpsc-agent",
+  "version": "0.0.0-dev",
+  "private": true,
+  "description": "VPS Commander device agent scaffold; pairing and transport not released",
+  "type": "module",
+  "bin": {
+    "vpsc-agent": "./bin/vpsc-agent.mjs"
+  },
+  "files": ["bin/", "src/"],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}
