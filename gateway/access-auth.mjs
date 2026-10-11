@@ -4,6 +4,9 @@ import { createPublicKey, verify as verifySignature } from 'node:crypto';
 const MAX_JWT_LENGTH = 16 * 1024;
 const KEY_CACHE_MS = 5 * 60 * 1000;
 const ALLOW_CLOCK_SKEW = 30;
+// Maximum age of a signed Access assertion. Application session duration is 8h.
+// Fail closed for unreasonably long-lived or internally inconsistent tokens.
+const MAX_ACCESS_ASSERTION_LIFETIME = 24 * 60 * 60;
 
 function segmentJson(segment) {
   if (typeof segment !== 'string' || !/^[A-Za-z0-9_-]+$/.test(segment) || segment.length > MAX_JWT_LENGTH) {
@@ -76,7 +79,8 @@ export function createAccessVerifier(options = {}) {
           !(payload.aud === c.audience || (Array.isArray(payload.aud) && payload.aud.includes(c.audience))) ||
           !Number.isInteger(payload.exp) || payload.exp <= now - ALLOW_CLOCK_SKEW ||
           !Number.isInteger(payload.iat) || payload.iat > now + ALLOW_CLOCK_SKEW ||
-          (payload.nbf != null && (!Number.isInteger(payload.nbf) || payload.nbf > now + ALLOW_CLOCK_SKEW)) ||
+          payload.iat > payload.exp || payload.exp - payload.iat > MAX_ACCESS_ASSERTION_LIFETIME ||
+          (payload.nbf != null && (!Number.isInteger(payload.nbf) || payload.nbf > now + ALLOW_CLOCK_SKEW || payload.nbf > payload.exp)) ||
           typeof payload.email !== 'string' || !c.emails.has(payload.email.toLowerCase()) ||
           typeof payload.sub !== 'string' || payload.sub.length < 1) return null;
       let keys = await getKeys();
