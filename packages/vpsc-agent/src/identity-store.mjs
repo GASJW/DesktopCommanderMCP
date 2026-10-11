@@ -41,12 +41,13 @@ function powershellDpapi(op,input) {
   // Script body is static and contains no secrets. PKCS8 key material is sent
   // only through stdin, never in argv, the shell command or the output logs.
   const code = [
+    "Add-Type -AssemblyName System.Security",
     "$ErrorActionPreference='Stop'",
     "$s=[Console]::In.ReadToEnd().Trim()",
     "$bytes=[Convert]::FromBase64String($s)",
     "$entropy=[Text.Encoding]::UTF8.GetBytes('"+DOMAIN+"')",
-    "$scope=[Security.Cryptography.DataProtectionScope]::CurrentUser",
-    "$cipher=[Security.Cryptography.ProtectedData]::"+(op==='protect'?'Protect':'Unprotect')+"($bytes,$entropy,$scope)",
+    "$scope=[System.Security.Cryptography.DataProtectionScope]::CurrentUser",
+    "$cipher=[System.Security.Cryptography.ProtectedData]::"+(op==='protect'?'Protect':'Unprotect')+"($bytes,$entropy,$scope)",
     "[Console]::Out.Write([Convert]::ToBase64String($cipher))",
   ].join(';');
   const proc=spawnSync('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',

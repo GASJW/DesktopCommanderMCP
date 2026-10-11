@@ -14,7 +14,7 @@
 ## Tests / constraints
 
 - On Linux: persistence across a **separate Node process**, directory/file permissions, symlink rejection, invalid/corrupt identity handling, fingerprint tamper and private key exclusion from public object.
-- On Windows (required before certification): DPAPI CurrentUser encrypt/decrypt test in a temporary user-owned directory, process-restart persistence and verifying that another user cannot decrypt, where authorized.
+- On Windows Gui-PC, actual DPAPI CurrentUser encrypt/decrypt in a temporary user-owned directory passed with process-restart persistence (8 PASS / 5 POSIX SKIP). Required fix: explicitly load the System.Security assembly before resolving ProtectedData/DataProtectionScope. Cross-user decryption denial and directory ACL audit remain uncertified.
 - Do **not** claim Windows validation based solely on Linux skipped tests. Windows test must run on a consenting Gui-PC with adequate disk and trusted checkout. No existing device credentials should be imported.
 - Do not allow profile path override through untrusted agent network messages; test directory injection is local-only and cannot be a remote tool parameter.
 - Hardening before live rollout: Windows directory ACL audit; key-at-rest process-memory hygiene, backup/recovery, key rotation with two-phase owner approval, server-side revocation/tombstones and authenticated TLS ingress, no rollback to a previously revoked key.
@@ -27,3 +27,9 @@
 At preparation time VPS gui root disk reported 90% utilized; workspace intentionally uses shallow clones and does not install npm dependencies. Preserve existing G6 production and G5.2 PR #10.
 
 **Acceptance:** protected CI GREEN, Linux test suite GREEN, Windows DPAPI simulation GREEN, security review of storage and ownership. No live rollout from this PR alone.
+
+## Real host evidence — 11 October 2026
+
+- Linux gui: 140 tests in baseline suite (139 PASS, 1 Windows SKIP) after initial storage implementation. Final Linux rerun after Windows fix required before publication.
+- Windows Gui-PC, Node v24.16.0: actual code exercised via a temporary shallow clone of private branch, with test-only keys. Initial DPAPI test failed with PowerShell TypeNotFound because System.Security assembly was not explicitly loaded. Small code fix to load assembly and use full type names; rerun on Gui-PC **8 PASS, 0 FAIL, 5 POSIX SKIP**, verified another process reload. No imported RDC credentials or live machine enrollment. Test clone resides only under the current user TEMP folder.
+- No published npx package and no Cloudflare/MCP production changes.
