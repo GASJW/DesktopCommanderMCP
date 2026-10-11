@@ -1,3 +1,29 @@
+# G3.2 — CERTIFICAÇÃO FINAL LIVE GREEN (2026-10-10, horário local)
+
+**Estado atual: G3.2 GREEN.** Registros reais autenticados comprovados no `journald` em execução SSH root do proprietário, após deployment e smoke via plugin ChatGPT Commander.
+
+Saída observada de `deploy/verify-g3-audit-journal.py`, executado por pipeline `journalctl -u vps-commander.service --since '60 minutes ago' --no-pager -o cat`:
+
+```text
+G3_2_JOURNAL_EVENTS=12
+G3_2_JOURNAL_VALID=12
+G3_2_JOURNAL_VERIFIED_PRINCIPAL=11
+G3_2_JOURNAL_DENIED=1
+G3_2_TOOL_READ_FILE=PASS
+G3_2_TOOL_START_PROCESS=PASS
+G3_2_TOOL_WRITE_FILE=PASS
+G3_2_SCHEMA_VIOLATIONS=0
+G3_2_JOURNAL_CERTIFICATION=GREEN
+```
+
+A janela inclui chamadas reais de `start_process`, `read_file` e `write_file` feitas pelo conector ChatGPT. A análise foi restrita a metadados: nenhum conteúdo de comando, token, arquivo ou identidade bruta foi impresso. O operador já havia comprovado `G3_2_AUDIT_SYSTEMD=BOOTSTRAP_GREEN`, 16/16 testes de gateway e evento 401 registrado. Os túneis `vps-commander` e `cofre` estavam healthy, com quatro conexões cada.
+
+**Limites inalterados:** registros journald não são imutáveis, retenção depende da configuração do host, eventos cobrem requisições MCP (não subprocessos), falha do destino de log não bloqueia execução e crash pode perder registros. Esses limites pertencem a fases futuras, não contradizem o G3.2 aprovado.
+
+**Governança:** PR #3 permanece Draft até integração protegida/revisão, apesar de G3.2 operacional GREEN. Próximo marco independente: G3.3 recuperação de falhas do gateway, executor e conector, sem tocar em Cloudflare Access ou privilégios.
+
+---
+
 # G3.2 — POST-DEPLOY STATUS, 2026-10-10 (local) / 2026-10-11 (UTC)
 
 **Current state: deployment GREEN / ChatGPT authenticated MCP smoke GREEN / privileged journald inspection PENDING.** Older sections below contain historical pre-deployment state.
