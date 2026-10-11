@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, sign } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, lstatSync, mkdtempSync, readFileSync, rmSync,
+import { chmodSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync,
   symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -216,5 +216,25 @@ test('trust revision exhaustion denies mutation and blocks further session acces
     const restarted=createDurableDeviceTrustStore({directory:dir});
     assert.throws(()=>restarted.trustDevice(metadata(generate())),/revision exhausted/);
     assert.throws(()=>restarted.registry.listDevices(),/Trust store unavailable/);
+  });
+});
+test('stale second writer cannot overwrite another process trust revision',()=>{
+  temp(dir=>{
+    const first=createDurableDeviceTrustStore({directory:dir});
+    const second=createDurableDeviceTrustStore({directory:dir});
+    first.trustDevice(metadata(generate(),'first'));
+    assert.throws(()=>second.trustDevice(metadata(generate(),'second')),/changed by another process/);
+    assert.throws(()=>second.registry.listDevices(),/Trust store unavailable/);
+    const read=createDurableDeviceTrustStore({directory:dir});
+    assert.equal(read.registry.listDevices().length,1);
+  });
+});
+test('exclusive lock blocks writers and keeps service fail-closed',()=>{
+  temp(dir=>{
+    const store=createDurableDeviceTrustStore({directory:dir});
+    const lock=path.join(dir,'.trusted-devices-writer.lock');
+    mkdirSync(lock,{mode:0o700});
+    assert.throws(()=>store.trustDevice(metadata(generate())),/EEXIST/);
+    assert.throws(()=>store.registry.listDevices(),/Trust store unavailable/);
   });
 });

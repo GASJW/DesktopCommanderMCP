@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { constants, closeSync, fstatSync, fsyncSync, lstatSync,
-  mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+  mkdirSync, openSync, readFileSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createDeviceRegistry } from './registry.mjs';
 
 // G7.2e candidate. Server-side trust records contain PUBLIC keys only.
@@ -81,11 +81,34 @@ export function createDurableDeviceTrustStore({directory,maxDevices=32,now=Date.
     requireHealthy();
     if(snapshot.revision>=Number.MAX_SAFE_INTEGER){blocked=true;throw Error('Trust revision exhausted');}
     const next={version:1,revision:snapshot.revision+1,devices:candidate.snapshotTrustedDevices()};
-    blocked=true; // Fail closed if ANY write, rename or directory fsync fails.
-    commitSnapshot(directory,next); // Do NOT change memory before durable write.
-    snapshot=next;
-    current=candidate; // New registry discards existing sessions / challenges.
-    blocked=false;
+    blocked=true; // Fail closed if ANY storage/lock failure or stale snapshot occurs.
+    // mkdir is exclusive across processes on a local POSIX filesystem. Never
+    // steal a pre-existing lock: after a crash, an operator must reconcile it.
+    const lock=path.join(directory,'.trusted-devices-writer.lock');
+    let locked=false, committed=false;
+    try {
+      mkdirSync(lock,{mode:0o700});
+      locked=true;
+      const actual=readSnapshot(directory);
+      if(actual.revision!==snapshot.revision ||
+         JSON.stringify(actual.devices)!==JSON.stringify(snapshot.devices)){
+        throw Error('Trust store changed by another process; restart required');
+      }
+      commitSnapshot(directory,next); // Do NOT change memory before durable write.
+      committed=true;
+      snapshot=next;
+      current=candidate; // New registry discards sessions / challenges.
+      rmdirSync(lock);
+      locked=false;
+      blocked=false;
+    } finally {
+      // On a failed durability step, do not remove the lock automatically:
+      // after a crash/uncertain write the next writer must stop for recovery.
+      // A deterministic pre-commit stale revision is safe to release.
+      if(locked&&!committed){
+        // Keep lock in place for operator inspection (fail-closed).
+      }
+    }
   }
   function trustDevice(metadata) {
     requireHealthy();
