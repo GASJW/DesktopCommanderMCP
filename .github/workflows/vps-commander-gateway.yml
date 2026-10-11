@@ -19,6 +19,7 @@ jobs:
       - run: node --check gateway/server.mjs
       - run: node --check gateway/access-auth.mjs
       - run: node --check gateway/audit.mjs
+      - run: node --check gateway/dashboard/metrics.mjs gateway/dashboard/http.mjs gateway/dashboard/app.js
       - run: node --check deploy/manual-smoke-g3-audit.mjs
       - run: node --test gateway/test/*.test.mjs deploy/test/*.test.mjs
       - run: bash -n deploy/bootstrap-g3-isolation.sh
@@ -28,6 +29,7 @@ jobs:
       - run: bash -n deploy/repair-g3-gateway-dependency.sh
       - run: bash -n deploy/bootstrap-g3-limits.sh
       - run: bash -n deploy/bootstrap-g3-access.sh
+      - run: bash -n deploy/bootstrap-commander-dashboard.sh
       - run: bash -n deploy/g5-health.sh deploy/g5-backup.sh deploy/g5-release-guard.sh
       - run: node --check deploy/manual-smoke-g3-access.mjs
       - run: python3 -c "import ast,pathlib; ast.parse(pathlib.Path('deploy/verify-g3-recovery-events.py').read_text())"
