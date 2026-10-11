@@ -37,6 +37,19 @@ ensure_gateway_sources_readable() {
   done
 }
 ensure_gateway_sources_readable
+# The dedicated tunnel Requires=the gateway, so systemctl restart gateway also
+# brings the tunnel through activating. Poll its state rather than immediately
+# declaring the release RED on the first transient activating result.
+wait_commander_tunnel_ready() {
+  local attempts="${1:-120}" delay="${2:-0.25}" i
+  for ((i=0; i<attempts; i++)); do
+    if systemctl is-active --quiet cloudflared-vps-commander.service; then
+      return 0
+    fi
+    sleep "$delay"
+  done
+  return 1
+}
 /opt/vps-commander/bin/node --check gateway/server.mjs
 /opt/vps-commander/bin/node --test gateway/test/*.test.mjs deploy/test/*.test.mjs
 BACKUP=$(mktemp -d /root/vps-commander-g3-limits-backup.XXXXXXXX)
@@ -64,14 +77,20 @@ rollback() {
     [[ "$status" = 401 ]] && break
     sleep 0.25
   done
-  if [[ "$status" = 401 ]] && systemctl is-active --quiet "$GW"; then
-    echo 'G3_4_ROLLBACK=GREEN_G3_3_RESTORED'
-  else
+  if [[ "$status" != 401 ]] || ! systemctl is-active --quiet "$GW"; then
     echo 'G3_4_ROLLBACK=RED_NOT_HEALTHY' >&2
+    return 1
   fi
-  if ! systemctl is-active --quiet cloudflared-vps-commander.service; then
+  if ! wait_commander_tunnel_ready; then
+    # Single best-effort tunnel restart only if ordinary dependency recovery
+    # did not stabilize; never touch the unrelated cofre tunnel.
     systemctl restart cloudflared-vps-commander.service || true
+    if ! wait_commander_tunnel_ready; then
+      echo 'G3_4_ROLLBACK=RED_TUNNEL_UNAVAILABLE' >&2
+      return 1
+    fi
   fi
+  echo 'G3_4_ROLLBACK=GREEN_G3_3_RESTORED'
 }
 trap rollback ERR
 wk_pid_before=$(systemctl show -P MainPID "$WK")
@@ -89,9 +108,13 @@ systemctl is-active --quiet "$WK"
 [[ "$(systemctl show -P MainPID "$WK")" = "$wk_pid_before" ]]
 [[ " $(systemctl show -P Wants "$GW") " = *" $WK "* ]]
 [[ "$(systemctl show -P Environment "$GW")" = *VPS_COMMANDER_AUDIT_ENABLED=1* ]]
-systemctl is-active --quiet cloudflared-vps-commander.service
+if ! wait_commander_tunnel_ready; then
+  echo 'G3_4_GATE=RED_TUNNEL_NOT_READY_AFTER_WAIT' >&2
+  false
+fi
 systemctl is-active --quiet cloudflared.service
 trap - ERR
+echo G3_4_TUNNEL_STABILIZATION=PASS
 echo G3_4_GATEWAY_DEPLOY=BOOTSTRAP_GREEN
 echo G3_4_EXECUTOR_PID_UNCHANGED=PASS
 echo G3_4_ANONYMOUS_ORIGIN_HTTP=401
