@@ -1,7 +1,6 @@
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
 import { createConnection } from 'node:net';
-import { createInterface } from 'node:readline';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
@@ -16,6 +15,8 @@ const DEFAULT_EXECUTOR = path.join(ROOT, 'dist/index.js');
 const TIMEOUT_MS = 120_000;
 const MAX_PENDING = 16;
 const MAX_BODY = 1024 * 1024;
+const DEFAULT_MAX_RESPONSE = 2 * 1024 * 1024;
+const DEFAULT_MAX_RPC_LINE = 4 * 1024 * 1024;
 
 export function matchesBearer(header, token) {
   if (typeof header !== 'string' || !header.startsWith('Bearer ')) return false;
@@ -31,7 +32,7 @@ function fault(id, code, message) {
   return { jsonrpc: '2.0', id: id ?? null, error: { code, message } };
 }
 class Peer {
-  constructor(file, socketPath) { this.file = file; this.socketPath = socketPath; this.pending = new Map(); this.sequence = 0; this.dead = false; }
+  constructor(file, socketPath, maxLine = DEFAULT_MAX_RPC_LINE) { this.file = file; this.socketPath = socketPath; this.maxLine = maxLine; this.pending = new Map(); this.sequence = 0; this.dead = false; }
   async start() {
     if (this.socketPath) {
       const socket = createConnection(this.socketPath);
@@ -56,17 +57,45 @@ class Peer {
     this.child.on('exit', () => this.fail());
     this.child.on('error', () => this.fail());
     }
-    createInterface({ input: this.output }).on('line', line => {
-      if (line.length > 16_000_000) return;
-      let message;
-      try { message = JSON.parse(line); } catch { return; }
-      if (!message || !Object.hasOwn(message, 'id')) return;
-      const key = String(message.id);
-      const item = this.pending.get(key);
-      if (!item) return;
-      clearTimeout(item.timer);
-      this.pending.delete(key);
-      item.resolve(message);
+    // Bound every upstream JSONL frame while receiving, including lines with no newline.
+    // Oversized output closes this transport; in-flight operations are never automatically replayed.
+    let parts = [];
+    let frameBytes = 0;
+    this.output.on('data', chunk => {
+      if (this.dead) return;
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      let start = 0;
+      while (start < buffer.length && !this.dead) {
+        const endOfLine = buffer.indexOf(10, start);
+        const end = endOfLine < 0 ? buffer.length : endOfLine;
+        const length = end - start;
+        if (frameBytes + length > this.maxLine) {
+          parts = [];
+          frameBytes = 0;
+          this.fail();
+          this.socket?.destroy();
+          this.child?.kill('SIGTERM');
+          return;
+        }
+        if (length) parts.push(buffer.subarray(start, end));
+        frameBytes += length;
+        if (endOfLine < 0) return;
+        const line = Buffer.concat(parts, frameBytes).toString('utf8');
+        parts = [];
+        frameBytes = 0;
+        let message;
+        try { message = JSON.parse(line); } catch { start = endOfLine + 1; continue; }
+        if (message && Object.hasOwn(message, 'id')) {
+          const key = String(message.id);
+          const item = this.pending.get(key);
+          if (item) {
+            clearTimeout(item.timer);
+            this.pending.delete(key);
+            item.resolve(message);
+          }
+        }
+        start = endOfLine + 1;
+      }
     });
     try {
       const init = await this.call('initialize', {
@@ -123,6 +152,7 @@ class RecoveringPeer {
     this.initialDelay = options.initialDelay ?? 250;
     this.maxDelay = options.maxDelay ?? 8000;
     this.recoverySink = options.recoverySink ?? (line => process.stderr.write(line));
+    this.maxLine = options.maxLine ?? DEFAULT_MAX_RPC_LINE;
   }
   logRecovery(phase, attempt = 0, retryDelayMs = 0) {
     const record = {
@@ -139,7 +169,7 @@ class RecoveringPeer {
   async start() { await this.connect(); }
   async connect() {
     if (this.stopping) return;
-    const candidate = new Peer(this.file, this.socketPath);
+    const candidate = new Peer(this.file, this.socketPath, this.maxLine);
     this.connecting = candidate;
     try {
       await candidate.start();
@@ -210,13 +240,20 @@ export async function startGateway(options = {}) {
     throw Error('VPS_COMMANDER_TOKEN must contain 32-4096 bytes');
   if (host !== '127.0.0.1' && host !== '::1') throw Error('Loopback bind required');
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw Error('Invalid port');
+  const maxResponseBytes = options.maxResponseBytes ?? Number(process.env.VPS_COMMANDER_MAX_RESPONSE_BYTES ?? DEFAULT_MAX_RESPONSE);
+  const maxUpstreamLineBytes = options.maxUpstreamLineBytes ?? Number(process.env.VPS_COMMANDER_MAX_RPC_LINE_BYTES ?? DEFAULT_MAX_RPC_LINE);
+  const maxInFlight = options.maxInFlight ?? Number(process.env.VPS_COMMANDER_MAX_INFLIGHT ?? MAX_PENDING);
+  if (!Number.isSafeInteger(maxResponseBytes) || maxResponseBytes < 1024 || maxResponseBytes > 8 * 1024 * 1024) throw Error('Invalid response byte limit');
+  if (!Number.isSafeInteger(maxUpstreamLineBytes) || maxUpstreamLineBytes < 1024 || maxUpstreamLineBytes > 16 * 1024 * 1024 || maxUpstreamLineBytes < maxResponseBytes) throw Error('Invalid upstream line byte limit');
+  if (!Number.isSafeInteger(maxInFlight) || maxInFlight < 1 || maxInFlight > MAX_PENDING) throw Error('Invalid in-flight limit');
   if (!executorSocket && !existsSync(executable)) throw Error('Build missing: expected Desktop Commander dist/index.js');
   const peer = executorSocket
-    ? new RecoveringPeer(executable, executorSocket, { initialDelay: options.recoveryInitialDelay, maxDelay: options.recoveryMaxDelay, recoverySink: options.recoverySink })
-    : new Peer(executable, executorSocket);
+    ? new RecoveringPeer(executable, executorSocket, { initialDelay: options.recoveryInitialDelay, maxDelay: options.recoveryMaxDelay, recoverySink: options.recoverySink, maxLine: maxUpstreamLineBytes })
+    : new Peer(executable, executorSocket, maxUpstreamLineBytes);
   await peer.start();
   const auditEnabled = options.auditEnabled ?? process.env.VPS_COMMANDER_AUDIT_ENABLED === '1';
   const beginAudit = auditEnabled ? createAuditRecorder({ sink: options.auditSink }) : null;
+  let inFlight = 0;
   const server = createServer(async (req, res) => {
     const audit = beginAudit?.(req, res);
     // No browser cross-origin requests. Also do not leak MCP methods without auth.
@@ -265,13 +302,28 @@ export async function startGateway(options = {}) {
     if (!Object.hasOwn(message, 'id')) {
       res.writeHead(202, { 'cache-control': 'no-store' }); return res.end();
     }
+    if (inFlight >= maxInFlight) {
+      audit?.outcome('busy');
+      res.setHeader('retry-after', '1');
+      return reply(res, 429, fault(message.id, -32001, 'Gateway at concurrency limit'));
+    }
+    inFlight++;
     try {
       const result = await peer.call(message.method, message.params ?? {});
+      const envelope = { ...result, id: message.id };
+      const encoded = JSON.stringify(envelope);
+      if (Buffer.byteLength(encoded, 'utf8') > maxResponseBytes) {
+        audit?.outcome('limit_exceeded');
+        return reply(res, 502, fault(message.id, -32005, 'Executor response exceeds limit; use smaller chunks'));
+      }
       audit?.outcome(result?.error ? 'rpc_error' : result?.result?.isError ? 'tool_error' : 'ok');
-      return reply(res, 200, { ...result, id: message.id });
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
+      return res.end(encoded);
     } catch {
       audit?.outcome('unavailable');
-      return reply(res, peer.dead ? 503 : 502, fault(message.id, -32000, 'Executor unavailable, busy or timed out'));
+      return reply(res, peer.dead ? 503 : 502, fault(message.id, -32000, 'Executor unavailable or timed out'));
+    } finally {
+      inFlight--;
     }
   });
   server.requestTimeout = TIMEOUT_MS + 5000;
