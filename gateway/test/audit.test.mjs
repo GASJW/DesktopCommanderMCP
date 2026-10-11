@@ -75,7 +75,7 @@ test('audit uses only allowlisted method/tool identifiers and never includes com
     const res=await fetch(app.address+'/mcp',{method:'POST',headers:{authorization:'Bearer '+token,
       'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:'ignored',
       method:'tools/call',params:{name:'../'+secret,arguments:{command:secret,path:'/private/very-secret'}}})});
-    assert.equal(res.status,200); await res.text(); await wait();
+    assert.equal(res.status,400); await res.text(); await wait();
     const event=records.find(x=>x.operation==='tools/call');
     assert.ok(event); assert.equal(event.tool,'unknown');
     assert.equal(event.identity,'local-authenticated');

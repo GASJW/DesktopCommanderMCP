@@ -17,6 +17,10 @@ const MAX_PENDING = 16;
 const MAX_BODY = 1024 * 1024;
 const DEFAULT_MAX_RESPONSE = 2 * 1024 * 1024;
 const DEFAULT_MAX_RPC_LINE = 4 * 1024 * 1024;
+// This gateway exposes only the read/execute MCP tool surface. Never proxy
+// arbitrary JSON-RPC method names directly into the privileged executor.
+const ALLOWED_RPC_METHODS = new Set(['initialize', 'ping', 'tools/list', 'tools/call']);
+const ALLOWED_RPC_NOTIFICATIONS = new Set(['notifications/initialized', 'notifications/cancelled']);
 
 export function matchesBearer(header, token) {
   if (typeof header !== 'string' || !header.startsWith('Bearer ')) return false;
@@ -288,10 +292,26 @@ export async function startGateway(options = {}) {
     } catch { return reply(res, 400, { error: 'Invalid body' }); }
     let message;
     try { message = JSON.parse(body); } catch { return reply(res, 400, fault(null, -32700, 'Invalid JSON')); }
-    if (!message || Array.isArray(message) || message.jsonrpc !== '2.0' || typeof message.method !== 'string')
+    if (!message || Array.isArray(message) || message.jsonrpc !== '2.0' ||
+        typeof message.method !== 'string' || !message.method || message.method.length > 100)
       return reply(res, 400, fault(message?.id, -32600, 'Invalid request'));
+    const hasId = Object.hasOwn(message, 'id');
+    if (hasId && (message.id === null || typeof message.id === 'boolean' ||
+        (typeof message.id !== 'string' && (typeof message.id !== 'number' || !Number.isSafeInteger(message.id)))))
+      return reply(res, 400, fault(null, -32600, 'Invalid request id'));
     audit?.operation(message.method, message.params?.name);
-    if (message.method === 'initialize' && Object.hasOwn(message, 'id')) {
+    if (!ALLOWED_RPC_METHODS.has(message.method) && !ALLOWED_RPC_NOTIFICATIONS.has(message.method)) {
+      audit?.outcome('invalid_request');
+      return reply(res, 404, fault(hasId ? message.id : null, -32601, 'Method not found'));
+    }
+    if (message.method === 'tools/call' && (typeof message.params?.name !== 'string' ||
+        !/^[a-zA-Z][a-zA-Z0-9_-]{0,79}$/.test(message.params.name) ||
+        (message.params.arguments !== undefined && (!message.params.arguments ||
+         typeof message.params.arguments !== 'object' || Array.isArray(message.params.arguments))))) {
+      audit?.outcome('invalid_request');
+      return reply(res, 400, fault(hasId ? message.id : null, -32602, 'Invalid tool parameters'));
+    }
+    if (message.method === 'initialize' && hasId) {
       const init = peer.initialization;
       return reply(res, 200, {
         jsonrpc: '2.0', id: message.id,
@@ -299,8 +319,16 @@ export async function startGateway(options = {}) {
           serverInfo: { name: 'vps-commander-gateway', version: '0.1.0' } },
       });
     }
-    if (!Object.hasOwn(message, 'id')) {
+    if (!hasId) {
+      if (!ALLOWED_RPC_NOTIFICATIONS.has(message.method)) {
+        audit?.outcome('invalid_request');
+        return reply(res, 400, fault(null, -32600, 'Notification not supported for method'));
+      }
       res.writeHead(202, { 'cache-control': 'no-store' }); return res.end();
+    }
+    if (ALLOWED_RPC_NOTIFICATIONS.has(message.method)) {
+      audit?.outcome('invalid_request');
+      return reply(res, 400, fault(message.id, -32600, 'Notification cannot carry request id'));
     }
     if (inFlight >= maxInFlight) {
       audit?.outcome('busy');
