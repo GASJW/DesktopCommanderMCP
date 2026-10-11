@@ -13,7 +13,7 @@ if [[ $EUID -ne 0 || "${1:-}" != '--accept-controlled-executor-restart' ]]; then
 fi
 [[ "$(git -c safe.directory="$BASE" -C "$BASE" branch --show-current)" == 'feat/g3-recovery' ]] || { echo WRONG_BRANCH; exit 3; }
 [[ -f "$VERIFIER" ]] || { echo VERIFIER_NOT_FOUND; exit 4; }
-python3 -m py_compile "$VERIFIER"
+python3 -c 'import ast,pathlib,sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())' "$VERIFIER"
 for unit in "$GATEWAY" "$WORKER" cloudflared-vps-commander.service cloudflared.service; do
   systemctl is-active --quiet "$unit" || { echo "SERVICE_NOT_ACTIVE=$unit"; exit 5; }
 done
