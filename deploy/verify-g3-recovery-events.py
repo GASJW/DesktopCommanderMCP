@@ -16,10 +16,10 @@ for line in sys.stdin:
             raise ValueError('fields')
         if obj['event'] != 'vps_commander_recovery' or obj['version'] != 1:
             raise ValueError('version')
-        if obj['phase'] not in required or
+        if (obj['phase'] not in required or
                 not isinstance(obj['attempt'], int) or obj['attempt'] < 0 or
                 not isinstance(obj['retry_delay_ms'], int) or
-                not 0 <= obj['retry_delay_ms'] <= 8000:
+                not 0 <= obj['retry_delay_ms'] <= 8000):
             raise ValueError('value')
         events.append(obj['phase'])
     except (json.JSONDecodeError, ValueError, TypeError, KeyError):
