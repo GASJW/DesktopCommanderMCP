@@ -38,7 +38,7 @@ function checkedRead(args,root,maxBytes){
 }
 export function createLocalReadonlyMcp({
   allowedRoot,entrypoint,nodeBin=process.execPath,
-  timeoutMs=8000,maxFileBytes=64*1024,
+  timeoutMs=8000,startupTimeoutMs=30_000,maxFileBytes=64*1024,
 }={}){
   if(typeof process.getuid==='function' && process.getuid()===0){
     throw err('PRIVILEGE','Agent must run as nonroot');
@@ -46,6 +46,7 @@ export function createLocalReadonlyMcp({
   if(typeof entrypoint!=='string'||!path.isAbsolute(entrypoint)||
      !statSync(entrypoint).isFile()||typeof nodeBin!=='string'||!path.isAbsolute(nodeBin)||
      !Number.isSafeInteger(timeoutMs)||timeoutMs<1000||timeoutMs>30000||
+     !Number.isSafeInteger(startupTimeoutMs)||startupTimeoutMs<1000||startupTimeoutMs>60000||
      !Number.isSafeInteger(maxFileBytes)||maxFileBytes<1024||maxFileBytes>1024*1024){
     throw err('POLICY','Invalid local MCP runtime configuration');
   }
@@ -59,7 +60,7 @@ export function createLocalReadonlyMcp({
     pending.clear();
     child?.kill('SIGTERM');
   }
-  function send(method,params={},notify=false){
+  function send(method,params={},notify=false,deadlineMs=timeoutMs){
     if(dead||!child?.stdin?.writable) return Promise.reject(err('UNAVAILABLE','Local MCP unavailable'));
     if(pending.size>=MAX_PENDING&&!notify) return Promise.reject(err('BUSY','Local MCP busy'));
     const id='g7-agent-'+(++serial);
@@ -75,7 +76,7 @@ export function createLocalReadonlyMcp({
         pending.delete(id);
         shutdown(err('AMBIGUOUS_TIMEOUT','MCP operation timed out; no automatic replay'));
         reject(err('AMBIGUOUS_TIMEOUT','MCP operation timed out; no automatic replay'));
-      },timeoutMs);
+      },deadlineMs);
       pending.set(id,{resolve,reject,timer});
       child.stdin.write(wire,error=>{
         if(!error)return;
@@ -129,7 +130,7 @@ export function createLocalReadonlyMcp({
       const init=await send('initialize',{
         protocolVersion:'2025-03-26',capabilities:{},
         clientInfo:{name:'vpsc-readonly-device-agent',version:'0.0.0-dev'},
-      });
+      },false,startupTimeoutMs);
       if(init.error||!init.result?.capabilities)throw err('UNAVAILABLE','MCP initialization failed');
       await send('notifications/initialized',{},true);
     }catch(e){shutdown();throw e;}

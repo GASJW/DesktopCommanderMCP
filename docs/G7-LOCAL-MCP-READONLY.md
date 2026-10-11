@@ -38,3 +38,7 @@ This module is **not imported into gateway/server.mjs or the published agent CLI
 ## Cross-platform local test result
 
 Gui-PC (Windows Node 24.16.0): base read-only, injection/traversal, size limits, signed mock loopback routing passed. Creating a symlink returned EPERM without developer/admin privilege, so symlink escape is now an explicitly skipped POSIX-only test on Windows; do not claim Windows symlink/junction safety is certified. No persistent service or npx package was installed.
+
+## Windows installed MCP startup finding
+
+The installed Desktop Commander on Gui-PC replied successfully to MCP initialize after approximately **7.2 seconds** (separately measured; stdout response present, no child stderr). The prior host test used a 7-second deadline for both startup and operations and timed out. The adapter now has a **distinct default startupTimeoutMs=30,000** while retaining the bounded per-operation timeoutMs=8,000 by default; this does not authorize any new tool. Retest with the exact updated GitHub candidate required.
