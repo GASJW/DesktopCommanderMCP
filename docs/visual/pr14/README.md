@@ -31,3 +31,12 @@ Outras capturas: [tablet 768 × 1024](768x1024-normal.png), [mobile 375 × 812](
 O teste foi realizado com **fixtures**, não com sessão autenticada de produção. Não houve deployment. Os textos secundários de 10px merecem **revisão subjetiva de legibilidade no celular**, apesar de axe-core não reportar violações.
 
 **Validação técnica visual e de acessibilidade automatizada: concluída.** Aceite subjetivo pelo proprietário: **pendente**. Não dar merge ou fazer deploy até o proprietário aprovar as capturas.
+
+## Refinamento mobile de legibilidade — 11/10/2026
+
+Somente CSS responsivo da mesma branch: textos operacionais secundários e rótulos pequenos passaram a 11 px ou mais no celular, mantendo hierarquia e densidade editorial. Navegação, marca, botão de atualização e controle de expansão da tabela receberam altura mínima de 44 px. Sem alteração de JavaScript, backend, autenticação, API ou serviços.
+
+- [Mobile refinado 390 × 844](mobile-refined-390x844-normal.png) e [mobile refinado 320 × 740](mobile-refined-320x740-normal.png) — capturas Chromium com fixtures locais, não produção.
+- Revalidação no ambiente isolado: 54/54 testes Node PASS; 15 cenários Playwright sem overflow horizontal; tabela de 60 linhas nos sete cenários normais; nos viewports móveis testados, nenhum texto-alvo abaixo de 11 px nem controle-alvo abaixo de 44 px.
+- axe-core: zero violações detectadas nas regras WCAG 2 A/AA e 2.1 A/AA em 1366, 390 e 375 px; foco e expansão por Enter preservados.
+- A aceitação visual subjetiva pelo proprietário permanece **pendente**. Nada foi mergeado ou implantado.

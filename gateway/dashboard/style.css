@@ -182,30 +182,44 @@ h1 { margin: 0; font-size: 29px; line-height: 1.2; font-weight: 620; letter-spac
   .secondary-grid { margin-top: 27px; }
   .chart-frame { height: 194px; }
   .devices-section { margin-top: 28px; }
+  /* Mobile readability: no tiny operational annotations or cramped tap targets. */
+  .brand, .refresh { min-height: 44px; }
+  .refresh { min-width: 44px; }
+  .primary-nav a { min-height: 44px; font-size: 12px; }
+  .metric-context, .section-heading p, .chart-legend, .chart-data,
+  .attention-detail, .service-group-label, .service-state, .external-note,
+  .tool-count, .resource-note, .source-label, .role-label, .role-item p,
+  .device-identity div span, .device-type, .device-caveat, .identity-count,
+  .identity-row, .identity-caveat, .page-footer {
+    font-size: 11px;
+    line-height: 1.5;
+  }
+  .chart-data table { font-size: 11px; }
+  .chart-data summary { display: inline-flex; align-items: center; min-height: 44px; }
 }
 @media (max-width: 430px) {
   body { font-size: 13px; }
   .topbar { padding-right: 14px; padding-left: 14px; }
   .brand { gap: 8px; }
   .brand-mark { width: 27px; height: 27px; font-size: 16px; }
-  .brand-name { display: grid; gap: 0; font-size: 11px; line-height: 1.1; }
-  .brand-name span { margin-left: 0; font-size: 9px; }
+  .brand-name { display: grid; gap: 0; font-size: 12px; line-height: 1.2; }
+  .brand-name span { margin-left: 0; font-size: 11px; }
   .topbar-actions { gap: 8px; }
-  .connection { gap: 6px; font-size: 9px; }
+  .connection { gap: 6px; font-size: 11px; }
   .refresh { gap: 0; padding: 7px; }
   .refresh span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; }
   .primary-nav { gap: 18px; }
   .page { width: calc(100% - 32px); padding-top: 24px; }
   h1 { font-size: 25px; }
-  .page-description { max-width: 250px; font-size: 11px; }
-  .read-time { max-width: 112px; font-size: 9px; }
+  .page-description { max-width: 250px; font-size: 12px; }
+  .read-time { max-width: 112px; font-size: 11px; }
   .metric { padding-top: 13px; padding-bottom: 12px; }
   .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .metric:nth-child(odd) { border-left: 0; padding-left: 0; }
   .metric:nth-child(n+3) { border-top: 1px solid var(--line-soft); }
-  .metric h2 { font-size: 10px; }
+  .metric h2 { font-size: 11px; }
   .metric-value { font-size: 19px; }
-  .metric-context { min-height: 28px; font-size: 9px; }
+  .metric-context { min-height: 34px; font-size: 11px; }
   .attention-heading { align-items: start; flex-direction: column; gap: 2px; }
   .attention-heading p { font-size: 11px; }
   .section-heading h2 { font-size: 13px; }
