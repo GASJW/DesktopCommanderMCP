@@ -26,11 +26,14 @@ export function createDashboardMetrics({ now = () => Date.now() } = {}) {
     if (entry.outcome === 'busy') totals.busy++;
     if (entry.operation === 'tools/call') {
       totals.tools++;
-      if (/^[a-zA-Z][a-zA-Z0-9_-]{0,79}$/.test(entry.tool ?? ''))
-        toolCounts.set(entry.tool, (toolCounts.get(entry.tool) ?? 0) + 1);
+      if (/^[a-zA-Z][a-zA-Z0-9_-]{0,79}$/.test(entry.tool ?? '')) {
+        const key = toolCounts.has(entry.tool) || toolCounts.size < 64 ? entry.tool : 'other';
+        toolCounts.set(key, (toolCounts.get(key) ?? 0) + 1);
+      }
     }
     if (typeof entry.identity === 'string' && /^cf_[a-f0-9]{24}$/.test(entry.identity)) {
-      clients.set(entry.identity, { lastSeen: now(), calls: (clients.get(entry.identity)?.calls ?? 0) + 1 });
+      if (clients.has(entry.identity) || clients.size < 128)
+        clients.set(entry.identity, { lastSeen: now(), calls: (clients.get(entry.identity)?.calls ?? 0) + 1 });
     }
     if (Number.isSafeInteger(entry.duration_ms) && entry.duration_ms >= 0 && entry.duration_ms <= 300_000) {
       latencies.push(entry.duration_ms);
