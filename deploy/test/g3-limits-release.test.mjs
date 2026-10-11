@@ -30,3 +30,17 @@ test('G3.4 has retained non-root systemd memory/process ceilings',()=>{
   assert.match(worker,/^TasksMax=128$/m);
   assert.match(deploy,/production load tests are forbidden/);
 });
+
+test('G3.4 protects source readability and verifies rollback health after root git switch',()=>{
+  assert.match(deploy,/ensure_gateway_sources_readable/);
+  assert.match(deploy,/gateway\/server\.mjs gateway\/audit\.mjs gateway\/access-auth\.mjs/);
+  assert.match(deploy,/ls-files --stage/);
+  assert.match(deploy,/expected" = 100644/);
+  assert.match(deploy,/chmod 0644 "\$BASE\/\$p"/);
+  assert.match(deploy,/runuser -u vpsc-gateway -- test -r/);
+  assert.match(deploy,/if ! ensure_gateway_sources_readable/);
+  assert.match(deploy,/G3_4_ROLLBACK=GREEN_G3_3_RESTORED/);
+  assert.match(deploy,/G3_4_ROLLBACK=RED_NOT_HEALTHY/);
+  assert.match(deploy,/mktemp -d \/root\/vps-commander-g3-limits-backup\./);
+  assert.doesNotMatch(deploy,/chmod -R|chown -R/);
+});
