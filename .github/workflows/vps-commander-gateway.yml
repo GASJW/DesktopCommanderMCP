@@ -31,6 +31,8 @@ jobs:
       - run: bash -n deploy/bootstrap-g3-access.sh
       - run: bash -n deploy/bootstrap-commander-dashboard.sh
       - run: bash -n deploy/g5-health.sh deploy/g5-backup.sh deploy/g5-release-guard.sh
+      - run: bash -n deploy/g5-offsite-encrypt.sh deploy/g5-offsite-upload.sh
+      - run: python3 -c "import ast,pathlib; ast.parse(pathlib.Path('deploy/g5-restore-verify.py').read_text())"
       - run: node --check deploy/manual-smoke-g3-access.mjs
       - run: python3 -c "import ast,pathlib; ast.parse(pathlib.Path('deploy/verify-g3-recovery-events.py').read_text())"
       - run: node --check deploy/manual-smoke-g3-recovery.mjs
