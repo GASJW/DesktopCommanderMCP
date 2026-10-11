@@ -1,3 +1,32 @@
+# G3.3 — PRIMEIRO ENSAIO SYSTEMD RED, CORREÇÃO MÍNIMA PREPARADA (2026-10-10 local / 2026-10-11 UTC)
+
+**Estado atual: operação restaurada/saudável; recuperação sem reiniciar gateway NÃO certificada.**
+
+O operador iniciou por SSH o ensaio `verify-g3-systemd-recovery.sh`: último registro visível `G3_3_DRILL_START=CONTROLLED_SINGLE_EXECUTOR_MAIN_SIGKILL`. Não houve evidência final `G3_3_REAL_SYSTEMD_DRILL=GREEN` nesse print.
+
+Inspeção read-only posterior pelo plugin Commander:
+- `vps-commander.service=active`, `vps-commander-executor.service=active`, ambos túneis `active`, shell `G3_3_POST_FAILURE_CHATGPT_GREEN`; HTTP `/healthz` anônimo local 401.
+- Gateway PID antes do ensaio = `1608565`; após = `1617612`. Executor antes = `1495805`; após = `1617600`. Gateway e executor com `ExecMainStartTimestamp=2026-10-11 00:41:59 UTC`, na janela do ensaio. Portanto o gateway **foi reiniciado**, contrariando o requisito de PID constante.
+- O script original executa `recover()` em falha, com `systemctl restart` de ambos os serviços; o reinício observado pode resultar dessa recuperação. Causa exata da falha exige journal privilegiado, que o usuário `vpscommander` não pode ler.
+- Uma causa arquitetural provável foi confirmada na configuração ativa: `Requires=vps-commander-executor.service` junto com `After=` liga o ciclo de vida do gateway à unidade do worker, interferindo no teste de queda isolada.
+
+Correção versionada na mesma branch/PR #4 (não aplicada em produção):
+- `deploy/systemd/vps-commander-g3.service`: trocar **somente** `Requires=vps-commander-executor.service` por `Wants=vps-commander-executor.service`, preservar `After=`. O gateway inicia com ordenação; perda transitória do worker deve apenas manter a aplicação viva e deixar `RecoveringPeer` reconectar. O boot continua fail-closed quando upstream não está disponível.
+- `deploy/repair-g3-gateway-dependency.sh`: aplica hotfix de uma linha via SSH root, com guarda `sed | cmp`, backup root-only, `systemd-analyze verify`, `daemon-reload`, verifica PID gateway/worker **sem reiniciar serviços**, com rollback no erro.
+- `deploy/verify-g3-systemd-recovery.sh`: agora falha cedo ao observar mudança de PID do gateway e no rollback reinicia um serviço somente se estiver inativo, evitando mascarar a causa com reinícios desnecessários.
+- Testes unitários para `Wants` e contra `Requires` acrescidos; candidato já passou 23/23 na VPS antes do último ajuste do script.
+
+**NÃO repetir o ensaio de falha ainda.** Primeiro aplicar hotfix governado por SSH em momento ocioso:
+```bash
+sudo git -c safe.directory=/opt/vps-commander/code -C /opt/vps-commander/code pull --ff-only
+sudo bash /opt/vps-commander/code/deploy/repair-g3-gateway-dependency.sh
+```
+Resultado esperado: `G3_3_DEPENDENCY_REPAIR=GREEN`, `G3_3_GATEWAY_PID_UNCHANGED=PASS`, `G3_3_EXECUTOR_PID_UNCHANGED=PASS`.
+
+Somente com esta configuração confirmada e sem comandos mutantes ativos repetir o ensaio root `verify-g3-systemd-recovery.sh --accept-controlled-executor-restart`, observar `G3_3_REAL_SYSTEMD_DRILL=GREEN` e certificação autentificada posterior. **G3.3 permanece RED no gate de recuperação real até lá.**
+
+---
+
 # G3.3 — DEPLOY REAL GREEN, ENSAIO DE FALHA SYSTEMD PENDENTE (2026-10-10)
 
 **O operador executou por SSH root a implantação do gateway G3.3.** Print da sessão reporta `G3_3_GATEWAY_DEPLOY=BOOTSTRAP_GREEN` e 19/19 testes PASS. O gateway foi reiniciado nessa implantação e retomou serviço; não há evidência ainda de falha induzida do executor do systemd real.
