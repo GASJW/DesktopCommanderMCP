@@ -25,12 +25,14 @@ test('gateway returns 503 during Unix executor outage and recovers automatically
   const socketPath=path.join(root,'mcp.sock');
   const token=randomBytes(32).toString('hex');
   const records=[];
+  const recoveries=[];
   let worker,gateway;
   try {
     worker=await startExecutor({socketPath,executorFile:fixture,cwd:root});
     gateway=await startGateway({executorSocket:socketPath,authMode:'local',token,port:0,
       recoveryInitialDelay:50,recoveryMaxDelay:250,auditEnabled:true,
-      auditSink:line=>records.push(JSON.parse(line))});
+      auditSink:line=>records.push(JSON.parse(line)),
+      recoverySink:line=>recoveries.push(JSON.parse(line))});
     const health=async()=>{
       const res=await fetch(gateway.address+'/healthz',{headers:{authorization:'Bearer '+token}});
       return res.status;
@@ -58,6 +60,12 @@ test('gateway returns 503 during Unix executor outage and recovers automatically
     assert.ok(records.some(x=>x.http_status===503));
     assert.ok(records.some(x=>x.outcome==='denied'));
     assert.equal(JSON.stringify(records).includes('recovery-sensitive-id'),false);
+    assert.ok(recoveries.some(x=>x.phase==='disconnected'));
+    assert.ok(recoveries.some(x=>x.phase==='retry_scheduled'));
+    assert.ok(recoveries.some(x=>x.phase==='reconnected'));
+    assert.ok(recoveries.every(x=>x.event==='vps_commander_recovery' &&
+      !JSON.stringify(x).includes(socketPath) && !JSON.stringify(x).includes(token)));
+    assert.ok(recoveries.filter(x=>x.phase==='retry_scheduled').every(x=>x.retry_delay_ms<=250));
     // Repeat to catch stale socket/listener and one-shot recovery defects.
     await worker.close(); worker=null;
     assert.equal(await waitFor(async()=>await health()===503),true);
