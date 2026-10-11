@@ -1,6 +1,6 @@
 [Unit]
 Description=VPS Commander authenticated HTTP gateway (isolated)
-Requires=vps-commander-executor.service
+Wants=vps-commander-executor.service
 After=network.target vps-commander-executor.service
 
 [Service]
