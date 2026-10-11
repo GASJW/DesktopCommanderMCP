@@ -1,6 +1,8 @@
 [codespell]
 # Ref: https://github.com/codespell-project/codespell#using-a-config-file
-skip = .git*,*.svg,package-lock.json,*.css,.codespellrc
+# Operational handoff docs are written in Brazilian Portuguese; Codespell uses an English dictionary.
+# Keep spellchecking source files, workflows, scripts, and English documentation.
+skip = .git*,*.svg,package-lock.json,*.css,.codespellrc,docs/*.md
 check-hidden = true
 # ignore-regex = 
 ignore-words-list = fo
