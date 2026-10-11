@@ -1,3 +1,45 @@
+# G6 — PRIMEIRA ATIVAÇÃO DO DASHBOARD NA VPS (2026-10-11)
+
+**Estado:** bootstrap operacional GREEN; gateway, executor, túneis Cloudflare e rotas protegidas certificados. **Ainda pendente:** abrir e autenticar a UI de fato no navegador do proprietário e validar execução de ferramenta ChatGPT Commander nessa mesma sessão após reinício. Não confundir estes gates com infraestrutura GREEN.
+
+## Incidente de checkout e resolução — acesso por RDC excepcionalmente autorizado
+
+O proprietário tentou a sequência manual root SSH pelo celular e recebeu:
+
+- `fatal: cannot set up tracking information; starting point 'origin/main' is not a branch`; checkout não passou de `feat/g3-access-hardening`.
+- `git pull` recusou sobrescrever `.github/workflows/codespell.yml` e `docs/G4-RELEASE-GOVERNANCE-20261010.md`.
+- `DASH_DEPLOY=RED_MAIN_REQUIRED` antes de qualquer restart.
+
+Com autorização explícita do proprietário, foi usado **RDC somente na VPS gui** para reparar o Git; sem alterações nos hosts auxiliares. A auditoria mostrou 22 arquivos staged que **eram idênticos ao origin/main**. `git diff refs/remotes/origin/main` retornou zero; `git diff --cached refs/remotes/origin/main` retornou zero; `git write-tree` e a árvore `origin/main^{tree}` coincidiram exatamente: `739a31a0ca6889a2691f6ee382834ec1b6de585d`. Untracked count 0. O fetch refspec remoto só incluía branches de feature, por isso `switch --track origin/main` não criou a branch esperada.
+
+**Correção mínima sem sobrescrever arquivos:** validada proteção GitHub `main.protected=true` e dois checks required GREEN no SHA `a6cd5df12824a0028c798ffd4d98df3f0e3b9a8c`; depois `git branch --no-track main <sha>` + `git symbolic-ref HEAD refs/heads/main`. O HEAD local passou a apontar ao mesmo conteúdo já staged/working tree, ficando `main`, HEAD SHA `a6cd5df...`, status limpo, 0 arquivos modificados. Branch funcional `feat/g3-access-hardening` (commit `1bc99bf`) preservada para rollback. Nenhum `reset --hard`, `git stash`, `chown -R`, limpeza ou troca de filesystem Git sob umask inseguro.
+
+## Bootstrap real e verificação independente
+
+```text
+DASH_DEPLOY=BOOTSTRAP_GREEN
+DASH_ROUTE_ANONYMOUS=401
+DASH_WORKER_PID_UNCHANGED=PASS
+DASHBOARD_GOVERNED_RELEASE_EXIT=0
+```
+
+- Bootstrap rodou a suíte de testes e executou somente restart governado de `vps-commander.service`, com espera do túnel dependente. Executor manteve PID `1650485`. Novo gateway PID `2311910`, `NRestarts=0` no pós-deploy.
+- Quatro serviços `active`: `vps-commander.service`, `vps-commander-executor.service`, `cloudflared-vps-commander.service`, `cloudflared.service` (cofre).
+- API Cloudflare confirmou ambos túneis `vps-commander` e `cofre` **healthy** com quatro conexões cada. Nenhuma política Access/DNS/túnel alterada.
+- Em `http://127.0.0.1:8787`, sem autenticação: `/dashboard`, `/dashboard/metrics`, `/dashboard/app.js`, `/dashboard/style.css`, `/mcp` e `/healthz` retornaram todos **401** (fail closed).
+- O endpoint público `https://commander.supercerebro.me/dashboard` com `Accept: text/html` retorna **HTTP 302** para o login Cloudflare Access; teste sem cabeçalho de navegador retorna 401 como esperado para chamada API não autenticada.
+- Módulos estáticos legíveis por `vpsc-gateway` (0644), `main` local limpo no commit protegido. Nenhuma linha de `EACCES`, `SyntaxError`, `ERR_` ou erros de serviço em janela de pós-deploy inspecionada.
+
+## Testes restantes, sem inventar GREEN
+
+O restart do gateway fez a ferramenta customizada `mcp__Commander__start_process` deixar de ser anunciada **na sessão ChatGPT atual**. Não há evidência suficiente para afirmar se é apenas sessão MCP desatualizada ou falha de reconnect do cliente. Os serviços e túnel no servidor continuam saudáveis e testes de API local/proxy Access passaram. **Necessário efetuar uma nova chamada real com o Commander após reconexão/reabertura da sessão ChatGPT**, de preferência `start_process` e `read_file`.
+
+A UI ainda não foi aberta após login real do proprietário. O proprietário deve abrir [Commander Control Plane](https://commander.supercerebro.me/dashboard), autenticar com seu Cloudflare Access owner email e confirmar renderização e atualização de métricas, sem compartilhar token ou cookies.
+
+Até esses gates, **G6 = INFRAESTRUTURA GREEN / ACEITE DO USUÁRIO E RECONEXÃO MCP PENDENTES**. O dashboard conta apenas eventos desde o restart do gateway, e os clientes autenticados recentes não representam inventário físico de PC.
+
+---
+
 # G6 — Commander Control Plane · Dashboard de uso e infraestrutura (candidato)
 
 **Status (2026-10-11):** implementação isolada, ainda NÃO implantada no gateway público. Não afirmar que `/dashboard` está disponível até bootstrap + smoke autenticado real. PR na branch `feat/commander-dashboard`.
