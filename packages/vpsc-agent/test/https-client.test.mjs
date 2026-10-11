@@ -1,0 +1,170 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { generateKeyPairSync,sign } from 'node:crypto';
+import { mkdirSync,mkdtempSync,rmSync,writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createHttpsAgentClient } from '../src/https-client.mjs';
+import { createEphemeralPairingIdentity } from '../src/pairing.mjs';
+import { createLocalReadonlyMcp } from '../src/local-mcp-readonly.mjs';
+import { createMachineAccessVerifier } from '../../../gateway/devices/machine-access.mjs';
+import { startMachineIngressLoopback } from '../../../gateway/devices/machine-ingress-loopback.mjs';
+import { createDeviceRegistry } from '../../../gateway/devices/registry.mjs';
+import { createPairingCoordinator } from '../../../gateway/devices/pairing.mjs';
+import { createDeviceRouter } from '../../../gateway/devices/router.mjs';
+
+const HOST='devices.example.test';
+const BASE_URL='https://'+HOST+'/';
+const CLIENT='edge-agent-test.access';
+const SECRET='synthetic-test-secret-not-production-0001';
+const ISSUER='https://vpsc.cloudflareaccess.com';
+const AUD='c'.repeat(64),T=1_800_000_000_000,SEC=Math.floor(T/1000);
+const MCP_FIXTURE=fileURLToPath(new URL('./fixtures-readonly-mcp.mjs',import.meta.url));
+function jwt(privateKey){
+  const a=Buffer.from(JSON.stringify({alg:'RS256',kid:'kid'})).toString('base64url');
+  const b=Buffer.from(JSON.stringify({type:'app',sub:'',common_name:CLIENT,
+    aud:AUD,iss:ISSUER,iat:SEC-10,exp:SEC+3600})).toString('base64url');
+  return a+'.'+b+'.'+sign('RSA-SHA256',Buffer.from(a+'.'+b),privateKey).toString('base64url');
+}
+async function harness(){
+  const registry=createDeviceRegistry(),router=createDeviceRouter({registry,timeoutMs:5000});
+  const pairing=createPairingCoordinator({registry});
+  const identity=createEphemeralPairingIdentity();
+  const request=pairing.startPairing({name:'test-Windows',platform:'win32',
+    publicKeyPem:identity.publicKeyPem});
+  pairing.provePossession(request.requestId,identity.prove(request));
+  const {deviceId}=pairing.approvePairing(request.requestId,identity.fingerprint);
+  const {publicKey,privateKey}=generateKeyPairSync('rsa',{modulusLength:2048});
+  const jwk={...publicKey.export({format:'jwk'}),kid:'kid',alg:'RS256'};
+  const verifyMachineToken=createMachineAccessVerifier({issuer:ISSUER,audience:AUD,
+    allowedClientIds:[CLIENT],now:()=>T,keyProvider:async()=>({keys:[jwk]})});
+  const ingress=await startMachineIngressLoopback({registry,router,
+    verifyMachineToken,machineBindings:new Map([[CLIENT,deviceId]]),
+    enableTestIngress:true});
+  const assertion=jwt(privateKey);
+  const observed=[];
+  // Fake Cloudflare EDGE for unit/E2E only: remap a validated HTTPS request to
+  // the test-only HTTP loopback ingress after checking a synthetic service token.
+  const fakeEdge=async (input,opts)=>{
+    const u=new URL(input);
+    observed.push({url:input,headers:{...opts.headers},redirect:opts.redirect});
+    assert.equal(u.protocol,'https:');
+    assert.equal(u.hostname,HOST);
+    if(opts.headers['cf-access-client-id']!==CLIENT||
+       opts.headers['cf-access-client-secret']!==SECRET){
+      return new Response(JSON.stringify({error:'Edge rejects service token'}),
+        {status:403,headers:{'content-type':'application/json'}});
+    }
+    const headers={...opts.headers};
+    delete headers['cf-access-client-id'];
+    delete headers['cf-access-client-secret'];
+    headers['cf-access-jwt-assertion']=assertion;
+    return fetch(ingress.url+u.pathname,{
+      ...opts,headers,redirect:'error',
+    });
+  };
+  const client=createHttpsAgentClient({gatewayUrl:BASE_URL,expectedHostname:HOST,
+    identity,deviceId,clientId:CLIENT,clientSecret:SECRET,fetchFn:fakeEdge});
+  const close=async()=>{client.close();router.close();await ingress.close();};
+  return {client,router,identity,deviceId,ingress,observed,close};
+}
+function makeInvalid(overrides={}){
+  const identity=createEphemeralPairingIdentity();
+  return {gatewayUrl:BASE_URL,expectedHostname:HOST,identity,
+    deviceId:'f1a2b3c4-d5e6-4a9f-8abc-1bb9b99c0001',
+    clientId:CLIENT,clientSecret:SECRET, ...overrides};
+}
+test('reject HTTP, credentials in URL, other hosts, IP and untrusted port',()=>{
+  for(const gatewayUrl of [
+    'http://devices.example.test','https://evil.example.test/',
+    'https://user:pass@devices.example.test/',
+    'https://devices.example.test:8443/',
+    'https://devices.example.test/agent/poll',
+    'https://127.0.0.1/','https://devices.example.test/?token=abc',
+  ])assert.throws(()=>createHttpsAgentClient(makeInvalid({gatewayUrl})),/Gateway URL/);
+});
+test('reject weak configuration, missing token, unknown identity and unpinned hostname',()=>{
+  for(const override of [
+    {expectedHostname:'localhost'},{clientId:'a'},{clientSecret:'short'},
+    {clientSecret:'good-secret-with-\r\n-injection'},
+    {deviceId:'fake'}, {identity:null}, {timeoutMs:120_000}
+  ])assert.throws(()=>createHttpsAgentClient(makeInvalid(override)),e=>e.code==='CONFIG');
+});
+test('HTTPS agent sends Service Token headers to edge and signs device frames',async()=>{
+  const x=await harness();
+  try{
+    await x.client.connect();
+    await x.client.heartbeat();
+    await x.client.poll();
+    const urls=x.observed.map(v=>v.url);
+    assert.ok(urls.includes(BASE_URL+'agent/challenge'));
+    assert.ok(urls.includes(BASE_URL+'agent/connect'));
+    assert.ok(urls.includes(BASE_URL+'agent/heartbeat'));
+    assert.ok(urls.includes(BASE_URL+'agent/poll'));
+    for(const item of x.observed){
+      assert.equal(item.headers['cf-access-client-id'],CLIENT);
+      assert.equal(item.headers['cf-access-client-secret'],SECRET);
+      assert.equal(item.redirect,'error');
+      assert.equal(item.headers['cf-access-jwt-assertion'],undefined);
+    }
+    const signed=x.observed.find(v=>v.url===BASE_URL+'agent/poll');
+    assert.ok(signed.headers['x-vpsc-signature']);
+  }finally{await x.close();}
+});
+test('two layers authenticate an actual local MCP fixture read and return through router',async()=>{
+  const x=await harness();
+  const tmp=mkdtempSync(path.join(os.tmpdir(),'vpsc-https-agent-test-'));
+  const dir=path.join(tmp,'approved');
+  mkdirSync(dir);
+  const file=path.join(dir,'hello.txt');
+  writeFileSync(file,'end-to-end-device-signed-read\n');
+  const executor=createLocalReadonlyMcp({allowedRoot:dir,entrypoint:MCP_FIXTURE,timeoutMs:5000});
+  try{
+    await x.client.connect();await x.client.heartbeat();await executor.start();
+    const pending=x.router.callDevice({deviceId:x.deviceId,name:'read_file',arguments:{path:file}});
+    const task=await x.client.poll();
+    const value=await executor.handle(task);
+    await x.client.result(task.requestId,value);
+    assert.match(JSON.stringify(await pending),/end-to-end-device-signed-read/);
+  }finally{executor.close();await x.close();rmSync(tmp,{recursive:true,force:true});}
+});
+test('HTTPS client closes fail-closed and prevents further messages',async()=>{
+  const x=await harness();
+  await x.client.connect();
+  x.client.close();
+  await assert.rejects(x.client.heartbeat(),e=>e.code==='CLOSED');
+  x.router.close();await x.ingress.close();
+});
+test('network error is ambiguous and never retried or exposes service secret',async()=>{
+  let calls=0;
+  const client=createHttpsAgentClient(makeInvalid({fetchFn:async()=>{
+    calls++;throw Error('network interrupted');
+  }}));
+  await assert.rejects(client.connect(),e=>e.code==='AMBIGUOUS_TRANSPORT'&&
+    !e.message.includes(SECRET));
+  assert.equal(calls,1);
+  client.close();
+});
+test('edge rejection never triggers JWT shortcut or client credential leakage',async()=>{
+  const client=createHttpsAgentClient(makeInvalid({
+    fetchFn:async()=>new Response(JSON.stringify({error:'no'}),{
+      status:403,headers:{'content-type':'application/json'}
+    }),
+  }));
+  await assert.rejects(client.connect(),e=>e.code==='REJECTED'&&
+    !e.message.includes(SECRET));
+  client.close();
+});
+test('redirection, non-JSON and oversized response fail closed',async()=>{
+  const redirect=createHttpsAgentClient(makeInvalid({
+    fetchFn:async()=>{throw TypeError('fetch redirect rejected');},
+  }));
+  await assert.rejects(redirect.connect(),e=>e.code==='AMBIGUOUS_TRANSPORT');
+  const wrong=createHttpsAgentClient(makeInvalid({
+    fetchFn:async()=>new Response('not-json',{status:200,
+      headers:{'content-type':'text/plain'}}),
+  }));
+  await assert.rejects(wrong.connect(),e=>e.code==='BAD_RESPONSE');
+  redirect.close();wrong.close();
+});
