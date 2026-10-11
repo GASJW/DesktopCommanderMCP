@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#10151a">
+  <title>Parear dispositivo · Commander</title>
+  <link rel="stylesheet" href="/dashboard/pairing.css">
+  <script src="/dashboard/pairing.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Pular para o conteúdo</a>
+  <header class="topbar">
+    <a class="brand" href="/dashboard"><span class="brand-icon" aria-hidden="true">C<span>/</span></span> Commander <span class="subbrand">Control Plane</span></a>
+    <nav aria-label="Navegação principal"><a href="/dashboard">Visão geral</a><a aria-current="page" href="/dashboard/pairing">Pareamento</a></nav>
+  </header>
+  <main id="main" class="container">
+    <div class="heading">
+      <p class="eyebrow">Dispositivos · G7</p>
+      <h1>Parear novo dispositivo</h1>
+      <p>Um código de comparação, uma identidade criptográfica e sua aprovação. O código, sozinho, não concede acesso.</p>
+    </div>
+    <div class="notice" role="status" id="api-status" aria-live="polite">Verificando se o pareamento está disponível…</div>
+    <section class="instructions" aria-labelledby="steps-title">
+      <h2 id="steps-title">Como conectar</h2>
+      <ol>
+        <li>Instale o agente no dispositivo sob uma conta padrão, sem acesso Root/Admin.</li>
+        <li>Quando a funcionalidade estiver habilitada, execute <code>vpsc-agent pair</code> para solicitar o código.</li>
+        <li>Compare o código de <strong>10 caracteres</strong> e o fingerprint do dispositivo com os exibidos neste painel.</li>
+        <li>Aprove somente se você reconhece o dispositivo. A conexão começa em modo <strong>Padrão</strong>.</li>
+      </ol>
+      <p class="hint">No momento, o CLI instalado no Gui-PC ainda oferece apenas <code>doctor</code>, <code>--version</code> e <code>--help</code>. Não tente parear até a liberação do G7.</p>
+    </section>
+    <section class="panel" aria-labelledby="requests-title">
+      <div class="panel-header">
+        <div><p class="eyebrow">Sua aprovação</p><h2 id="requests-title">Solicitações pendentes</h2></div>
+        <span class="status" id="request-count">Indisponível</span>
+      </div>
+      <div id="request-list" role="status" aria-live="polite">
+        <p class="muted">O Gateway ainda não disponibilizou solicitações de pareamento.</p>
+      </div>
+    </section>
+    <template id="request-template">
+      <article class="request">
+        <div class="request-top"><div><h3 class="device-name"></h3><span class="platform"></span></div><span class="proof"></span></div>
+        <p class="muted">Fingerprint Ed25519</p><p class="fingerprint"></p>
+        <label>Código apresentado no dispositivo
+          <input class="typed-code" autocomplete="off" autocapitalize="characters" spellcheck="false" inputmode="text" maxlength="16" placeholder="Ex.: A1B2 C3D4 E5" aria-describedby="code-hint">
+        </label>
+        <p class="muted" id="code-hint">Digite o código do próprio dispositivo. O código nunca é mostrado aqui.</p>
+        <div class="actions">
+          <button class="approve" type="button" disabled>Aprovar em modo padrão</button>
+          <button class="reject" type="button" disabled>Rejeitar solicitação</button>
+        </div>
+      </article>
+    </template>
+    <footer>
+      <a href="/dashboard">Voltar à Dashboard</a>
+      <span>Pareamento G7 · aprovação protegida · sem acesso administrativo automático</span>
+    </footer>
+  </main>
+</body>
+</html>
