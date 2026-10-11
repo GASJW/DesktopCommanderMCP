@@ -1,3 +1,33 @@
+# G3.2 — POST-DEPLOY STATUS, 2026-10-10 (local) / 2026-10-11 (UTC)
+
+**Current state: deployment GREEN / ChatGPT authenticated MCP smoke GREEN / privileged journald inspection PENDING.** Older sections below contain historical pre-deployment state.
+
+## Owner bootstrap observed
+- Owner ran Git fetch + branch switch to `feat/g3-audit-trail`, then `deploy/bootstrap-g3-audit.sh` over direct root SSH.
+- Bootstrap output: **16/16 tests PASS**, `G3_2_AUDIT_SYSTEMD=BOOTSTRAP_GREEN`.
+- Bootstrap confirmed anonymous local HTTP 401 event was written to the journald; therefore logging activated successfully (this test does not establish authenticated tool events).
+
+## ChatGPT Commander real post-deploy verification (no RDC)
+- Authenticated `mcp__Commander__start_process` returned `G3_2_CHATGPT_LIVE_SHELL=GREEN` on host `gui` as `vpscommander` at **2026-10-11T00:08:41Z**.
+- `vps-commander.service` active, `vps-commander-executor.service` active and `cloudflared-vps-commander.service` active.
+- Gateway systemd User=`vpsc-gateway`, Environment includes `VPS_COMMANDER_AUDIT_ENABLED=1`.
+- Authenticated `read_file /etc/os-release` PASS, `write_file` and read-back of `/var/lib/vps-commander/workspace/g3-audit-live-e2e-20261010.txt` PASS; file contained `G3_2_CHATGPT_LIVE_FILE_GREEN`.
+- Cloudflare API confirmed both `vps-commander` and unrelated `cofre` tunnels **healthy**, 4 connections each.
+- The Commander executor's `journalctl -u vps-commander.service` returned `No journal files were opened due to insufficient permissions`. This is expected from G3.1 least-privilege isolation. Do not grant executor journal access.
+
+## Privileged audit certification remaining
+- Created read-only `deploy/verify-g3-audit-journal.py`; checks strict event JSON fields and verifies an authenticated pseudonym and successful `tools/call` for `start_process`, `write_file`, and `read_file` without displaying any event payload, raw line, identity, command, file path or token.
+- Local verifier check: `python3 -m py_compile` PASS, 3 synthetic valid events verified GREEN. **Synthetic events do not certify real journald evidence.**
+- Ask owner to run direct SSH root:
+```bash
+sudo git -c safe.directory=/opt/vps-commander/code -C /opt/vps-commander/code pull --ff-only
+sudo journalctl -u vps-commander.service --since '60 minutes ago' --no-pager -o cat \
+  | python3 /opt/vps-commander/code/deploy/verify-g3-audit-journal.py
+```
+- Expected `G3_2_JOURNAL_CERTIFICATION=GREEN` and `G3_2_SCHEMA_VIOLATIONS=0`. If RED, gather only the sanitized diagnostics; do not share raw JWT/log lines.
+- PR #3 stays Draft until real post-deploy audit is certified. Do not claim G3.2 final GREEN prematurely.
+
+---
 # G3.2 — Auditoria MCP: implementação e certificação candidata (2026-10-10)
 
 **Estado:** implementação/testes do candidato GREEN; **auditoria em produção ainda não ativada**. O runtime atual G3.1 permanece operacional.
