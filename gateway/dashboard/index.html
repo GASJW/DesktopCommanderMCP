@@ -4,62 +4,207 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>Commander — Control Plane</title>
+  <meta name="theme-color" content="#10151a">
+  <title>Commander Control Plane</title>
   <link rel="stylesheet" href="/dashboard/style.css">
   <script src="/dashboard/app.js" defer></script>
 </head>
 <body>
-<div class="shell">
-  <aside class="sidebar" aria-label="Navegação do painel">
-    <a class="brand" href="/dashboard" aria-label="Commander Control Plane">
-      <div class="brand-symbol">C<span>_</span></div>
-      <div><strong>COMMANDER</strong><small>CONTROL PLANE <span class="brand-beta">BETA</span></small></div>
+  <a class="skip-link" href="#main">Pular para o conteúdo</a>
+  <header class="topbar">
+    <a class="brand" href="/dashboard" aria-label="Commander Control Plane, início">
+      <span class="brand-mark" aria-hidden="true">C<span>/</span></span>
+      <span class="brand-name">Commander <span>Control Plane</span></span>
     </a>
-    <p class="nav-heading">WORKSPACE</p>
-    <nav class="side-nav">
-      <a href="#overview" class="active"><span class="nav-ico">◈</span> Visão geral</a>
-      <a href="#activity"><span class="nav-ico">▤</span> Atividade</a>
-      <a href="#infrastructure"><span class="nav-ico">⌘</span> Infraestrutura</a>
-      <a href="#clients"><span class="nav-ico">◉</span> Clientes recentes</a>
+    <nav class="primary-nav" aria-label="Seções do painel">
+      <a href="#overview" aria-current="page">Visão geral</a>
+      <a href="#activity">Atividade</a>
+      <a href="#infrastructure">Infraestrutura</a>
+      <a href="#devices">Dispositivos</a>
     </nav>
-    <div class="side-footer">
-      <div class="secure-mark"><span class="tiny-led"></span> ACCESS PROTECTED</div>
-      <p>Autenticação Cloudflare Access. Acesso somente ao proprietário autorizado.</p>
-      <a class="side-link" href="/mcp" target="_blank" rel="noreferrer">MCP endpoint ↗</a>
+    <div class="topbar-actions">
+      <div class="connection" id="connection-state" role="status" aria-live="polite">
+        <span class="state-dot" aria-hidden="true"></span><span id="connection-label">Aguardando leitura</span>
+      </div>
+      <button class="refresh" id="refresh" type="button" aria-label="Atualizar métricas">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.2 6A5.4 5.4 0 0 0 3.4 4.1L2 5.5M2 2.8v2.7h2.7M2.8 10A5.4 5.4 0 0 0 12.6 12l1.4-1.4m0 2.7v-2.7h-2.7"/></svg>
+        <span>Atualizar</span>
+      </button>
     </div>
-  </aside>
-  <main class="content" id="overview">
-    <header class="topbar">
-      <div class="breadcrumbs">INFRAESTRUTURA <span>/</span> COMMANDER <span>/</span> VISÃO GERAL</div>
-      <div class="topbar-right"><span class="connection-pill" id="connection-pill"><span class="pulse-dot"></span><span id="connection-label">Conectando...</span></span><span class="avatar">G</span></div>
-    </header>
-    <div class="page-inner">
-      <section class="page-heading">
-        <div><div class="eyebrow"><span class="mini-line"></span> STATUS EM TEMPO REAL</div><h1>Visão geral<span class="heading-period">.</span></h1><p>Acompanhe operações, disponibilidade e o pulso do seu MCP, em um só lugar.</p></div>
-        <button class="refresh" id="refresh" type="button" aria-label="Atualizar métricas"><span>↻</span> Atualizar dados</button>
+  </header>
+
+  <main class="page" id="main">
+    <section class="page-heading" id="overview" aria-labelledby="page-title">
+      <div>
+        <p class="eyebrow">Operações</p>
+        <h1 id="page-title">Visão geral</h1>
+        <p class="page-description">Uso do MCP, estado local dos serviços e recursos da VPS.</p>
+      </div>
+      <p class="read-time" id="footer-updated">Aguardando a primeira leitura</p>
+    </section>
+
+    <div class="load-error" id="load-error" role="alert" hidden></div>
+
+    <section class="metrics" aria-label="Resumo de uso do MCP">
+      <article class="metric">
+        <h2>Chamadas MCP</h2>
+        <p class="metric-value" id="metric-calls">—</p>
+        <p class="metric-context">Desde a inicialização do Gateway</p>
+      </article>
+      <article class="metric">
+        <h2>Concluídas sem erro</h2>
+        <p class="metric-value" id="metric-success">—</p>
+        <p class="metric-context" id="metric-success-context">Aguardando dados</p>
+      </article>
+      <article class="metric">
+        <h2>Latência p95</h2>
+        <p class="metric-value" id="metric-p95">—</p>
+        <p class="metric-context">Até 512 durações MCP recentes</p>
+      </article>
+      <article class="metric">
+        <h2>Identidades recentes</h2>
+        <p class="metric-value" id="metric-identities">—</p>
+        <p class="metric-context">Com atividade nos últimos 15 min</p>
+      </article>
+    </section>
+
+    <section class="attention" aria-labelledby="attention-title">
+      <div class="attention-heading">
+        <h2 id="attention-title">Atenção</h2>
+        <p id="attention-summary">Verificando registros recentes…</p>
+      </div>
+      <p class="attention-detail" id="attention-detail">A janela considera chamadas MCP dos últimos 60 minutos e estados locais observáveis.</p>
+    </section>
+
+    <div class="primary-grid">
+      <section class="section-block activity-section" id="activity" aria-labelledby="activity-title">
+        <div class="section-heading">
+          <div>
+            <h2 id="activity-title">Atividade MCP</h2>
+            <p>Chamadas por minuto · últimos 60 minutos</p>
+          </div>
+          <p class="chart-total" id="requests-60">— chamadas</p>
+        </div>
+        <figure class="chart-figure">
+          <div class="chart-frame">
+            <canvas id="activity-chart" role="img" aria-label="Chamadas MCP por minuto nos últimos 60 minutos"></canvas>
+            <p class="chart-empty" id="activity-empty" hidden>Nenhuma chamada MCP nesta janela.</p>
+          </div>
+          <figcaption class="chart-legend">
+            <span><i class="legend-swatch calls" aria-hidden="true"></i>Chamadas</span>
+            <span><i class="legend-swatch errors" aria-hidden="true"></i>Falhas registradas</span>
+            <span class="chart-context" id="chart-summary">Pico e falhas por minuto.</span>
+          </figcaption>
+        </figure>
+        <details class="chart-data">
+          <summary>Consultar valores por minuto</summary>
+          <div class="table-scroll">
+            <table>
+              <caption>Chamadas MCP, falhas e recusas na janela de 60 minutos</caption>
+              <thead><tr><th scope="col">Minuto</th><th scope="col">Chamadas</th><th scope="col">Falhas</th><th scope="col">Recusas</th></tr></thead>
+              <tbody id="activity-table"></tbody>
+            </table>
+          </div>
+        </details>
       </section>
-      <section class="hero-strip" aria-label="Status principal">
-        <div class="hero-left"><span class="hero-orbit">⌘</span><div><span class="hero-kicker">COMMANDER MCP GATEWAY</span><h2 id="hero-status">Verificando infraestrutura...</h2><p id="hero-sub">Conexão autenticada com a VPS gui.</p></div></div>
-        <div class="hero-right"><div class="hero-stat"><span>HOST</span><strong id="hero-host">gui</strong></div><div class="hero-stat"><span>UPTIME DO PAINEL</span><strong id="hero-uptime">—</strong></div></div>
+
+      <section class="section-block services-section" aria-labelledby="services-title">
+        <div class="section-heading">
+          <div>
+            <h2 id="services-title">Serviços</h2>
+            <p>Estado local informado pelo systemd</p>
+          </div>
+          <span class="source-label">LOCAL</span>
+        </div>
+        <div class="service-group-label">Commander</div>
+        <div class="service-list" id="services-commander"></div>
+        <div class="service-group-label cofre-label">Túnel independente</div>
+        <div class="service-list" id="services-cofre"></div>
+        <p class="external-note" id="external-health">Alcançabilidade externa do Cloudflare: não observada por esta API.</p>
       </section>
-      <section class="kpis" aria-label="Indicadores de uso">
-        <article class="kpi"><div class="kpi-top"><span>CHAMADAS MCP</span><span class="kpi-ico">↗</span></div><div class="kpi-value" id="kpi-calls">—</div><div class="kpi-foot">Desde a inicialização do gateway</div></article>
-        <article class="kpi"><div class="kpi-top"><span>SUCESSO MCP</span><span class="kpi-ico green">✓</span></div><div class="kpi-value" id="kpi-success">—</div><div class="kpi-foot"><span id="kpi-ok">—</span> requisições concluídas sem erro</div></article>
-        <article class="kpi"><div class="kpi-top"><span>LATÊNCIA P95</span><span class="kpi-ico purple">◷</span></div><div class="kpi-value" id="kpi-latency">—</div><div class="kpi-foot">Janela de até 512 requisições MCP</div></article>
-        <article class="kpi"><div class="kpi-top"><span>CLIENTES RECENTES</span><span class="kpi-ico amber">◎</span></div><div class="kpi-value" id="kpi-clients">—</div><div class="kpi-foot">Identidades vistas nos últimos 15 min</div></article>
-      </section>
-      <section class="primary-grid" id="activity">
-        <article class="panel usage-panel"><div class="panel-heading"><div><h3>Fluxo de requisições</h3><p>Atividade HTTP na rota MCP, últimos 60 minutos</p></div><span class="period">60 MIN <span>⌄</span></span></div><div class="chart-wrap"><canvas id="activity-chart" aria-label="Gráfico das chamadas MCP dos últimos 60 minutos" role="img"></canvas><div class="chart-empty" id="chart-empty">Aguardando as primeiras chamadas registradas.</div></div><div class="chart-bottom"><span><i class="legend-dot teal"></i> Chamadas MCP</span><span><i class="legend-dot coral"></i> Erros</span><strong id="requests-60">— chamadas na última hora</strong></div></article>
-        <article class="panel infra-panel" id="infrastructure"><div class="panel-heading"><div><h3>Infraestrutura</h3><p>Estado local dos serviços da VPS</p></div><span class="signal">● LIVE</span></div><div class="service-list" id="services"><div class="loading-line">Consultando systemd...</div></div><div class="infra-note">Unidade ativa ≠ túnel Cloudflare comprovadamente saudável.</div></article>
-      </section>
-      <section class="secondary-grid">
-        <article class="panel tools-panel"><div class="panel-heading"><div><h3>Ferramentas mais utilizadas</h3><p>Ranking desde a inicialização do gateway</p></div><span class="panel-glyph">▥</span></div><div class="tools-list" id="tools-list"><p class="empty-state">Nenhuma ferramenta registrada ainda.</p></div></article>
-        <article class="panel resources-panel"><div class="panel-heading"><div><h3>Recursos do servidor</h3><p>Leituras locais, sem acesso privilegiado</p></div><span class="panel-glyph">◫</span></div><div class="resource-line"><div><span>Memória RAM</span><strong id="memory-text">—</strong></div><div class="meter"><div id="memory-fill"></div></div></div><div class="resource-line"><div><span>Disco raiz</span><strong id="disk-text">—</strong></div><div class="meter"><div id="disk-fill"></div></div></div><div class="resource-line"><div><span>Load médio (1 min)</span><strong id="load-text">—</strong></div></div><div class="resource-foot"><span>Em execução</span><strong id="inflight-text">— chamadas</strong></div></article>
-      </section>
-      <section class="panel clients-panel" id="clients"><div class="panel-heading"><div><h3>Hosts e clientes</h3><p>Somente os dispositivos e acessos que este MCP consegue observar</p></div><span class="panel-glyph">⌘</span></div><div class="clients-grid"><div class="host-block"><div class="host-icon">▣</div><div><div class="host-title"><strong id="device-name">gui</strong><span class="host-pill">HOST DO MCP</span></div><p>VPS Linux · Gateway e executor locais</p><span class="host-live" id="device-state">Aguardando status...</span></div></div><div class="identity-block"><span class="identity-label">IDENTIDADES AUTENTICADAS ATIVAS · 15 MIN</span><strong id="active-identities">—</strong><div id="identity-list" class="identity-list"><span>Nenhum cliente recente registrado.</span></div></div></div><p class="disclaimer">O Commander da VPS não descobre automaticamente o Gui-PC nem outros computadores. Identidades recentes não significam dispositivos ou sessões permanentemente online.</p></section>
-      <footer class="footer"><span>COMMANDER CONTROL PLANE <em>•</em> OWNER-ONLY</span><span id="footer-updated">Aguardando dados...</span><span>Origem: auditoria local G3.2 • Retenção em memória</span></footer>
     </div>
+
+    <div class="secondary-grid" id="infrastructure">
+      <section class="section-block tools-section" aria-labelledby="tools-title">
+        <div class="section-heading">
+          <div>
+            <h2 id="tools-title">Ferramentas mais usadas</h2>
+            <p>Chamadas registradas desde a inicialização</p>
+          </div>
+        </div>
+        <div class="tools-list" id="tools-list"></div>
+        <p class="empty-copy" id="tools-empty" hidden>Nenhuma chamada de ferramenta registrada desde a inicialização do Gateway.</p>
+      </section>
+
+      <section class="section-block resources-section" aria-labelledby="resources-title">
+        <div class="section-heading">
+          <div>
+            <h2 id="resources-title">Recursos da VPS</h2>
+            <p>Leituras locais sem acesso privilegiado</p>
+          </div>
+        </div>
+        <div class="resource-list">
+          <div class="resource" id="memory-resource">
+            <div class="resource-heading"><span>Memória livre reportada</span><strong id="memory-text">—</strong></div>
+            <div class="meter" id="memory-meter" role="progressbar" aria-label="Memória livre reportada pelo sistema operacional" aria-valuemin="0" aria-valuemax="100"><span></span></div>
+          </div>
+          <div class="resource" id="disk-resource">
+            <div class="resource-heading"><span>Disco raiz</span><strong id="disk-text">—</strong></div>
+            <div class="meter" id="disk-meter" role="progressbar" aria-label="Uso do disco raiz" aria-valuemin="0" aria-valuemax="100"><span></span></div>
+          </div>
+          <div class="resource-inline"><span>Load médio · 1 min</span><strong id="load-text">—</strong></div>
+          <div class="resource-inline"><span>Chamadas em execução</span><strong id="inflight-text">—</strong></div>
+        </div>
+        <p class="resource-note">Disco: destaque a partir de 90% de uso. RAM mostra memória livre reportada pelo sistema operacional.</p>
+      </section>
+    </div>
+
+    <section class="section-block devices-section" id="devices" aria-labelledby="devices-title">
+      <div class="section-heading">
+        <div>
+          <h2 id="devices-title">Host e dispositivo gerenciado</h2>
+          <p>Uma VPS observada em dois papéis do Commander</p>
+        </div>
+        <span class="source-label">INVENTÁRIO LOCAL</span>
+      </div>
+      <div class="device-identity">
+        <div><strong id="device-name">—</strong><span id="managed-device-copy">Host do Gateway e dispositivo do Executor local</span></div>
+        <span class="device-type" id="device-type">VPS</span>
+      </div>
+      <div class="roles-grid">
+        <div class="role-item">
+          <span class="role-label">Host do plano de controle</span>
+          <strong>Gateway MCP</strong>
+          <p>O processo Gateway e a API do painel executam nesta VPS.</p>
+          <span class="role-state" id="gateway-role-state">Estado local: não verificado</span>
+        </div>
+        <div class="role-item">
+          <span class="role-label">Dispositivo gerenciado</span>
+          <strong>Executor local</strong>
+          <p>A VPS também é o dispositivo que o Executor local controla.</p>
+          <span class="role-state" id="executor-role-state">Conexão: não verificada</span>
+        </div>
+      </div>
+      <p class="device-caveat" id="device-caveat">Nenhum outro computador aparece sem evidência de inventário ou conexão.</p>
+    </section>
+
+    <section class="section-block identities-section" id="identities-section" aria-labelledby="identities-title">
+      <div class="section-heading">
+        <div>
+          <h2 id="identities-title">Identidades MCP recentes</h2>
+          <p>Identificadores pseudonimizados vistos nos últimos 15 minutos</p>
+        </div>
+        <span class="identity-count" id="active-identities">— ativas</span>
+      </div>
+      <div class="identities-list" id="identities-list"><p class="empty-copy">Nenhuma identidade recente.</p></div>
+      <p class="identity-caveat">Atividade de clientes MCP não representa dispositivos físicos online.</p>
+    </section>
+
+    <footer class="page-footer">
+      <span>Commander Control Plane</span>
+      <span>Somente leitura · auditoria sanitizada G3.2</span>
+      <span id="uptime-context">Uptime do Gateway: —</span>
+    </footer>
   </main>
-</div>
 </body>
 </html>
