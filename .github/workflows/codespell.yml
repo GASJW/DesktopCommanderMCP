@@ -23,3 +23,6 @@ jobs:
         uses: codespell-project/codespell-problem-matcher@v1
       - name: Codespell
         uses: codespell-project/actions-codespell@v2
+        with:
+          # Operational docs are Portuguese; keep English spellcheck enabled for code and scripts.
+          skip: ./docs
