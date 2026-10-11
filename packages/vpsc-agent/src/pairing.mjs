@@ -22,5 +22,19 @@ export function createEphemeralPairingIdentity() {
     return sign(null,Buffer.from([DOMAIN,requestId,nonce,fingerprint].join('\n'),'utf8'),
       privateKey).toString('base64url');
   }
-  return Object.freeze({publicKeyPem,fingerprint,prove});
+  function proveDeviceChallenge({deviceId, nonce} = {}) {
+    if (typeof deviceId !== 'string' ||
+        !UUID.test(deviceId) || typeof nonce !== 'string' || !NONCE.test(nonce)) {
+      throw new TypeError('Invalid device challenge');
+    }
+    return sign(null,Buffer.from(['VPSC-AGENT-CHALLENGE-v1',deviceId,nonce].join('\n'),'utf8'),
+      privateKey).toString('base64url');
+  }
+  function signFrame(frameBytes) {
+    if (!Buffer.isBuffer(frameBytes) || frameBytes.length < 32 || frameBytes.length > 1024) {
+      throw new TypeError('Invalid transport frame');
+    }
+    return sign(null,frameBytes,privateKey).toString('base64url');
+  }
+  return Object.freeze({publicKeyPem,fingerprint,prove,proveDeviceChallenge,signFrame});
 }
