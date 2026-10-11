@@ -26,4 +26,4 @@ jobs:
         with:
           # Portuguese-language docs and UI strings are not English spelling errors.
           # Continue checking gateway backend, deployment scripts and workflows.
-          skip: ./docs,./gateway/dashboard/index.html,./gateway/dashboard/app.js
+          skip: ./docs,./gateway/dashboard/index.html,./gateway/dashboard/app.js,./gateway/dashboard/pairing.html,./gateway/dashboard/pairing.js
