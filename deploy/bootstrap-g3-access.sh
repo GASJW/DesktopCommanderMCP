@@ -92,7 +92,7 @@ rollback() {
       return 1
     fi
   fi
-  echo 'G3_5_ROLLBACK=GREEN_G3_3_RESTORED'
+  echo 'G3_5_ROLLBACK=GREEN_G3_4_RESTORED'
 }
 trap rollback ERR
 wk_pid_before=$(systemctl show -P MainPID "$WK")
