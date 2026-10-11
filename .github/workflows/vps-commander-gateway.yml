@@ -25,3 +25,4 @@ jobs:
       - run: node --check gateway/server.mjs
       - run: node --check gateway/access-auth.mjs
       - run: node --test gateway/test/*.test.mjs deploy/test/*.test.mjs
+      - run: bash -n deploy/bootstrap-g3-isolation.sh

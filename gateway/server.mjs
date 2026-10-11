@@ -1,5 +1,6 @@
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
+import { createConnection } from 'node:net';
 import { createInterface } from 'node:readline';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync } from 'node:fs';
@@ -29,18 +30,32 @@ function fault(id, code, message) {
   return { jsonrpc: '2.0', id: id ?? null, error: { code, message } };
 }
 class Peer {
-  constructor(file) { this.file = file; this.pending = new Map(); this.sequence = 0; this.dead = false; }
+  constructor(file, socketPath) { this.file = file; this.socketPath = socketPath; this.pending = new Map(); this.sequence = 0; this.dead = false; }
   async start() {
-    // Do not hand the gateway's authentication secret to the executor shell.
+    if (this.socketPath) {
+      const socket = createConnection(this.socketPath);
+      try {
+        await new Promise((resolve, reject) => { socket.once('connect', resolve); socket.once('error', reject); });
+      } catch (error) { socket.destroy(); throw error; }
+      this.socket = socket;
+      this.input = socket;
+      this.output = socket;
+      socket.once('close', () => this.fail());
+      socket.on('error', () => this.fail());
+    } else {
+    // Legacy single-user mode: only for isolated development/testing.
     const childEnv = { ...process.env, DC_REMOTE_DEVICE: 'true', VPS_COMMANDER_DISABLE_BROWSER_INIT: '1' };
     delete childEnv.VPS_COMMANDER_TOKEN;
     this.child = spawn(process.execPath, [this.file, '--no-onboarding'], {
       shell: false, cwd: path.dirname(this.file), stdio: ['pipe', 'pipe', 'inherit'],
       env: childEnv,
     });
+    this.input = this.child.stdin;
+    this.output = this.child.stdout;
     this.child.on('exit', () => this.fail());
     this.child.on('error', () => this.fail());
-    createInterface({ input: this.child.stdout }).on('line', line => {
+    }
+    createInterface({ input: this.output }).on('line', line => {
       if (line.length > 16_000_000) return;
       let message;
       try { message = JSON.parse(line); } catch { return; }
@@ -71,7 +86,7 @@ class Peer {
     this.pending.clear();
   }
   call(method, params = {}) {
-    if (this.dead || !this.child?.stdin.writable) return Promise.reject(Error('Executor disconnected'));
+    if (this.dead || !this.input?.writable) return Promise.reject(Error('Executor disconnected'));
     if (this.pending.size >= MAX_PENDING) return Promise.reject(Error('Executor busy'));
     const id = 'vpsc-' + ++this.sequence + '-' + randomUUID();
     return new Promise((resolve, reject) => {
@@ -79,17 +94,17 @@ class Peer {
         this.pending.delete(id); reject(Error('Executor timeout'));
       }, TIMEOUT_MS);
       this.pending.set(id, { resolve, reject, timer });
-      this.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n', error => {
+      this.input.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n', error => {
         if (error) { clearTimeout(timer); this.pending.delete(id); reject(error); }
       });
     });
   }
   notify(method, params = {}) {
-    if (this.child?.stdin.writable && !this.dead) {
-      this.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n');
+    if (this.input?.writable && !this.dead) {
+      this.input.write(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n');
     }
   }
-  close() { this.fail(); this.child?.kill('SIGTERM'); }
+  close() { this.fail(); this.socket?.destroy(); this.child?.kill('SIGTERM'); }
 }
 
 export async function startGateway(options = {}) {
@@ -105,13 +120,15 @@ export async function startGateway(options = {}) {
   const host = options.host ?? process.env.VPS_COMMANDER_HOST ?? '127.0.0.1';
   const port = Number(options.port ?? process.env.VPS_COMMANDER_PORT ?? 8787);
   const executable = path.resolve(options.executorFile ?? process.env.VPS_COMMANDER_EXECUTOR_FILE ?? DEFAULT_EXECUTOR);
+  const executorSocket = options.executorSocket ?? process.env.VPS_COMMANDER_EXECUTOR_SOCKET ?? null;
+  if (executorSocket && (!path.isAbsolute(executorSocket) || executorSocket.length > 105)) throw Error('Invalid executor socket path');
   if (authMode === 'local' &&
       (typeof token !== 'string' || Buffer.byteLength(token) < 32 || Buffer.byteLength(token) > 4096))
     throw Error('VPS_COMMANDER_TOKEN must contain 32-4096 bytes');
   if (host !== '127.0.0.1' && host !== '::1') throw Error('Loopback bind required');
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw Error('Invalid port');
-  if (!existsSync(executable)) throw Error('Build missing: expected Desktop Commander dist/index.js');
-  const peer = new Peer(executable);
+  if (!executorSocket && !existsSync(executable)) throw Error('Build missing: expected Desktop Commander dist/index.js');
+  const peer = new Peer(executable, executorSocket);
   await peer.start();
   const server = createServer(async (req, res) => {
     // No browser cross-origin requests. Also do not leak MCP methods without auth.

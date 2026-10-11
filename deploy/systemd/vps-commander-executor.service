@@ -1,0 +1,35 @@
+[Unit]
+Description=VPS Commander isolated MCP executor
+After=network.target
+
+[Service]
+Type=simple
+User=vpscommander
+Group=vpsc-ipc
+WorkingDirectory=/var/lib/vps-commander/workspace
+Environment=HOME=/var/lib/vps-commander
+Environment=PATH=/opt/vps-commander/bin:/usr/bin:/bin
+Environment=VPS_COMMANDER_EXECUTOR_SOCKET=/run/vps-commander-ipc/mcp.sock
+ExecStart=/opt/vps-commander/bin/node /opt/vps-commander/code/gateway/executor-socket.mjs
+RuntimeDirectory=vps-commander-ipc
+RuntimeDirectoryMode=0750
+Restart=on-failure
+RestartSec=3s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/vps-commander
+TasksMax=128
+MemoryMax=900M
+
+[Install]
+WantedBy=multi-user.target
