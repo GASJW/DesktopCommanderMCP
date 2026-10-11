@@ -43,8 +43,14 @@ ensure_readable(){
 ensure_readable || { echo 'DASH_DEPLOY=RED_SOURCE_READABILITY';exit 9; }
 /opt/vps-commander/bin/node --check "$BASE/gateway/server.mjs"
 /opt/vps-commander/bin/node --check "$BASE/gateway/dashboard/app.js"
-/opt/vps-commander/bin/node --test "$BASE"/gateway/test/*.test.mjs "$BASE"/deploy/test/*.test.mjs > /tmp/vpscommander-dashboard-check.txt 2>&1 || { echo 'DASH_DEPLOY=RED_TESTS';exit 10; }
-rm -f /tmp/vpscommander-dashboard-check.txt
+CHECK_DIR=$(mktemp -d /root/vpsc-dashboard-check.XXXXXXXX)
+chmod 0700 "$CHECK_DIR"
+if ! /opt/vps-commander/bin/node --test "$BASE"/gateway/test/*.test.mjs "$BASE"/deploy/test/*.test.mjs > "$CHECK_DIR/tests.log" 2>&1; then
+  echo 'DASH_DEPLOY=RED_TESTS'
+  rm -rf -- "$CHECK_DIR"
+  exit 10
+fi
+rm -rf -- "$CHECK_DIR"
 WORKER_PID=$(systemctl show -P MainPID "$WORKER")
 wait_tunnel(){ for i in {1..120};do systemctl is-active --quiet "$TUNNEL" && return 0;sleep .25;done;return 1; }
 wait_origin(){ local status;for i in {1..120};do
