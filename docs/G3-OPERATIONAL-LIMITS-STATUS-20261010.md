@@ -1,3 +1,46 @@
+# G3.4 — CERTIFICAÇÃO LIVE GREEN (2026-10-10 local / 2026-10-11 UTC)
+
+**ESTADO ATUAL: G3.4 GREEN**, limites de gateway ativados e smoke real ChatGPT certificado. Os registros de deploy RED e rollback abaixo são **históricos**, referentes às duas tentativas anteriores.
+
+## Causa confirmada da segunda tentativa RED
+
+Investigação dos eventos systemd por canal RDC root (somente VPS gui): o túnel dedicado `cloudflared-vps-commander.service` possui `Requires=vps-commander.service` e `After=vps-commander.service`. Ao reiniciar o gateway, o systemd reinicia também o túnel. Em `2026-10-11 01:25:01 UTC`, o gateway novo inicializou e emitiu HTTP audit **401**. Simultaneamente o túnel passou por `Stopping` / `Starting` e só ficou `active` em **01:25:03 UTC**. O bootstrap antigo fazia uma checagem de `is-active` única durante `activating` e reprovava a ativação imediatamente. Não era falha do MCP.
+
+Correção mínima: `wait_commander_tunnel_ready` espera até 120 tentativas de 0,25s (~30s) após o restart do gateway, antes de emitir PASS/RED. O rollback também espera estabilização antes de afirmar GREEN. Não houve necessidade de modificar unidades, DNS, políticas Cloudflare ou token.
+
+Regressão: três testes novos simulando túnel `activating → active`, túnel permanentemente indisponível e espera em rollback. **Suíte total 33/33 PASS na VPS** e [GitHub Actions GREEN](https://github.com/GASJW/DesktopCommanderMCP/actions/runs/38101893551), head `5ee291a6f1b088f62135493c461dc2d9602b49a4`.
+
+## Deploy real GREEN
+
+Aplicado por sessão administrativa no dispositivo **gui** (RDC temporário), com controles do bootstrap e rollback. Checkout Git limpo inicialmente em `feat/g3-recovery`; `fetch`, `switch feat/g3-operational-limits`, `pull --ff-only`. O script executou testes 33/33 e retornou:
+
+```text
+G3_4_TUNNEL_STABILIZATION=PASS
+G3_4_GATEWAY_DEPLOY=BOOTSTRAP_GREEN
+G3_4_EXECUTOR_PID_UNCHANGED=PASS
+G3_4_ANONYMOUS_ORIGIN_HTTP=401
+```
+
+### Smoke real após o restart — ChatGPT Commander (sem RDC)
+
+- `G34_AUTHENTICATED_CHATGPT_SHELL=GREEN`, host `gui`, execução `vpscommander`.
+- `vps-commander.service` **active** como `vpsc-gateway` (PID **1681908**); `vps-commander-executor.service` **active** como `vpscommander`, PID **1650485** preservado.
+- `cloudflared-vps-commander.service` e `cloudflared.service` **active**.
+- API Cloudflare: `vps-commander=healthy, connections=4` e `cofre=healthy, connections=4`.
+- `VPS_COMMANDER_AUDIT_ENABLED=1` preservado; modules com modo 0644.
+- `read_file /etc/os-release` PASS (Ubuntu 24.04.4 LTS).
+- `write_file` + read-back de `/var/lib/vps-commander/workspace/g3-4-postdeploy-acceptance-20261010.txt`: `G3_4_POSTDEPLOY_FILE_GREEN`.
+- `GET http://127.0.0.1:8787/healthz` **sem autenticação HTTP 401**. Consulta root pós-deploy: nenhuma linha `Error:`, `Failed with result` ou `EACCES` nos últimos dois minutos, `NRestarts=0`, branch ativa `feat/g3-operational-limits`, SHA `5ee291a`.
+- Cotas Linux preservadas: Gateway `MemoryMax=262144000` bytes (250M), Executor `MemoryMax=943718400` bytes (900M).
+
+## Contrato de limites certificado
+
+**Testes do código candidato**, não load test público: 1 MiB de entrada, 2 MiB de resposta JSON UTF-8, 4 MiB/frame JSONL do executor, até 16 chamadas em andamento (excesso HTTP 429 + Retry-After). Os caps são validados antes de expor HTTP, sem repetição automática de comandos mutantes em falha, e a auditoria registra `busy`/`limit_exceeded` sem conteúdo sensível.
+
+**Limites do aceite:** falhas prolongadas de rede, reboot integral da VPS, retenção imutável do journald, exaustão de armazenamento e WAF/DoS ficam fora do G3.4. Não executar saturação no endpoint produtivo apenas para duplicar testes isolados. O G3.4 está **GREEN operacionalmente**; PR #5 permanece Draft até revisão e merge governados, sobre PRs anteriores.
+
+---
+
 # G3.4 — PRIMEIRO DEPLOY RED, G3.3 RESTAURADO, BOOTSTRAP CORRIGIDO (10/10/2026 local / 11/10 UTC)
 
 **Estado atual: produção G3.3 GREEN; G3.4 candidato GREEN, mas implantação G3.4 NÃO certificada.** Este relatório substitui o status de candidato inicial indicado abaixo. Não repetir o antigo bootstrap sem obter os commits corretivos.
