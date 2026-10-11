@@ -5,8 +5,8 @@ name: Codespell
 on:
   push:
     branches: [main]
+  # Validate stacked PRs too, even when their base is another feature branch.
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read
