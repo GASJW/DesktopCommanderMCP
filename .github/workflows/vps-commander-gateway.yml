@@ -31,5 +31,6 @@ jobs:
       - run: bash -n deploy/bootstrap-g3-audit.sh
       - run: bash -n deploy/bootstrap-g3-recovery.sh
       - run: bash -n deploy/verify-g3-systemd-recovery.sh
+      - run: bash -n deploy/repair-g3-gateway-dependency.sh
       - run: python3 -c "import ast,pathlib; ast.parse(pathlib.Path('deploy/verify-g3-recovery-events.py').read_text())"
       - run: node --check deploy/manual-smoke-g3-recovery.mjs
