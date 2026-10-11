@@ -28,9 +28,13 @@ out=$(mktemp)
 cleanup() { rm -f "$out"; }
 recover() {
   echo 'G3_3_REAL_SYSTEMD_DRILL=RED; attempting safe service recovery' >&2
-  systemctl reset-failed "$WORKER" || true
-  systemctl restart "$WORKER" || true
-  systemctl restart "$GATEWAY" || true
+  if ! systemctl is-active --quiet "$WORKER"; then
+    systemctl reset-failed "$WORKER" || true
+    systemctl restart "$WORKER" || true
+  fi
+  if ! systemctl is-active --quiet "$GATEWAY"; then
+    systemctl restart "$GATEWAY" || true
+  fi
   if ! systemctl is-active --quiet cloudflared-vps-commander.service; then
     systemctl restart cloudflared-vps-commander.service || true
   fi
@@ -44,7 +48,11 @@ for i in {1..120}; do
   if systemctl is-active --quiet "$WORKER" && systemctl is-active --quiet "$GATEWAY"; then
     after_gateway=$(systemctl show -P MainPID "$GATEWAY")
     after_worker=$(systemctl show -P MainPID "$WORKER")
-    if [[ "$after_gateway" == "$before_gateway" && "$after_worker" != "$before_worker" && "$after_worker" -gt 1 ]]; then
+    if [[ "$after_gateway" != "$before_gateway" ]]; then
+      echo 'G3_3_GATEWAY_PID_CHANGED=RED (do not certify transparent recovery)' >&2
+      false
+    fi
+    if [[ "$after_worker" != "$before_worker" && "$after_worker" -gt 1 ]]; then
       if journalctl -u "$GATEWAY" --since "$stamp" --no-pager -o cat | python3 "$VERIFIER" > "$out"; then
         success=1
         break
