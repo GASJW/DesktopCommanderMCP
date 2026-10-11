@@ -27,6 +27,7 @@ export function createDeviceRegistry({
   heartbeatTtlMs = 45_000,
   challengeTtlMs = 30_000,
   maxDevices = 32,
+  initialTrustedDevices = [],
 } = {}) {
   if (typeof now !== 'function' ||
       !Number.isSafeInteger(heartbeatTtlMs) || heartbeatTtlMs < 1_000 || heartbeatTtlMs > 300_000 ||
@@ -158,6 +159,44 @@ export function createDeviceRegistry({
     return true;
   }
 
+  // Trusted records are public-key-only durable identities. Restoring them
+  // NEVER restores an old transport session, challenge or online status.
+  function snapshotTrustedDevices() {
+    return Array.from(devices.values(), d => Object.freeze({
+      deviceId:d.deviceId, name:d.name, platform:d.platform,
+      publicKeyPem:d.key.export({type:'spki',format:'pem'}),
+      fingerprint:d.fingerprint,
+    })).sort((a,b)=>a.deviceId.localeCompare(b.deviceId));
+  }
+
+  if (!Array.isArray(initialTrustedDevices) || initialTrustedDevices.length > maxDevices) {
+    throw new TypeError('Invalid initial trusted devices');
+  }
+  for (const record of initialTrustedDevices) {
+    if (!record || typeof record !== 'object' || Array.isArray(record) ||
+        Object.keys(record).sort().join(',') !== 'deviceId,fingerprint,name,platform,publicKeyPem' ||
+        !validUuid(record.deviceId) || typeof record.name !== 'string' ||
+        !NAME_RE.test(record.name.trim()) || record.name !== record.name.trim() ||
+        !PLATFORMS.has(record.platform) || typeof record.publicKeyPem !== 'string' ||
+        Buffer.byteLength(record.publicKeyPem,'utf8') > 1024 ||
+        typeof record.fingerprint !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(record.fingerprint)) {
+      throw new TypeError('Invalid initial trusted device');
+    }
+    let key;
+    try {key=createPublicKey(record.publicKeyPem);}
+    catch {throw new TypeError('Invalid initial trusted public key');}
+    if (key.asymmetricKeyType !== 'ed25519')throw new TypeError('Trusted key must be Ed25519');
+    const fingerprint=createHash('sha256').update(key.export({type:'spki',format:'der'})).digest('hex');
+    if (fingerprint !== record.fingerprint || devices.has(record.deviceId) ||
+        fingerprints.has(fingerprint)) throw new Error('Invalid or duplicated trusted identity');
+    devices.set(record.deviceId,{
+      deviceId:record.deviceId,name:record.name,platform:record.platform,
+      key,fingerprint,trustedAt:timestamp(),challenge:null,session:null,lastSeenAt:null,
+    });
+    fingerprints.add(fingerprint);
+  }
+
   function listDevices() {
     const t = timestamp();
     return Array.from(devices.values(), d => {
@@ -173,5 +212,6 @@ export function createDeviceRegistry({
   }
 
   return Object.freeze({ trustDevice, beginHandshake, completeHandshake,
-    heartbeat, disconnect, revokeDevice, listDevices, isLiveSession, acceptSignedFrame });
+    heartbeat, disconnect, revokeDevice, listDevices, isLiveSession, acceptSignedFrame,
+    snapshotTrustedDevices });
 }
