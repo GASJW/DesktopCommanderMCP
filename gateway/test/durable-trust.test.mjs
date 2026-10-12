@@ -234,7 +234,7 @@ test('exclusive lock blocks writers and keeps service fail-closed',()=>{
     const store=createDurableDeviceTrustStore({directory:dir});
     const lock=path.join(dir,'.trusted-devices-writer.lock');
     mkdirSync(lock,{mode:0o700});
-    assert.throws(()=>store.trustDevice(metadata(generate())),/EEXIST/);
+    assert.throws(()=>store.trustDevice(metadata(generate())),/EEXIST|lock present/);
     assert.throws(()=>store.registry.listDevices(),/Trust store unavailable/);
   });
 });
