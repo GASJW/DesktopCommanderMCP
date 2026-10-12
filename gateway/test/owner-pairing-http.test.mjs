@@ -58,8 +58,23 @@ async function setup({auditWrite,now=Date.now}={}){
   const approvePayload=()=>({requestId:pairing.requestId,code:pairing.displayCode,
     expectedFingerprint:pairing.fingerprint});
   const proof=()=>coordinator.provePossession(pairing.requestId,identity.prove(pairing));
+  const makePairing=(name='Gui-PC-2')=>{
+    const nextIdentity=createEphemeralPairingIdentity();
+    const next=coordinator.startPairing({
+      name,platform:'win32',publicKeyPem:nextIdentity.publicKeyPem,
+    });
+    return {
+      pairing:next,
+      prove:()=>coordinator.provePossession(next.requestId,nextIdentity.prove(next)),
+      approvePayload:()=>({requestId:next.requestId,code:next.displayCode,
+        expectedFingerprint:next.fingerprint}),
+      rejectPayload:()=>({requestId:next.requestId,
+        expectedFingerprint:next.fingerprint}),
+    };
+  };
   const close=()=>new Promise(resolve=>server.close(resolve));
-  return {registry,coordinator,identity,pairing,audits,request,pending,approvePayload,proof,createJwt,close};
+  return {registry,coordinator,identity,pairing,audits,request,pending,approvePayload,proof,
+    makePairing,createJwt,close};
 }
 test('JWT valid owner sees pending list and session-bound CSRF; no code or secret leaked',async()=>{
   const x=await setup();
@@ -239,6 +254,92 @@ test('expired CSRF token is denied even with valid signed owner JWT',async()=>{
     assert.equal(r.status,403);
     assert.equal(x.registry.listDevices().length,0);
     assert.equal(x.audits.length,0);
+  }finally{await x.close();}
+});
+
+test('concurrent decisions for the same request serialize without poisoning audit',async()=>{
+  let active=0;
+  const written=[];
+  const x=await setup({auditWrite:async entry=>{
+    if(active>0)return false;
+    active++;
+    try{
+      await new Promise(resolve=>setTimeout(resolve,10));
+      written.push(entry);
+      return true;
+    }finally{active--;}
+  }});
+  try{
+    x.proof();
+    const csrf=(await x.pending()).data.csrf;
+    const args={method:'POST',origin:ORIGIN,csrf,body:x.approvePayload()};
+    const results=await Promise.all([
+      x.request('approve',args),
+      x.request('approve',args),
+    ]);
+    assert.deepEqual(results.map(r=>r.status).sort(),[200,403]);
+    assert.equal(x.registry.listDevices().length,1);
+    assert.deepEqual(written.map(entry=>entry.phase),['intent','outcome','intent','outcome']);
+    assert.equal((await x.pending()).status,200);
+  }finally{await x.close();}
+});
+
+test('concurrent decisions for different requests serialize audit while preserving both outcomes',async()=>{
+  let active=0;
+  const written=[];
+  const x=await setup({auditWrite:async entry=>{
+    if(active>0)return false;
+    active++;
+    try{
+      await new Promise(resolve=>setTimeout(resolve,10));
+      written.push(entry);
+      return true;
+    }finally{active--;}
+  }});
+  try{
+    const other=x.makePairing();
+    x.proof();other.prove();
+    const csrf=(await x.pending()).data.csrf;
+    const [approved,rejected]=await Promise.all([
+      x.request('approve',{method:'POST',origin:ORIGIN,csrf,body:x.approvePayload()}),
+      x.request('reject',{method:'POST',origin:ORIGIN,csrf,body:other.rejectPayload()}),
+    ]);
+    assert.equal(approved.status,200);
+    assert.equal(rejected.status,200);
+    assert.equal(approved.data.status,'approved_offline');
+    assert.equal(rejected.data.rejected,true);
+    assert.equal(x.registry.listDevices().length,1);
+    assert.deepEqual(written.map(entry=>entry.phase),['intent','outcome','intent','outcome']);
+    assert.deepEqual(new Set(written.filter(entry=>entry.phase==='intent')
+      .map(entry=>entry.operation)),new Set(['approve','reject']));
+    assert.equal((await x.pending()).data.pending.length,0);
+  }finally{await x.close();}
+});
+
+test('concurrent approval and rejection of one request produce one decision and keep audit usable',async()=>{
+  let active=0;
+  const written=[];
+  const x=await setup({auditWrite:async entry=>{
+    if(active>0)return false;
+    active++;
+    try{
+      await new Promise(resolve=>setTimeout(resolve,10));
+      written.push(entry);
+      return true;
+    }finally{active--;}
+  }});
+  try{
+    x.proof();
+    const csrf=(await x.pending()).data.csrf;
+    const [approved,rejected]=await Promise.all([
+      x.request('approve',{method:'POST',origin:ORIGIN,csrf,body:x.approvePayload()}),
+      x.request('reject',{method:'POST',origin:ORIGIN,csrf,
+        body:{requestId:x.pairing.requestId,expectedFingerprint:x.pairing.fingerprint}}),
+    ]);
+    assert.deepEqual([approved.status,rejected.status].sort(),[200,403]);
+    assert.equal(x.registry.listDevices().length,approved.status===200?1:0);
+    assert.deepEqual(written.map(entry=>entry.phase),['intent','outcome','intent','outcome']);
+    assert.equal((await x.pending()).status,200);
   }finally{await x.close();}
 });
 test('CSRF substitution and malformed token are rejected without audit intent',async()=>{

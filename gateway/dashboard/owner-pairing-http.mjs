@@ -47,6 +47,7 @@ export function createOwnerPairingHttp({
   });
   const rate=new Map();
   let poisoned=false;
+  let decisionQueue=Promise.resolve();
   function csrfTag(owner,payload){
     return createHmac('sha256',csrfSecret)
       .update(owner.issuer).update('\0').update(owner.subject).update('\0')
@@ -165,26 +166,32 @@ export function createOwnerPairingHttp({
       targetId:digest(payload.requestId),
       // Never persist entered code, JWT, private key, nonce or Access cookie.
     };
-    try{
-      await durableEvent({...event,phase:'intent'});
-    }catch{return response(res,503,{error:'Owner audit unavailable'});}
-    let result,status=200;
-    try{
-      result=action==='approve'
-        ? await review.approve(context,payload)
-        : await review.reject(context,payload);
-    }catch{
-      status=403;
-      result={error:'Pairing decision denied'};
-    }
-    try{
-      await durableEvent({...event,phase:'outcome',
-        outcome:status===200?'accepted':'denied'});
-    }catch{
-      // The operation may already have completed: never claim failure means
-      // no trust mutation; lock the control plane for manual reconciliation.
-      return response(res,503,{error:'Pairing outcome requires reconciliation'});
-    }
-    return response(res,status,result);
+    const decision=decisionQueue.then(async()=>{
+      try{
+        await durableEvent({...event,phase:'intent'});
+      }catch{return response(res,503,{error:'Owner audit unavailable'});}
+      let result,status=200;
+      try{
+        result=action==='approve'
+          ? await review.approve(context,payload)
+          : await review.reject(context,payload);
+      }catch{
+        status=403;
+        result={error:'Pairing decision denied'};
+      }
+      try{
+        await durableEvent({...event,phase:'outcome',
+          outcome:status===200?'accepted':'denied'});
+      }catch{
+        // The operation may already have completed: never claim failure means
+        // no trust mutation; lock the control plane for manual reconciliation.
+        return response(res,503,{error:'Pairing outcome requires reconciliation'});
+      }
+      return response(res,status,result);
+    });
+    // Keep the queue usable after a request-level exception while preserving
+    // the individual request's rejected result for the HTTP server wrapper.
+    decisionQueue=decision.then(()=>undefined,()=>undefined);
+    return decision;
   };
 }
