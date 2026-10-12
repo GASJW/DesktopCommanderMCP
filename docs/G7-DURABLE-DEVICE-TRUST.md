@@ -28,8 +28,8 @@ An authorized agent's Ed25519 signing key already survives restart locally (Linu
 
 ## Tests
 
-The suite covers stable deviceId across same-process and **new OS process**, offline after restart, owner-only POSIX modes, symlink and dangling-symlink denial, corrupt metadata/fingerprint and duplicates, revocation durable across restart, all-session fencing on state mutation, write failure poisoning of active state, exact schema, revision overflow and public-keys-only records.
+The suite covers a true two-process writer race from one trust revision, stable deviceId across same-process and **new OS process**, offline after restart, owner-only POSIX modes, symlink and dangling-symlink denial, corrupt metadata/fingerprint and duplicates, revocation durable across restart, all-session fencing on state mutation, write failure poisoning of active state, exact schema, revision overflow and public-keys-only records.
 
-Tests run with ephemeral temporary directories only; they neither enroll Gui-PC nor mutate production. Current local verification on the synchronized branch: `node --test gateway/test/durable-trust.test.mjs` as an unprivileged user — **19 PASS, 0 FAIL**. GitHub checks passed on the synchronization-only revision; checks for the current lock-fix revision are pending. This is source and test evidence only; the PR remains Draft and no G7 feature is wired into production.
+Tests run with ephemeral temporary directories only; they neither enroll Gui-PC nor mutate production. Current local verification on the synchronized branch: `node --test gateway/test/durable-trust.test.mjs` as an unprivileged user — **20 PASS, 0 FAIL**. GitHub checks passed on the synchronization-only revision; checks for the current lock-fix revision are pending. This is source and test evidence only; the PR remains Draft and no G7 feature is wired into production.
 
 **Next safe milestone:** build an authenticated owner-admin approval plane and separate agent machine ingress in a new PR, with full threat model, audit and staged pilot. Do not create a public endpoint just to make the local test server reachable.
