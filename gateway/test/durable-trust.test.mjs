@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, sign } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { chmodSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync,
   symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -227,6 +229,35 @@ test('stale second writer cannot overwrite another process trust revision',()=>{
     assert.throws(()=>second.registry.listDevices(),/Trust store unavailable/);
     const read=createDurableDeviceTrustStore({directory:dir});
     assert.equal(read.registry.listDevices().length,1);
+  });
+});
+test('pre-commit stale snapshot releases its own lock for recovery',()=>{
+  temp(dir=>{
+    const store=createDurableDeviceTrustStore({directory:dir});
+    store.trustDevice(metadata(generate(),'first'));
+    const lock=path.join(dir,'.trusted-devices-writer.lock');
+    const originalMkdirSync=fs.mkdirSync;
+    fs.mkdirSync=(...args)=>{
+      const result=originalMkdirSync(...args);
+      if(args[0]===lock){
+        const snapshot=JSON.parse(readFileSync(file(dir),'utf8'));
+        snapshot.revision++;
+        writeFileSync(file(dir),JSON.stringify(snapshot)+'\n');
+      }
+      return result;
+    };
+    syncBuiltinESMExports();
+    try{
+      assert.throws(()=>store.trustDevice(metadata(generate(),'second')),
+        /Trust store changed by another process/);
+      assert.throws(()=>lstatSync(lock),{code:'ENOENT'});
+      const recovered=createDurableDeviceTrustStore({directory:dir});
+      assert.equal(recovered.revision(),2);
+      assert.equal(recovered.registry.listDevices().length,1);
+    }finally{
+      fs.mkdirSync=originalMkdirSync;
+      syncBuiltinESMExports();
+    }
   });
 });
 test('exclusive lock blocks writers and keeps service fail-closed',()=>{
