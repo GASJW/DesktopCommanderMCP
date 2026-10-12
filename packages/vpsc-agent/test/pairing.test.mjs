@@ -50,7 +50,7 @@ test('agent identity object never exposes private key or environment secrets',()
   assert.equal(Object.isFrozen(identity),true);
   assert.equal(JSON.stringify(identity).includes('PRIVATE KEY'),false);
 });
-test('CLI doctor is local-only, claims no remote execution',()=>{
+test('CLI doctor is local-only, claims no remote execution', {skip:Number(process.versions.node.split('.')[0])<20},()=>{
   const output=execFileSync(process.execPath,[bin,'doctor'],{encoding:'utf8'});
   const data=JSON.parse(output);
   assert.equal(data.prototype,true);

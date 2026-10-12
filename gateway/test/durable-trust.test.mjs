@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, sign } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { chmodSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync,
   symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -24,6 +26,11 @@ function temp(testFn){
   const parent=mkdtempSync(path.join(os.tmpdir(),'vpsc-g7-trust-'));
   const directory=path.join(parent,'server');
   try{return testFn(directory,parent);}finally{rmSync(parent,{recursive:true,force:true});}
+}
+async function tempAsync(testFn){
+  const parent=mkdtempSync(path.join(os.tmpdir(),'vpsc-g7-trust-'));
+  const directory=path.join(parent,'server');
+  try{return await testFn(directory,parent);}finally{rmSync(parent,{recursive:true,force:true});}
 }
 const file=directory=>path.join(directory,'trusted-devices-v1.json');
 
@@ -233,6 +240,88 @@ test('stale second writer cannot overwrite another process trust revision',()=>{
     const read=createDurableDeviceTrustStore({directory:dir});
     assert.equal(read.registry.listDevices().length,1);
   });
+});
+test('pre-commit stale snapshot releases its own lock for recovery',()=>{
+  temp(dir=>{
+    const store=createDurableDeviceTrustStore({directory:dir});
+    store.trustDevice(metadata(generate(),'first'));
+    const lock=path.join(dir,'.trusted-devices-writer.lock');
+    const originalMkdirSync=fs.mkdirSync;
+    fs.mkdirSync=(...args)=>{
+      const result=originalMkdirSync(...args);
+      if(args[0]===lock){
+        const snapshot=JSON.parse(readFileSync(file(dir),'utf8'));
+        snapshot.revision++;
+        writeFileSync(file(dir),JSON.stringify(snapshot)+'\n');
+      }
+      return result;
+    };
+    syncBuiltinESMExports();
+    try{
+      assert.throws(()=>store.trustDevice(metadata(generate(),'second')),
+        /Trust store changed by another process/);
+      assert.throws(()=>lstatSync(lock),{code:'ENOENT'});
+      const recovered=createDurableDeviceTrustStore({directory:dir});
+      assert.equal(recovered.revision(),2);
+      assert.equal(recovered.registry.listDevices().length,1);
+    }finally{
+      fs.mkdirSync=originalMkdirSync;
+      syncBuiltinESMExports();
+    }
+  });
+});
+test('two OS processes racing from one trust revision commit at most one writer',async()=>{
+  await tempAsync(dir=>new Promise((resolve,reject)=>{
+    const source=`
+      const {createDurableDeviceTrustStore}=await import('./gateway/devices/durable-trust.mjs');
+      const {generateKeyPairSync}=await import('node:crypto');
+      const store=createDurableDeviceTrustStore({directory:process.argv[1]});
+      process.stdout.write('READY\\n');
+      process.stdin.once('data',()=>{
+        try{
+          const {publicKey}=generateKeyPairSync('ed25519');
+          store.trustDevice({name:process.argv[2],platform:'linux',
+            publicKeyPem:publicKey.export({format:'pem',type:'spki'})});
+          process.stdout.write('RESULT:OK\\n');
+        }catch{process.stdout.write('RESULT:ERR\\n');}
+        process.stdin.destroy();
+      });
+    `;
+    const children=['first','second'].map(name=>spawn(process.execPath,
+      ['--input-type=module','-e',source,dir,name],{cwd:process.cwd()}));
+    const outputs=children.map(()=> '');
+    let ready=0;
+    const maybeGo=()=>{
+      if(ready===children.length){for(const child of children)child.stdin.write('go\n');}
+    };
+    const results=[];
+    let exited=0;
+    children.forEach((child,index)=>{
+      child.stdout.setEncoding('utf8');
+      child.stderr.setEncoding('utf8');
+      child.stdout.on('data',chunk=>{
+        outputs[index]+=chunk;
+        if(outputs[index].includes('READY\n')){ready++;maybeGo();}
+        for(const match of chunk.matchAll(/RESULT:(OK|ERR)\n/g))results.push(match[1]);
+      });
+      child.on('error',reject);
+      child.on('exit',(code,signal)=>{
+        if(code!==0)reject(Error(`writer child failed: ${code??signal}; ${outputs[index]}`));
+        exited++;
+        if(exited===children.length){
+          try{
+            assert.equal(results.filter(x=>x==='OK').length,1);
+            assert.equal(results.filter(x=>x==='ERR').length,1);
+            const restarted=createDurableDeviceTrustStore({directory:dir});
+            assert.equal(restarted.revision(),1);
+            assert.equal(restarted.registry.listDevices().length,1);
+            resolve();
+          }catch(error){reject(error);}
+        }
+      });
+    });
+    setTimeout(()=>reject(Error(`writer children did not finish: ${outputs.join(' | ')}`)),10_000).unref();
+  }));
 });
 test('exclusive lock blocks writers and keeps service fail-closed',()=>{
   temp(dir=>{
