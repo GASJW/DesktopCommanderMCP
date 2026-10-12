@@ -347,7 +347,7 @@ test('CSRF substitution and malformed token are rejected without audit intent',a
   try{
     x.proof();
     const csrf=(await x.pending()).data.csrf;
-    for(const bad of [csrf.slice(0,-1)+'!',csrf.slice(1),csrf.replace(/.$/,'A'),'junk']){
+    for(const bad of [csrf.slice(0,-1)+'!',csrf.slice(1),csrf.slice(0,-1)+(csrf.at(-1)==='A'?'B':'A'),'junk']){
       const r=await x.request('approve',{method:'POST',origin:ORIGIN,csrf:bad,
         body:x.approvePayload()});
       assert.equal(r.status,403);
