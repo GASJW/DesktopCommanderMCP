@@ -1,6 +1,6 @@
 # G7.2e — Durable VPS-side approved device identities (inert)
 
-**Status:** standalone server-side store under review, not imported by `gateway/server.mjs` and not deployed. This PR builds on G7's main baseline `c2990c8`.
+**Status:** standalone server-side store under review, not imported by `gateway/server.mjs` and not deployed. This branch is synchronized with current `main` at `249ac1af8d279bad623f657368e987d1c57fd467` (G7 inert HTTPS agent client merge); the synchronization merge is `d90ef909f8469c1adea0e88ff12db7f22ef7872d`. That merge added no changes to the trust-store implementation.
 
 ## Problem being solved
 
@@ -28,8 +28,8 @@ An authorized agent's Ed25519 signing key already survives restart locally (Linu
 
 ## Tests
 
-The suite covers stable deviceId across same-process and **new OS process**, offline after restart, owner-only POSIX modes, symlink and dangling-symlink denial, corrupt metadata/fingerprint and duplicates, revocation durable across restart, all-session fencing on state mutation, write failure poisoning of active state, exact schema, revision overflow and public-keys-only records.
+The suite covers a true two-process writer race from one trust revision, stable deviceId across same-process and **new OS process**, offline after restart, owner-only POSIX modes, symlink and dangling-symlink denial, corrupt metadata/fingerprint and duplicates, revocation durable across restart, all-session fencing on state mutation, write failure poisoning of active state, exact schema, revision overflow and public-keys-only records.
 
-Tests run with ephemeral temporary directories only; they neither enroll Gui-PC nor mutate production. The G7 .md files from earlier PRs may retain historical Draft status but current main includes their inert source after protected merges.
+Tests run with ephemeral temporary directories only; they neither enroll Gui-PC nor mutate production. Current local verification on the synchronized branch: `node --test gateway/test/durable-trust.test.mjs` as an unprivileged user — **20 PASS, 0 FAIL**. GitHub checks passed on the synchronization-only revision; checks for the current lock-fix revision are pending. This is source and test evidence only; the PR remains Draft and no G7 feature is wired into production.
 
 **Next safe milestone:** build an authenticated owner-admin approval plane and separate agent machine ingress in a new PR, with full threat model, audit and staged pilot. Do not create a public endpoint just to make the local test server reachable.
