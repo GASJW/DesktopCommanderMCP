@@ -8,14 +8,41 @@ import { createDeviceRegistry } from './registry.mjs';
 // Not wired into gateway/server.mjs, Cloudflare or any live tool endpoint.
 const FILE='trusted-devices-v1.json';
 const MAX_BYTES=128*1024;
-function checkDirectory(directory){
+function checkDirectory(directory,{create=false}={}){
   if(process.platform==='win32')throw new Error('VPS trust store requires POSIX owner-only ACLs');
-  if(typeof directory!=='string'||!path.isAbsolute(directory))throw new TypeError('Trust directory must be absolute');
-  mkdirSync(directory,{recursive:true,mode:0o700});
+  if(typeof directory!=='string'||!path.isAbsolute(directory)||
+     path.normalize(directory)!==directory||directory===path.parse(directory).root){
+    throw new TypeError('Trust directory must be a normalized absolute path');
+  }
+  // Do not follow a symlink in any path component, including ancestors.
+  // Parents must be provisioned before the trust store is initialized.
+  let cursor=path.parse(directory).root;
+  for(const component of directory.slice(cursor.length).split(path.sep)){
+    cursor=path.join(cursor,component);
+    let st;
+    try{st=lstatSync(cursor);}catch(e){
+      if(e?.code!=='ENOENT')throw e;
+      if(cursor!==directory||!create)throw Error('Missing trusted store directory');
+      mkdirSync(cursor,{mode:0o700});
+      st=lstatSync(cursor);
+    }
+    if(!st.isDirectory()||st.isSymbolicLink())throw Error('Unsafe trust directory ancestor');
+  }
   const st=lstatSync(directory);
-  if(!st.isDirectory()||st.isSymbolicLink()||(st.mode&0o077))throw Error('Unsafe trust directory');
+  if(st.uid!==process.getuid()||(st.mode&0o7777)!==0o700){
+    throw Error('Unsafe trust directory owner or mode');
+  }
+  return st;
 }
 function trustedFile(directory){return path.join(directory,FILE);}
+function assertNoWriterLock(directory){
+  const lock=path.join(directory,'.trusted-devices-writer.lock');
+  try{lstatSync(lock);}catch(e){
+    if(e?.code==='ENOENT')return;
+    throw e;
+  }
+  throw Error('Trust writer lock present; manual reconciliation required');
+}
 function readSnapshot(directory) {
   const filename=trustedFile(directory);
   let stat;
@@ -27,7 +54,10 @@ function readSnapshot(directory) {
   const fd=openSync(filename,constants.O_RDONLY|(constants.O_NOFOLLOW??0));
   try{
     const st=fstatSync(fd);
-    if(!st.isFile()||st.size>MAX_BYTES||st.size<=0||(st.mode&0o077))throw Error('Unsafe trust file');
+    if(!st.isFile()||st.nlink!==1||st.uid!==process.getuid()||
+       st.size>MAX_BYTES||st.size<=0||(st.mode&0o7777)!==0o600){
+      throw Error('Unsafe trust file');
+    }
     const data=readFileSync(fd,'utf8');
     let obj;
     try{obj=JSON.parse(data);}catch{throw Error('Invalid trust document');}
@@ -60,11 +90,40 @@ function commitSnapshot(directory,snapshot){
   }
 }
 export function createDurableDeviceTrustStore({directory,maxDevices=32,now=Date.now}={}){
-  checkDirectory(directory);
+  const expectedDirectory=checkDirectory(directory,{create:true});
+  // On Linux filesystems an inode number can be reused immediately after
+  // deletion. Include the POSIX birth timestamp to fence reincarnated paths.
+  const expectedBirthtimeNs=lstatSync(directory,{bigint:true}).birthtimeNs;
+  if(expectedBirthtimeNs<=0n)throw Error('Trust filesystem lacks directory identity support');
+  assertNoWriterLock(directory);
   let snapshot=readSnapshot(directory);
+  assertNoWriterLock(directory);
   let current=createDeviceRegistry({maxDevices,now,initialTrustedDevices:snapshot.devices});
   let blocked=false;
-  const requireHealthy=()=>{if(blocked)throw Error('Trust store unavailable; stop routing and restart after repair');};
+  // A different process can revoke trust while this instance still holds a
+  // live in-memory session. Every authorization-facing operation must fence
+  // itself against the authoritative on-disk revision and any active writer.
+  const requireHealthy=()=>{
+    if(blocked)throw Error('Trust store unavailable; stop routing and restart after repair');
+    try {
+      const actualDirectory=checkDirectory(directory);
+      if(actualDirectory.ino!==expectedDirectory.ino||
+         actualDirectory.dev!==expectedDirectory.dev||
+         lstatSync(directory,{bigint:true}).birthtimeNs!==expectedBirthtimeNs){
+        throw Error('Trust directory replaced; restart and reconcile');
+      }
+      assertNoWriterLock(directory);
+      const authoritative=readSnapshot(directory);
+      if(authoritative.revision!==snapshot.revision||
+         JSON.stringify(authoritative.devices)!==JSON.stringify(snapshot.devices)){
+        throw Error('Trust store changed by another process; restart required');
+      }
+      assertNoWriterLock(directory);
+    }catch(error){
+      blocked=true;
+      throw error;
+    }
+  };
   // Read-only session facade always points to current state. Persistence of any
   // trust change resets ALL live sessions; callers must re-authenticate.
   const registry=Object.freeze({

@@ -17,6 +17,11 @@ const generate=()=>{
     sign:challenge=>sign(null,challenge,privateKey).toString('base64url') };
 };
 const metadata=(key,name='Gui-PC')=>({name,platform:'win32',publicKeyPem:key.publicKeyPem});
+async function tempProcess(testFn){
+  const parent=mkdtempSync(path.join(os.tmpdir(),'vpsc-g7-crash-'));
+  const directory=path.join(parent,'server');
+  try{return await testFn(directory);}finally{rmSync(parent,{recursive:true,force:true});}
+}
 function temp(testFn){
   const parent=mkdtempSync(path.join(os.tmpdir(),'vpsc-g7-trust-'));
   const directory=path.join(parent,'server');
@@ -323,7 +328,45 @@ test('exclusive lock blocks writers and keeps service fail-closed',()=>{
     const store=createDurableDeviceTrustStore({directory:dir});
     const lock=path.join(dir,'.trusted-devices-writer.lock');
     mkdirSync(lock,{mode:0o700});
-    assert.throws(()=>store.trustDevice(metadata(generate())),/EEXIST/);
+    assert.throws(()=>store.trustDevice(metadata(generate())),/EEXIST|lock present/);
     assert.throws(()=>store.registry.listDevices(),/Trust store unavailable/);
   });
+});
+test('killed writer process leaves a durable lock that blocks restart',async()=>{
+  await tempProcess(dir=>new Promise((resolve,reject)=>{
+    const source=`
+      import fs from 'node:fs';
+      import {syncBuiltinESMExports} from 'node:module';
+      fs.fsyncSync=()=>{
+        process.stdout.write('LOCKED\\n');
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,120000);
+      };
+      syncBuiltinESMExports();
+      const {createDurableDeviceTrustStore}=await import('./gateway/devices/durable-trust.mjs');
+      const {generateKeyPairSync}=await import('node:crypto');
+      const store=createDurableDeviceTrustStore({directory:process.argv[1]});
+      const {publicKey}=generateKeyPairSync('ed25519');
+      store.trustDevice({name:'crash-writer',platform:'linux',
+        publicKeyPem:publicKey.export({format:'pem',type:'spki'})});
+    `;
+    const child=spawn(process.execPath,['--input-type=module','-e',source,dir],
+      {cwd:process.cwd(),stdio:['ignore','pipe','pipe']});
+    let output='';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data',chunk=>{
+      output+=chunk;
+      if(output.includes('LOCKED\n'))child.kill('SIGKILL');
+    });
+    child.on('error',reject);
+    child.on('exit',(code,signal)=>{
+      try{
+        assert.equal(signal,'SIGKILL');
+        assert.equal(lstatSync(path.join(dir,'.trusted-devices-writer.lock')).isDirectory(),true);
+        assert.throws(()=>createDurableDeviceTrustStore({directory:dir}),
+          /Trust writer lock present/);
+        resolve();
+      }catch(error){reject(error);}
+    });
+    setTimeout(()=>{child.kill('SIGKILL');reject(Error(`writer did not reach lock: ${output}`));},10_000).unref();
+  }));
 });
