@@ -85,13 +85,16 @@ export function createDurableDeviceTrustStore({directory,maxDevices=32,now=Date.
     // mkdir is exclusive across processes on a local POSIX filesystem. Never
     // steal a pre-existing lock: after a crash, an operator must reconcile it.
     const lock=path.join(directory,'.trusted-devices-writer.lock');
-    let locked=false, committed=false;
+    let locked=false, committed=false, staleSnapshot=false;
     try {
       mkdirSync(lock,{mode:0o700});
       locked=true;
+      const lockDirFd=openSync(directory,constants.O_RDONLY|(constants.O_NOFOLLOW??0));
+      try{fsyncSync(lockDirFd);}finally{closeSync(lockDirFd);}
       const actual=readSnapshot(directory);
       if(actual.revision!==snapshot.revision ||
          JSON.stringify(actual.devices)!==JSON.stringify(snapshot.devices)){
+        staleSnapshot=true;
         throw Error('Trust store changed by another process; restart required');
       }
       commitSnapshot(directory,next); // Do NOT change memory before durable write.
@@ -100,13 +103,21 @@ export function createDurableDeviceTrustStore({directory,maxDevices=32,now=Date.
       current=candidate; // New registry discards sessions / challenges.
       rmdirSync(lock);
       locked=false;
+      const dirFd=openSync(directory,constants.O_RDONLY|(constants.O_NOFOLLOW??0));
+      try{fsyncSync(dirFd);}finally{closeSync(dirFd);}
       blocked=false;
     } finally {
       // On a failed durability step, do not remove the lock automatically:
       // after a crash/uncertain write the next writer must stop for recovery.
       // A deterministic pre-commit stale revision is safe to release.
       if(locked&&!committed){
-        // Keep lock in place for operator inspection (fail-closed).
+        if(staleSnapshot){
+          rmdirSync(lock);
+          locked=false;
+          const dirFd=openSync(directory,constants.O_RDONLY|(constants.O_NOFOLLOW??0));
+          try{fsyncSync(dirFd);}finally{closeSync(dirFd);}
+        }
+        // Keep the lock for every other failure: storage may be uncertain.
       }
     }
   }
