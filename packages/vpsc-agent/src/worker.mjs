@@ -169,7 +169,8 @@ export function createAgentWorker({deviceId,client,executor,pollIntervalMs=250}=
             const claims=frame.authorization.claims;
             const acknowledgement=await client.cancelAck({requestId:frame.requestId,
               ownerDigest:claims.ownerDigest,status});
-            if(!acknowledgement||acknowledgement.accepted!==true||acknowledgement.status!==status){
+            if(!acknowledgement||acknowledgement.accepted!==true||
+               acknowledgement.status!==status&&acknowledgement.status!=='ambiguous'){
               throw fail('AMBIGUOUS_CANCEL_ACK','Cancellation acknowledgement was not accepted; do not replay');
             }
             continue;

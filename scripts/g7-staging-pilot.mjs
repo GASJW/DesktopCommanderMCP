@@ -21,6 +21,8 @@ const MACHINE_ISSUER='https://g7-machine-staging.cloudflareaccess.com';
 const OWNER_AUD='a'.repeat(64),MACHINE_AUD='b'.repeat(64);
 const OWNER_EMAIL='g7-staging-owner@example.test',OWNER_SUBJECT='synthetic-staging-owner';
 const DISPLAYED_READ='G7 standalone staging real MCP read\n';
+const TEST_ACTIVE_JOB_SCENARIOS=new Set(['owner-cancel','grant-revoke','device-revoke']);
+const FIXTURE_COMMAND_TIMEOUT_MS=10_000;
 const trace=message=>{if(process.env.VPSC_STAGING_TRACE==='1')process.stderr.write(`[g7-staging] ${message}\n`);};
 function ensure(condition,message){if(!condition)throw Error(message);}
 function modeDir(dir){mkdirSync(dir,{recursive:true,mode:0o700});chmodSync(dir,0o700);}
@@ -57,9 +59,34 @@ function waitForEvent(proc,event,timeoutMs=15_000){
     proc.exited.then(code=>{if(code!==null){clearTimeout(timer);proc.waiters.delete(onEvent);reject(Error(`${event} process exited ${code}: ${proc.stderrText}`));}});
   });
 }
-function startProcess(script,args,{cwd=ROOT,home,tmp}={}){
+function waitForMatchingEvent(proc,event,predicate,timeoutMs=15_000){
+  const existing=proc.events.find(value=>value.event===event&&predicate(value));
+  if(existing)return Promise.resolve(existing);
+  return new Promise((resolve,reject)=>{
+    const timer=setTimeout(()=>{proc.waiters.delete(onEvent);reject(Error(`${event} timeout`));},timeoutMs);
+    const onEvent=value=>{
+      if(value.event!==event||!predicate(value))return;
+      clearTimeout(timer);proc.waiters.delete(onEvent);resolve(value);
+    };
+    proc.waiters.add(onEvent);
+    proc.exited.then(code=>{if(code!==null){clearTimeout(timer);proc.waiters.delete(onEvent);
+      const fixtureEvents=proc.events.filter(value=>String(value.event).startsWith('FIXTURE_'));
+      reject(Error(`${event} process exited ${code}: ${proc.stderrText}; `+
+        `fixture=${JSON.stringify(fixtureEvents).slice(-1600)}`));}});
+  });
+}
+function startProcess(script,args,{cwd=ROOT,home,tmp,testActiveJob=false}={}){
+  const env={PATH:'/usr/bin:/bin',HOME:home,TMPDIR:tmp,LANG:'C.UTF-8'};
+  if(testActiveJob){
+    if(!process.env.NODE_TEST_CONTEXT||process.env.VPSC_STAGING_TEST_ACTIVE_JOB!=='1'||
+       !TEST_ACTIVE_JOB_SCENARIOS.has(process.env.VPSC_STAGING_TEST_SCENARIO))
+      throw Error('Test active-job fixture is available only to the Node test runner');
+    env.NODE_TEST_CONTEXT=process.env.NODE_TEST_CONTEXT;
+    env.VPSC_STAGING_TEST_ACTIVE_JOB='1';
+    env.VPSC_STAGING_TEST_SCENARIO=process.env.VPSC_STAGING_TEST_SCENARIO;
+  }
   const child=spawn(process.execPath,[script,...args],{cwd,detached:true,shell:false,
-    stdio:['ignore','pipe','pipe'],env:{PATH:'/usr/bin:/bin',HOME:home,TMPDIR:tmp,LANG:'C.UTF-8'}});
+    stdio:['ignore','pipe','pipe'],env});
   const proc={child,events:[],waiters:new Set(),stderrText:''};
   const lines=createInterface({input:child.stdout,crlfDelay:Infinity});
   lines.on('line',line=>{
@@ -107,6 +134,24 @@ function processTree(rootPid){
 function processStillLive(expected){
   const row=processRows().find(item=>item.pid===expected.pid&&item.startTime===expected.startTime);
   return Boolean(row&&row.state!=='Z'&&row.state!=='X');
+}
+function fixedSleepProcess(pid,agentPid){
+  const row=processRows().find(item=>item.pid===pid);
+  if(!row||row.state==='Z'||row.state==='X'||row.uid!==process.getuid()||
+     row.ppid!==agentPid||row.pgid!==pid)return null;
+  let args;
+  try{args=readFileSync(`/proc/${pid}/cmdline`).toString('utf8').split('\0').filter(Boolean);}
+  catch{return null;}
+  if(args.length!==2||args[0]!=='/usr/bin/sleep'||args[1]!=='30')return null;
+  return row;
+}
+async function waitForProcessExit(expected,timeoutMs=5000){
+  const deadline=Date.now()+timeoutMs;
+  while(Date.now()<deadline){
+    if(!processStillLive(expected))return true;
+    await new Promise(resolve=>setTimeout(resolve,25));
+  }
+  return !processStillLive(expected);
 }
 function processGroupHasLiveMember(group){
   return processRows().some(row=>row.uid===process.getuid()&&row.pgid===group&&
@@ -183,6 +228,11 @@ function assertMcpOk(response,label){
 async function runPilot(){
   if(process.platform!=='linux'||typeof process.getuid!=='function'||process.getuid()===0)
     throw Error('Run the staging pilot as a nonroot Linux user');
+  const fixtureRequested=process.env.VPSC_STAGING_TEST_ACTIVE_JOB==='1';
+  const activeJobScenario=process.env.VPSC_STAGING_TEST_SCENARIO;
+  if(fixtureRequested&&(!process.env.NODE_TEST_CONTEXT||!TEST_ACTIVE_JOB_SCENARIOS.has(activeJobScenario)))
+    throw Error('Active-job scenarios are available only to the Node test runner');
+  if(!fixtureRequested&&activeJobScenario!==undefined)throw Error('Staging test scenario denied');
   const mcpEntrypoint=process.env.VPSC_STAGING_MCP_ENTRYPOINT;
   if(!mcpEntrypoint||!path.isAbsolute(mcpEntrypoint)||path.normalize(mcpEntrypoint)!==mcpEntrypoint||
      !existsSync(mcpEntrypoint))
@@ -317,7 +367,7 @@ async function runPilot(){
       {maxBytes:65_536,maxLength:1000,maxOffset:100_000});
     const writeGrant=await grant('write_file',{root:dirs['allowed-root']},{maxBytes:65_536});
     const commandGrant=await grant('run_command',{root:dirs['allowed-root'],profile:'count_lines'},
-      {maxOutputBytes:4096,maxRuntimeMs:10_000,profile:'count_lines'});
+      {maxOutputBytes:4096,maxRuntimeMs:FIXTURE_COMMAND_TIMEOUT_MS,profile:'count_lines'});
     ensure(readGrant.deviceId===deviceId&&writeGrant.deviceId===deviceId,'grant identity binding mismatch');
     trace('durable grants committed');
 
@@ -327,7 +377,7 @@ async function runPilot(){
       caPath:tlsCert,pollIntervalMs:25});
     privateJson(agentConfigPath,makeAgentConfig(gatewayPort));
     const startAgent=()=>launchProcess(path.join(ROOT,'packages/vpsc-agent/bin/g7-staging-worker.mjs'),
-      ['--config',agentConfigPath],{home:agentHome,tmp:agentTmp});
+      ['--config',agentConfigPath],{home:agentHome,tmp:agentTmp,testActiveJob:fixtureRequested});
     agentProc=startAgent();
     const agentReady=await waitForEvent(agentProc,'READY');
     await waitForEvent(agentProc,'ONLINE');
@@ -338,6 +388,34 @@ async function runPilot(){
     const ownerCall=async(name,args,{signal}={})=>post(gatewayPort,readFileSync(tlsCert),'/mcp',{
       jsonrpc:'2.0',id:++rpcId,method:'tools/call',params:{name,arguments:{deviceId,...args}},
     },{headers:authHeaders,signal});
+    let preExecutionCancellation=null;
+    if(activeJobScenario==='owner-cancel'){
+      const beforeExecutionFile=path.join(dirs['allowed-root'],'cancel-before-execution-probe.txt');
+      writeFileSync(beforeExecutionFile,'cancel before local execution\n',{mode:0o600,flag:'wx'});
+      const controller=new AbortController();
+      const pending=ownerCall('read_file',{path:beforeExecutionFile},{signal:controller.signal})
+        .then(response=>({response}),error=>({error}));
+      const received=await waitForMatchingEvent(agentProc,'FIXTURE_OPERATION_RECEIVED',event=>
+        event.tool==='read_file'&&typeof event.requestId==='string');
+      controller.abort();
+      const acknowledgement=await waitForMatchingEvent(agentProc,'FIXTURE_CANCEL_ACK',event=>
+        event.requestId===received.requestId);
+      const callOutcome=await pending;
+      ensure(acknowledgement.accepted===true&&acknowledgement.status==='cancelled',
+        'agent did not acknowledge cancellation after receipt and before execution');
+      ensure(callOutcome.error instanceof Error,'cancelled Owner request returned a successful result');
+      const cancelledLedger=existsSync(path.join(dirs.ledger,'i4-execution.jsonl'))
+        ?readFileSync(path.join(dirs.ledger,'i4-execution.jsonl'),'utf8').trim().split('\n')
+          .filter(Boolean).map(line=>JSON.parse(line)):[];
+      ensure(!cancelledLedger.some(record=>record.requestId===received.requestId),
+        'cancelled before execution request created an execution-ledger intent');
+      preExecutionCancellation={requestId:received.requestId,receivedByAgent:true,
+        acknowledged:acknowledgement.accepted===true,agentExecutionStatus:acknowledgement.status,
+        gatewayAcknowledgementStatus:acknowledgement.gatewayStatus,
+        ownerResult:'ambiguous_after_disconnect',noExecutionIntent:true,
+        ownerTransportAborted:callOutcome.error instanceof Error};
+      trace('agent acknowledged cancellation after delivery and before execution');
+    }
     const read1=assertMcpOk(await ownerCall('read_file',{path:inputFile}),'real MCP read');
     trace('real MCP read completed');
     ensure(JSON.stringify(read1).includes(DISPLAYED_READ.trim()),'real Desktop Commander MCP did not return file content');
@@ -436,23 +514,120 @@ async function runPilot(){
       !existsSync(path.join(dirs['allowed-root'],'revoked-write.txt')),
       'revoked grant allowed a file write');
 
-    // Exercise HTTP-disconnect cancellation against the already certified bounded
-    // count_lines profile. The call is deliberately not retried; the ledger is inspected below.
-    const cancelledPath=path.join(dirs['allowed-root'],'cancel-probe.txt');
-    writeFileSync(cancelledPath,'cancel probe\n',{mode:0o600,flag:'wx'});
-    const abortController=new AbortController();
-    const ambiguousCall=ownerCall('run_command',{path:cancelledPath,profile:'count_lines'},
-      {signal:abortController.signal}).catch(error=>error);
-    setTimeout(()=>abortController.abort(),5).unref?.();
-    const cancellationResult=await ambiguousCall;
-    const cancellationObserved=cancellationResult instanceof Error;
-    ensure(cancellationObserved,'Owner HTTP abort was not observed by the pilot client');
+    let activeExecution=null,grantRevocationDuringJob=null,deviceRevocationDuringJob=null;
+    let revokedDevice=null;
+    if(activeJobScenario){
+      const cancelledPath=path.join(dirs['allowed-root'],'active-cancel-probe.txt');
+      writeFileSync(cancelledPath,'active cancellation fixture\n',{mode:0o600,flag:'wx'});
+      const ownerController=activeJobScenario==='owner-cancel'?new AbortController():null;
+      const pending=ownerCall('run_command',{path:cancelledPath,profile:'count_lines'},
+        ownerController?{signal:ownerController.signal}:{}).then(response=>({response}),error=>({error}));
+      const started=await waitForMatchingEvent(agentRestartProc,'FIXTURE_JOB_STARTED',event=>
+        typeof event.requestId==='string'&&Number.isSafeInteger(event.pid));
+      const liveProcess=fixedSleepProcess(started.pid,agentAfterGatewaySigkill.pid);
+      ensure(liveProcess,'executor start event did not match a live /usr/bin/sleep 30 child');
+      const ledgerPath=path.join(dirs.ledger,'i4-execution.jsonl');
+      const ledgerRecords=()=>existsSync(ledgerPath)
+        ?readFileSync(ledgerPath,'utf8').trim().split('\n').filter(Boolean).map(line=>JSON.parse(line)):[];
+      const intent=ledgerRecords().find(record=>record.type==='intent'&&record.requestId===started.requestId);
+      ensure(intent?.tool==='run_command'&&intent.deviceId===deviceId,
+        'active process has no matching durable I4 intent');
 
-    const revokedDevice=await post(gatewayPort,readFileSync(tlsCert),'/stage/revoke-device',{
-      clientId:CLIENT,deviceId,
-    },{headers:controlHeaders});
-    ensure(revokedDevice.status===200&&revokedDevice.json.revoked===true&&revokedDevice.json.trustRevision===2,
-      'device revocation was not durably committed');
+      let acknowledgement=null;
+      if(activeJobScenario==='owner-cancel'){
+        ownerController.abort();
+        acknowledgement=await waitForMatchingEvent(agentRestartProc,'FIXTURE_CANCEL_ACK',event=>
+          event.requestId===started.requestId);
+      }else if(activeJobScenario==='grant-revoke'){
+        ensure(processStillLive(liveProcess),'active fixture command stopped before grant revocation was requested');
+        const revocationRequestNs=process.hrtime.bigint();
+        const revoked=await post(gatewayPort,readFileSync(tlsCert),'/stage/revoke-grant',{
+          deviceId,expectedRevision:policyRevision,grantId:commandGrant.grantId,
+        },{headers:controlHeaders});
+        const revocationResponseNs=process.hrtime.bigint();
+        ensure(revoked.status===200&&revoked.json.active===false,
+          'active run_command grant was not durably revoked');
+        policyRevision=revoked.json.revision;
+        const jobStartedNs=BigInt(started.monotonicNs);
+        const commitElapsedMs=Number(revocationResponseNs-jobStartedNs)/1_000_000;
+        const commitBeforeCommandTimeout=commitElapsedMs<FIXTURE_COMMAND_TIMEOUT_MS-500;
+        ensure(commitBeforeCommandTimeout,
+          'grant revocation did not commit before the fixed command timeout safety margin');
+        acknowledgement=await waitForMatchingEvent(agentRestartProc,'FIXTURE_CANCEL_ACK',event=>
+          event.requestId===started.requestId);
+        const acknowledgementNs=BigInt(acknowledgement.monotonicNs);
+        const acknowledgementElapsedMs=Number(acknowledgementNs-jobStartedNs)/1_000_000;
+        const acknowledgementAfterRevocationRequest=acknowledgementNs>=revocationRequestNs;
+        const acknowledgementBeforeCommandTimeout=acknowledgementElapsedMs<FIXTURE_COMMAND_TIMEOUT_MS-500;
+        ensure(acknowledgementAfterRevocationRequest&&acknowledgementBeforeCommandTimeout,
+          'agent did not acknowledge grant-revocation cancellation before the command timeout safety margin');
+        grantRevocationDuringJob={revoked:true,revision:policyRevision,commitBeforeCommandTimeout,
+          acknowledgementAfterRevocationRequest,acknowledgementBeforeCommandTimeout,
+          commitElapsedMs,acknowledgementElapsedMs,commandTimeoutMs:FIXTURE_COMMAND_TIMEOUT_MS};
+      }else{
+        ensure(processStillLive(liveProcess),'active fixture command stopped before trust revocation was requested');
+        const revocationRequestNs=process.hrtime.bigint();
+        revokedDevice=await post(gatewayPort,readFileSync(tlsCert),'/stage/revoke-device',{
+          clientId:CLIENT,deviceId,
+        },{headers:controlHeaders});
+        const revocationResponseNs=process.hrtime.bigint();
+        ensure(revokedDevice.status===200&&revokedDevice.json.revoked===true&&
+          revokedDevice.json.trustRevision===2,'active device trust revocation was not durable');
+        const jobStartedNs=BigInt(started.monotonicNs);
+        const commitElapsedMs=Number(revocationResponseNs-jobStartedNs)/1_000_000;
+        const commitBeforeCommandTimeout=commitElapsedMs<FIXTURE_COMMAND_TIMEOUT_MS-500;
+        ensure(commitBeforeCommandTimeout,
+          'device trust revocation did not commit before the fixed command timeout safety margin');
+        const sessionRejection=await waitForMatchingEvent(agentRestartProc,'FIXTURE_CLIENT_CALL',event=>
+          ['heartbeat','pollControl'].includes(event.method)&&event.outcome==='error'&&event.code==='REJECTED');
+        const sessionRejectionNs=BigInt(sessionRejection.monotonicNs);
+        const rejectionElapsedMs=Number(sessionRejectionNs-jobStartedNs)/1_000_000;
+        const sessionRejectionBeforeCommandTimeout=rejectionElapsedMs<FIXTURE_COMMAND_TIMEOUT_MS-500;
+        ensure(sessionRejectionNs>=revocationRequestNs&&sessionRejectionBeforeCommandTimeout,
+          'agent did not observe the revoked trust session before the command timeout safety margin');
+        deviceRevocationDuringJob={revoked:true,trustRevision:revokedDevice.json.trustRevision,
+          sessionRejectionObserved:true,sessionRejectionMethod:sessionRejection.method,
+          sessionRejectionCode:sessionRejection.code,commitBeforeCommandTimeout,
+          commitElapsedMs,sessionRejectionBeforeCommandTimeout,rejectionElapsedMs,
+          commandTimeoutMs:FIXTURE_COMMAND_TIMEOUT_MS};
+      }
+      const callOutcome=await pending;
+      if(activeJobScenario==='owner-cancel'){
+        ensure(callOutcome.error instanceof Error,'Owner HTTP cancellation returned a result');
+      }else{
+        ensure(callOutcome.response&&callOutcome.response.status>=400,
+          'revoked active operation crossed the Owner response fence');
+      }
+      if(acknowledgement){
+        ensure(acknowledgement.accepted===true&&acknowledgement.status==='ambiguous',
+          'agent did not durably acknowledge the active job as ambiguous');
+      }
+      const processStopped=await waitForProcessExit(liveProcess);
+      ensure(processStopped,'active fixture child remained alive after cancellation or revocation');
+      const matchingRecords=ledgerRecords().filter(record=>record.requestId===started.requestId);
+      const intents=matchingRecords.filter(record=>record.type==='intent');
+      const outcomes=matchingRecords.filter(record=>record.type==='outcome');
+      ensure(intents.length===1&&outcomes.length===1&&outcomes[0].status==='ambiguous',
+        'active operation lacks one ambiguous durable outcome without replay');
+      activeExecution={scenario:activeJobScenario,requestId:started.requestId,
+        startProven:true,processWasLiveAtCancel:true,processPid:started.pid,
+        cancelAcknowledged:acknowledgement?.accepted===true,
+        acknowledgedStatus:acknowledgement?.status??'unavailable_after_device_revocation',
+        gatewayAcknowledgementStatus:acknowledgement?.gatewayStatus??null,
+        ownerResponseStatus:callOutcome.response?.status??null,
+        ownerResponseCode:callOutcome.response?.json?.error?.data?.code??null,
+        responseFenced:true,processStopped,automaticReplay:intents.length!==1};
+      ensure(activeExecution.automaticReplay===false,'active operation was replayed');
+      trace(`active job ${activeJobScenario} fenced with durable ambiguous outcome`);
+    }
+
+    if(!revokedDevice){
+      revokedDevice=await post(gatewayPort,readFileSync(tlsCert),'/stage/revoke-device',{
+        clientId:CLIENT,deviceId,
+      },{headers:controlHeaders});
+      ensure(revokedDevice.status===200&&revokedDevice.json.revoked===true&&revokedDevice.json.trustRevision===2,
+        'device revocation was not durably committed');
+    }
     const afterDeviceRevoke=await ownerCall('read_file',{path:inputFile});
     ensure(afterDeviceRevoke.status===403&&afterDeviceRevoke.json?.error!==undefined,
       'revoked device received a new dispatch');
@@ -482,8 +657,13 @@ async function runPilot(){
       security:{invalidOwnerRejected:true,ownerTokenRejectedByMachineIngress:true,
         invalidMachineSecretRejected:true,mismatchedMachineClientIdRejected:true,
         crossDeviceChallengeRejected:true},
-      cancellation:{ownerTransportAbortObserved:cancellationObserved,
-        cooperativeDuringExecution:'not_certified_by_standalone_pilot',
+      cancellation:{ownerTransportAbortObserved:activeJobScenario==='owner-cancel',
+        scenario:activeJobScenario??'not_tested_outside_node_test',
+        afterReceiptBeforeExecution:preExecutionCancellation,
+        followUpReadSucceeded:preExecutionCancellation?true:null,
+        activeExecution:activeExecution??{startProven:false,processWasLiveAtCancel:false,
+          cancelAcknowledged:false,acknowledgedStatus:'not_tested',processStopped:false,automaticReplay:false},
+        grantRevocationDuringJob,deviceRevocationDuringJob,
         noAutomaticReplay:ledger.automaticReplay===false,ledgerState:ledger.status},
       cleanup:{processGroupsGone:false,temporaryStateRemoved:false}};
   }finally{
@@ -508,9 +688,10 @@ if(process.argv.length>2&&!(process.argv.length===3&&process.argv[2]==='--json')
   process.stderr.write('Usage: node scripts/g7-staging-pilot.mjs [--json]\n');process.exitCode=2;
 }else{
   runPilot().then(report=>process.stdout.write(JSON.stringify(report)+'\n'),error=>{
+    const diagnosticLimit=process.env.VPSC_STAGING_TEST_ACTIVE_JOB==='1'?1600:240;
     process.stderr.write(JSON.stringify({status:'blocked',code:
       /^[A-Z_]{1,48}$/.test(error?.code??'')?error.code:'STAGING_PILOT_FAILED',
-      message:String(error?.message??'staging pilot failed').replace(/[\r\n]/g,' ').slice(0,240)})+'\n');
+      message:String(error?.message??'staging pilot failed').replace(/[\r\n]/g,' ').slice(0,diagnosticLimit)})+'\n');
     process.exitCode=1;
   });
 }

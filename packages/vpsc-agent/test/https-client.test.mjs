@@ -263,3 +263,37 @@ test('malformed connect acknowledgement fences a potentially created session',as
   await assert.rejects(client.connect(),error=>error.code==='CLOSED');
   client.close();
 });
+
+test('an accepted cancellation may be conservatively downgraded to ambiguous',async()=>{
+  const client=createHttpsAgentClient(makeInvalid({fetchFn:async input=>{
+    const route=new URL(input).pathname;
+    const payload=route==='/agent/challenge'?{deviceId:DEVICE,expiresInMs:30_000,nonce:'n'.repeat(43)}:
+      route==='/agent/connect'?{deviceId:DEVICE,sessionId:SESSION}:
+      route==='/agent/cancel-ack'?{accepted:true,status:'ambiguous'}:{status:'alive',deviceId:DEVICE};
+    return new Response(JSON.stringify(payload),{status:200,
+      headers:{'content-type':'application/json'}});
+  }}));
+  try{
+    await client.connect();
+    assert.deepEqual(await client.cancelAck({requestId:'f1a2b3c4-d5e6-4a9f-8abc-1bb9b99c0003',
+      ownerDigest:'d'.repeat(64),status:'cancelled'}),{accepted:true,status:'ambiguous'});
+    await client.heartbeat();
+  }finally{client.close();}
+});
+
+test('a cancellation acknowledgement cannot upgrade local ambiguity to cancelled',async()=>{
+  const client=createHttpsAgentClient(makeInvalid({fetchFn:async input=>{
+    const route=new URL(input).pathname;
+    const payload=route==='/agent/challenge'?{deviceId:DEVICE,expiresInMs:30_000,nonce:'n'.repeat(43)}:
+      route==='/agent/connect'?{deviceId:DEVICE,sessionId:SESSION}:
+      route==='/agent/cancel-ack'?{accepted:true,status:'cancelled'}:{status:'alive',deviceId:DEVICE};
+    return new Response(JSON.stringify(payload),{status:200,
+      headers:{'content-type':'application/json'}});
+  }}));
+  try{
+    await client.connect();
+    await assert.rejects(client.cancelAck({requestId:'f1a2b3c4-d5e6-4a9f-8abc-1bb9b99c0003',
+      ownerDigest:'d'.repeat(64),status:'ambiguous'}),error=>error.code==='AMBIGUOUS_TRANSPORT');
+    await assert.rejects(client.heartbeat(),error=>error.code==='CLOSED');
+  }finally{client.close();}
+});

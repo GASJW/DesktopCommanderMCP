@@ -197,7 +197,8 @@ export function createHttpsAgentClient({
       throw fail('BAD_PAYLOAD','Invalid cancellation acknowledgement');
     }
     const answer=await request('/agent/cancel-ack',{requestId,ownerDigest,status},true);
-    if(!exactKeys(answer,'accepted,status')||answer.accepted!==true||answer.status!==status){
+    if(!exactKeys(answer,'accepted,status')||answer.accepted!==true||
+       answer.status!==status&&answer.status!=='ambiguous'){
       return ambiguousResponse();
     }
     return answer;
