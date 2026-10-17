@@ -1,0 +1,278 @@
+import path from 'node:path';
+import { closeSync, constants, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, rmdirSync } from 'node:fs';
+import {
+  appendRecoveredOwnerOutcome, inspectDurableOwnerAudit,
+  releaseOwnerAuditLockForReconciliation,
+} from './durable-owner-audit.mjs';
+import {
+  inspectDurableDeviceTrust, releaseTrustWriterLockForReconciliation,
+} from '../devices/durable-trust.mjs';
+
+const RECOVERY_LOCK='.owner-pairing-reconciliation.lock';
+
+function lockPresent(directory){
+  const filename=path.join(directory,RECOVERY_LOCK);
+  let stat;
+  try{stat=lstatSync(filename);}catch(error){
+    if(error?.code==='ENOENT')return false;
+    throw error;
+  }
+  if(!stat.isDirectory()||stat.isSymbolicLink()||stat.uid!==process.getuid()||
+     (stat.mode&0o7777)!==0o700||readdirSync(filename).length!==0){
+    throw Error('Unsafe reconciliation lock');
+  }
+  return true;
+}
+function syncDirectory(directory){
+  const fd=openSync(directory,constants.O_RDONLY|(constants.O_NOFOLLOW??0));
+  try{fsyncSync(fd);}finally{closeSync(fd);}
+}
+function exactReceipt(event,transition){
+  return transition?.operation==='approve'&&transition.eventId===event.eventId&&
+    transition.requestId===event.requestId&&transition.fingerprint===event.fingerprint&&
+    transition.deviceId&&transition.previousRevision===event.trustRevisionBefore&&
+    transition.revision===event.trustRevisionBefore+1;
+}
+function matchesOutcome(event,receipt){
+  if(event.phase!=='outcome'||event.version!==2)return true;
+  if(event.operation==='approve'&&event.outcome==='accepted'){
+    return exactReceipt(event,receipt)&&receipt.deviceId===event.deviceId&&
+      receipt.revision===event.trustRevisionAfter;
+  }
+  return !receipt;
+}
+function diagnose(audit,trust){
+  if(trust.temporaryFiles?.length&&!trust.lockPresent){
+    return {state:'ORPHAN_TRUST_TEMP',temporaryFileCount:trust.temporaryFiles.length};
+  }
+  const transitions=trust.transitions;
+  const receipts=transitions.filter(item=>item.operation==='approve');
+  const events=audit.events;
+  const intents=new Map(events.filter(event=>event.version===2&&event.phase==='intent')
+    .map(event=>[event.eventId,event]));
+  const outcomes=new Map(events.filter(event=>event.version===2&&event.phase==='outcome')
+    .map(event=>[event.eventId,event]));
+  for(const receipt of receipts){
+    if(!intents.has(receipt.eventId))return {state:'TRUST_RECEIPT_WITHOUT_AUDIT',
+      eventId:receipt.eventId};
+  }
+  for(const outcome of outcomes.values()){
+    const intent=intents.get(outcome.eventId);
+    const receipt=receipts.find(item=>item.eventId===outcome.eventId);
+    if(!intent||!matchesOutcome(outcome,receipt))return {state:'OUTCOME_CONTRADICTS_TRUST',
+      eventId:outcome.eventId};
+    if(intent.ownerId!==outcome.ownerId||intent.requestId!==outcome.requestId||
+       intent.fingerprint!==outcome.fingerprint||
+       intent.operation!==outcome.operation||
+       intent.trustRevisionBefore!==outcome.trustRevisionBefore){
+      return {state:'OUTCOME_CONTRADICTS_TRUST',eventId:outcome.eventId};
+    }
+    if(intent.trustRevisionBefore<trust.historyStartRevision){
+      return {state:'TRUST_HISTORY_INCOMPLETE',eventId:outcome.eventId};
+    }
+  }
+  const pending=audit.pending;
+  if(pending.length>1)return {state:'CORRUPT',reason:'multiple unresolved intents'};
+  if(pending.length===1){
+    const intent=pending[0];
+    if(intent.version!==2)return {state:'AMBIGUOUS_LEGACY_INTENT',eventId:intent.eventId};
+    if(intent.trustRevisionBefore<trust.historyStartRevision){
+      return {state:'TRUST_HISTORY_INCOMPLETE',eventId:intent.eventId};
+    }
+    const byEvent=receipts.find(item=>item.eventId===intent.eventId);
+    const byRequest=receipts.find(item=>item.requestId===intent.requestId);
+    if(byRequest&&byRequest.eventId!==intent.eventId){
+      return {state:'OUTCOME_CONTRADICTS_TRUST',eventId:intent.eventId};
+    }
+    if(byEvent){
+      if(intent.operation!=='approve'||!exactReceipt(intent,byEvent)){
+        return {state:'OUTCOME_CONTRADICTS_TRUST',eventId:intent.eventId};
+      }
+      return {state:'COMMITTED_OUTCOME_MISSING',eventId:intent.eventId,
+        requestId:intent.requestId,fingerprint:intent.fingerprint,
+        deviceId:byEvent.deviceId,trustRevisionBefore:intent.trustRevisionBefore,
+        trustRevisionAfter:byEvent.revision};
+    }
+    if(trust.revision===intent.trustRevisionBefore){
+      if(intent.operation==='reject')return {state:'EPHEMERAL_RESULT_UNKNOWN',
+        eventId:intent.eventId,operation:intent.operation,
+        reason:'Pairing rejection has no durable mutation receipt'};
+      return {state:'INTENT_NOT_APPLIED',eventId:intent.eventId,
+        requestId:intent.requestId,fingerprint:intent.fingerprint,
+        trustRevisionBefore:intent.trustRevisionBefore};
+    }
+    return {state:'REVISION_DIVERGED',eventId:intent.eventId,
+      expectedRevision:intent.trustRevisionBefore,observedRevision:trust.revision};
+  }
+  const legacyEventCount=events.filter(event=>event.version===1).length;
+  if(legacyEventCount)return {state:'LEGACY_UNBOUND',legacyEventCount};
+  if(events.length===0)return {state:'NO_INTENT'};
+  return {state:'CONSISTENT'};
+}
+function loadEvidence({auditDirectory,trustDirectory}={}){
+  try{
+    const audit=inspectDurableOwnerAudit({directory:auditDirectory});
+    const trust=inspectDurableDeviceTrust({directory:trustDirectory});
+    return {audit,trust,diagnosis:diagnose(audit,trust)};
+  }catch(error){
+    return {error,state:'CORRUPT',reason:String(error?.message??error).slice(0,240)};
+  }
+}
+function withLocks(state,auditDirectory,trustDirectory){
+  let recoveryLockPresent;
+  try{recoveryLockPresent=lockPresent(auditDirectory)||lockPresent(trustDirectory);}
+  catch(error){return {state:'CORRUPT',reason:String(error?.message??error).slice(0,240)};}
+  if(recoveryLockPresent)return {state:'RECOVERY_LOCK_PRESENT',underlyingState:state.state,
+    eventId:state.eventId,reason:'An earlier reconciliation lock remains; operator review required'};
+  const auditLock=state.audit?.lockPresent??false;
+  const trustLock=state.trust?.lockPresent??false;
+  if((auditLock||trustLock)&&['NO_INTENT','CONSISTENT','LEGACY_UNBOUND'].includes(state.state)){
+    return {state:`${state.state}_LOCK_HELD`,
+      auditLockPresent:auditLock,trustLockPresent:trustLock};
+  }
+  return {...state,auditLockPresent:auditLock,trustLockPresent:trustLock};
+}
+function analyzeInternal({auditDirectory,trustDirectory}={},ignoreRecoveryLock=false){
+  const evidence=loadEvidence({auditDirectory,trustDirectory});
+  if(evidence.error)return {state:'CORRUPT',reason:evidence.reason};
+  if(ignoreRecoveryLock)return {...evidence.diagnosis,audit:evidence.audit,trust:evidence.trust};
+  return withLocks({...evidence.diagnosis,audit:evidence.audit,trust:evidence.trust},
+    auditDirectory,trustDirectory);
+}
+export function analyzeOwnerPairingRecovery({auditDirectory,trustDirectory}={}){
+  const result=analyzeInternal({auditDirectory,trustDirectory});
+  if(result.state==='NO_INTENT'&&!result.auditLockPresent&&!result.trustLockPresent){
+    return Object.freeze({state:'NO_INTENT'});
+  }
+  const {audit,trust,...publicResult}=result;
+  return Object.freeze(publicResult);
+}
+
+function acquireRecoveryLocks(directories){
+  const created=[];
+  try{
+    for(const directory of [...new Set(directories)].sort()){
+      const filename=path.join(directory,RECOVERY_LOCK);
+      mkdirSync(filename,{mode:0o700});
+      created.push({directory,filename});
+      syncDirectory(directory);
+    }
+    return created;
+  }catch(error){
+    for(const lock of created.reverse()){
+      try{rmdirSync(lock.filename);syncDirectory(lock.directory);}catch{}
+    }
+    if(error?.code==='EEXIST')throw Error('Reconciliation lock already exists; explicit stale-lock review required');
+    throw error;
+  }
+}
+function releaseRecoveryLocks(locks){
+  for(const lock of [...locks].reverse()){
+    if(lockPresent(lock.directory)){
+      rmdirSync(lock.filename);syncDirectory(lock.directory);
+    }
+  }
+}
+function releaseWriterLocks(evidence,options){
+  if(evidence.trust.lockPresent){
+    releaseTrustWriterLockForReconciliation({directory:options.trustDirectory,
+      expectedRevision:evidence.trust.revision,
+      expectedSnapshotDigest:evidence.trust.snapshotDigest,
+      operatorConfirmedNoActiveWriters:true});
+  }
+  if(evidence.audit.lockPresent){
+    releaseOwnerAuditLockForReconciliation({directory:options.auditDirectory,
+      expectedSequence:evidence.audit.sequence,expectedHash:evidence.audit.hash,
+      operatorConfirmedNoActiveWriters:true});
+  }
+}
+
+export function reconcileOwnerPairingRecovery({auditDirectory,trustDirectory,
+  operatorConfirmedNoActiveWriters}={}){
+  if(operatorConfirmedNoActiveWriters!==true){
+    throw Error('Operator confirmation that no writers are active is required');
+  }
+  const options={auditDirectory,trustDirectory};
+  const initial=analyzeInternal(options);
+  if(['CORRUPT','REVISION_DIVERGED','OUTCOME_CONTRADICTS_TRUST',
+      'TRUST_RECEIPT_WITHOUT_AUDIT','TRUST_HISTORY_INCOMPLETE',
+      'AMBIGUOUS_LEGACY_INTENT','EPHEMERAL_RESULT_UNKNOWN','ORPHAN_TRUST_TEMP',
+      'RECOVERY_LOCK_PRESENT'].includes(initial.state)){
+    throw Error(`Pairing reconciliation blocked: ${initial.state}`);
+  }
+  if(['NO_INTENT','CONSISTENT','LEGACY_UNBOUND'].includes(initial.state)&&
+     !initial.auditLockPresent&&!initial.trustLockPresent)return Object.freeze(initial);
+  const locks=acquireRecoveryLocks([auditDirectory,trustDirectory]);
+  let changed=false;
+  try{
+    let evidence=analyzeInternal(options,true);
+    if(['CORRUPT','REVISION_DIVERGED','OUTCOME_CONTRADICTS_TRUST',
+        'TRUST_RECEIPT_WITHOUT_AUDIT','TRUST_HISTORY_INCOMPLETE',
+        'AMBIGUOUS_LEGACY_INTENT','EPHEMERAL_RESULT_UNKNOWN','ORPHAN_TRUST_TEMP'].includes(evidence.state)){
+      throw Error(`Pairing reconciliation blocked: ${evidence.state}`);
+    }
+    let repairedState='RECONCILED_CONSISTENT';
+    if(evidence.state==='COMMITTED_OUTCOME_MISSING'||evidence.state==='INTENT_NOT_APPLIED'){
+      const intent=evidence.audit.pending[0];
+      const committed=evidence.state==='COMMITTED_OUTCOME_MISSING';
+      const outcome={event:'g7_owner_pairing',version:2,
+        at:new Date().toISOString(),eventId:intent.eventId,operation:intent.operation,
+        ownerId:intent.ownerId,requestId:intent.requestId,fingerprint:intent.fingerprint,
+        trustRevisionBefore:intent.trustRevisionBefore,phase:'outcome',
+        outcome:committed?'accepted':'not_applied',
+        deviceId:committed?evidence.deviceId:null,
+        trustRevisionAfter:committed?evidence.trustRevisionAfter:evidence.trust.revision};
+      if(evidence.trust.lockPresent){
+        releaseTrustWriterLockForReconciliation({directory:trustDirectory,
+          expectedRevision:evidence.trust.revision,
+          expectedSnapshotDigest:evidence.trust.snapshotDigest,
+          operatorConfirmedNoActiveWriters:true});
+        changed=true;
+      }
+      appendRecoveredOwnerOutcome({directory:auditDirectory,intent,outcome,
+        operatorConfirmedNoActiveWriters:true});
+      changed=true;
+      repairedState=committed?'RECONCILED_ACCEPTED':'RECONCILED_NOT_APPLIED';
+      evidence=analyzeInternal(options,true);
+      if(!['CONSISTENT','LEGACY_UNBOUND'].includes(evidence.state)){
+        throw Error(`Pairing reconciliation post-check failed: ${evidence.state}`);
+      }
+    }else if(!['NO_INTENT','CONSISTENT','LEGACY_UNBOUND'].includes(evidence.state)){
+      throw Error(`Pairing reconciliation blocked: ${evidence.state}`);
+    }
+    releaseWriterLocks(evidence,options);
+    changed=true;
+    releaseRecoveryLocks(locks);
+    const final=analyzeInternal(options);
+    if(!['NO_INTENT','CONSISTENT','LEGACY_UNBOUND'].includes(final.state))
+      throw Error(`Pairing reconciliation final check failed: ${final.state}`);
+    const resultState=repairedState==='RECONCILED_CONSISTENT'&&final.state==='LEGACY_UNBOUND'
+      ?'RECONCILED_LEGACY_UNBOUND'
+      :repairedState==='RECONCILED_CONSISTENT'&&final.state==='NO_INTENT'
+        ?'RECONCILED_NO_INTENT':repairedState;
+    return Object.freeze({state:resultState,
+      ...(initial.eventId?{eventId:initial.eventId}:{})});
+  }catch(error){
+    if(!changed){
+      try{releaseRecoveryLocks(locks);}catch{}
+    }
+    throw error;
+  }
+}
+
+// Explicitly clear only abandoned reconciliation mutexes after an operator
+// independently confirms no recovery process remains active.
+export function clearStaleOwnerPairingRecoveryLocks({auditDirectory,trustDirectory,
+  operatorConfirmedNoActiveRecovery}={}){
+  if(operatorConfirmedNoActiveRecovery!==true){
+    throw Error('Operator confirmation that no reconciliation process is active is required');
+  }
+  const directories=[...new Set([auditDirectory,trustDirectory])];
+  let cleared=0;
+  for(const directory of directories){
+    if(!lockPresent(directory))continue;
+    const filename=path.join(directory,RECOVERY_LOCK);
+    rmdirSync(filename);syncDirectory(directory);cleared++;
+  }
+  return Object.freeze({cleared});
+}

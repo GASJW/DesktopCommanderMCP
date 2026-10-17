@@ -17,6 +17,14 @@ const event = (phase, id = randomUUID(), extra = {}) => ({
   ...(phase === 'outcome' ? { outcome: 'accepted' } : {}),
   ...extra,
 });
+const correlatedEvent = (phase, id = randomUUID(), extra = {}) => ({
+  event:'g7_owner_pairing',version:2,at:now,eventId:id,operation:'approve',
+  ownerId:'a'.repeat(24),requestId:'8f15a479-cc22-448d-a0ca-918a9c67d5f5',
+  fingerprint:'b'.repeat(64),trustRevisionBefore:4,phase,
+  ...(phase==='outcome'?{outcome:'accepted',deviceId:'f69ec00e-f225-43df-bdc7-c2cbf8f4a9f3',
+    trustRevisionAfter:5}:{}),
+  ...extra,
+});
 function fixture() {
   const home = mkdtempSync(path.join(tmpdir(), 'g7-owner-wal-'));
   const directory = path.join(home, 'store');
@@ -200,4 +208,33 @@ test('same-length external tampering is detected before the next append',t=>{
   assert.throws(()=>s.auditWrite(event('outcome',id)),/Owner audit unavailable/);
   s.close();
   assert.throws(()=>createDurableOwnerAudit({directory:f.directory}),/EEXIST/);
+});
+
+test('v2 WAL preserves request, fingerprint, device and exact trust revision binding across restart',t=>{
+  const f=fixture();t.after(f.clean);
+  const s=createDurableOwnerAudit({directory:f.directory});
+  const id='e3d3147b-9325-4d42-a4e1-e9b219e5b02d';
+  assert.equal(s.auditWrite(correlatedEvent('intent',id)),true);
+  assert.equal(s.auditWrite(correlatedEvent('outcome',id)),true);
+  s.close();
+  const records=readFileSync(f.log,'utf8').trimEnd().split('\n').map(JSON.parse);
+  assert.deepEqual(records.map(x=>x.event.phase),['intent','outcome']);
+  assert.equal(records[0].event.requestId,'8f15a479-cc22-448d-a0ca-918a9c67d5f5');
+  assert.equal(records[0].event.fingerprint,'b'.repeat(64));
+  assert.equal(records[1].event.deviceId,'f69ec00e-f225-43df-bdc7-c2cbf8f4a9f3');
+  assert.equal(records[1].event.trustRevisionBefore,4);
+  assert.equal(records[1].event.trustRevisionAfter,5);
+  const restarted=createDurableOwnerAudit({directory:f.directory});
+  assert.equal(restarted.inspect().sequence,2);
+  restarted.close();
+});
+test('not_applied cannot certify an ephemeral rejection result',t=>{
+  const f=fixture();t.after(f.clean);
+  const s=createDurableOwnerAudit({directory:f.directory});
+  const id=randomUUID();
+  assert.equal(s.auditWrite(correlatedEvent('intent',id,{operation:'reject'})),true);
+  assert.throws(()=>s.auditWrite(correlatedEvent('outcome',id,{operation:'reject',
+    outcome:'not_applied',deviceId:null,trustRevisionAfter:4})),/Invalid pairing audit event/);
+  assert.equal(s.inspect().sequence,1);
+  s.close();
 });

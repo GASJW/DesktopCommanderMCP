@@ -1,10 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { generateKeyPairSync,sign } from 'node:crypto';
 import { createAccessVerifier } from '../access-auth.mjs';
+import { createDurableOwnerAudit, inspectDurableOwnerAudit } from '../dashboard/durable-owner-audit.mjs';
 import { createOwnerPairingHttp } from '../dashboard/owner-pairing-http.mjs';
-import { createDeviceRegistry } from '../devices/registry.mjs';
+import { createDurableDeviceTrustStore, inspectDurableDeviceTrust } from '../devices/durable-trust.mjs';
 import { createPairingCoordinator } from '../devices/pairing.mjs';
 import { createEphemeralPairingIdentity } from '../../packages/vpsc-agent/src/pairing.mjs';
 
@@ -13,14 +17,17 @@ const AUD='a'.repeat(64);
 const ORIGIN='https://commander.supercerebro.me';
 const OWNER='owner@example.com';
 async function setup({auditWrite,now=Date.now}={}){
+  const home=mkdtempSync(path.join(tmpdir(),'g7-owner-http-'));
   const {publicKey,privateKey}=generateKeyPairSync('rsa',{modulusLength:2048});
   const jwk={...publicKey.export({format:'jwk'}),kid:'owner-kid',alg:'RS256'};
   const accessVerifier=createAccessVerifier({
     issuer:ISSUER,audience:AUD,allowedEmails:OWNER,
     keyProvider:async()=>({keys:[jwk]}),
   });
-  const registry=createDeviceRegistry({now});
-  const coordinator=createPairingCoordinator({registry,now});
+  const trustDirectory=path.join(home,'trust');
+  const trustStore=createDurableDeviceTrustStore({directory:trustDirectory,now});
+  const registry=trustStore.registry;
+  const coordinator=createPairingCoordinator({registry:trustStore,now});
   const identity=createEphemeralPairingIdentity();
   const pairing=coordinator.startPairing({
     name:'Gui-PC',platform:'win32',publicKeyPem:identity.publicKeyPem,
@@ -44,14 +51,14 @@ async function setup({auditWrite,now=Date.now}={}){
     return head+'.'+body+'.'+sign('RSA-SHA256',Buffer.from(head+'.'+body),privateKey).toString('base64url');
   };
   const jwt=createJwt();
-  const request=async(route,{method='GET',body,origin,csrf,token=jwt,headers={}}={})=>{
+  const request=async(route,{method='GET',body,origin,csrf,token=jwt,headers={},signal}={})=>{
     const h={...headers};
     if(token!==null)h['cf-access-jwt-assertion']=token;
     if(origin!==undefined)h.origin=origin;
     if(csrf!==undefined)h['x-vpsc-csrf']=csrf;
     if(body!==undefined)h['content-type']='application/json';
     const res=await fetch(url+route,{method,headers:h,
-      ...(body!==undefined?{body:JSON.stringify(body)}:{})});
+      ...(body!==undefined?{body:JSON.stringify(body)}:{}),...(signal?{signal}:{})});
     return {status:res.status,data:await res.json(),headers:res.headers};
   };
   const pending=()=>request('pending');
@@ -72,8 +79,10 @@ async function setup({auditWrite,now=Date.now}={}){
         expectedFingerprint:next.fingerprint}),
     };
   };
-  const close=()=>new Promise(resolve=>server.close(resolve));
-  return {registry,coordinator,identity,pairing,audits,request,pending,approvePayload,proof,
+  const close=()=>new Promise(resolve=>server.close(()=>{
+    rmSync(home,{recursive:true,force:true});resolve();
+  }));
+  return {registry,trustStore,trustDirectory,coordinator,identity,pairing,audits,request,pending,approvePayload,proof,
     makePairing,createJwt,close};
 }
 test('JWT valid owner sees pending list and session-bound CSRF; no code or secret leaked',async()=>{
@@ -123,6 +132,27 @@ test('same-origin CSRF + JWT + device proof + code approve only once',async()=>{
       body:x.approvePayload()});
     assert.equal(after.status,403);
     assert.equal(x.registry.listDevices().length,1);
+  }finally{await x.close();}
+});
+test('approval outcome binds eventId to request, fingerprint, created device and trust revision',async()=>{
+  const x=await setup();
+  try{
+    const csrf=(await x.pending()).data.csrf;
+    x.proof();
+    const response=await x.request('approve',{method:'POST',origin:ORIGIN,csrf,
+      body:x.approvePayload()});
+    assert.equal(response.status,200);
+    const [intent,outcome]=x.audits;
+    assert.equal(intent.phase,'intent');
+    assert.equal(outcome.phase,'outcome');
+    assert.equal(intent.eventId,outcome.eventId);
+    assert.equal(intent.requestId,x.pairing.requestId);
+    assert.equal(intent.fingerprint,x.pairing.fingerprint);
+    assert.equal(intent.trustRevisionBefore,0);
+    assert.equal(outcome.deviceId,response.data.deviceId);
+    assert.equal(outcome.fingerprint,x.pairing.fingerprint);
+    assert.equal(outcome.trustRevisionBefore,0);
+    assert.equal(outcome.trustRevisionAfter,1);
   }finally{await x.close();}
 });
 test('owner may reject after signed proof; never registers device',async()=>{
@@ -279,7 +309,7 @@ test('concurrent decisions for the same request serialize without poisoning audi
     ]);
     assert.deepEqual(results.map(r=>r.status).sort(),[200,403]);
     assert.equal(x.registry.listDevices().length,1);
-    assert.deepEqual(written.map(entry=>entry.phase),['intent','outcome','intent','outcome']);
+    assert.deepEqual(written.map(entry=>entry.phase),['intent','outcome']);
     assert.equal((await x.pending()).status,200);
   }finally{await x.close();}
 });
@@ -338,7 +368,7 @@ test('concurrent approval and rejection of one request produce one decision and 
     ]);
     assert.deepEqual([approved.status,rejected.status].sort(),[200,403]);
     assert.equal(x.registry.listDevices().length,approved.status===200?1:0);
-    assert.deepEqual(written.map(entry=>entry.phase),['intent','outcome','intent','outcome']);
+    assert.deepEqual(written.map(entry=>entry.phase),['intent','outcome']);
     assert.equal((await x.pending()).status,200);
   }finally{await x.close();}
 });
@@ -355,4 +385,92 @@ test('CSRF substitution and malformed token are rejected without audit intent',a
     assert.equal(x.registry.listDevices().length,0);
     assert.equal(x.audits.length,0);
   }finally{await x.close();}
+});
+
+test('integrated approval survives restart with the exact WAL and trust receipt binding',async()=>{
+  const auditRoot=mkdtempSync(path.join(tmpdir(),'g7-owner-audit-integration-'));
+  const auditDirectory=path.join(auditRoot,'audit');
+  let audit=createDurableOwnerAudit({directory:auditDirectory});
+  let auditOpen=true;
+  const x=await setup({auditWrite:async event=>audit.auditWrite(event)});
+  try{
+    const csrf=(await x.pending()).data.csrf;
+    x.proof();
+    const response=await x.request('approve',{method:'POST',origin:ORIGIN,csrf,
+      body:x.approvePayload()});
+    assert.equal(response.status,200);
+    audit.close();auditOpen=false;
+    const replay=inspectDurableOwnerAudit({directory:auditDirectory});
+    const trust=inspectDurableDeviceTrust({directory:x.trustDirectory});
+    assert.equal(replay.pending.length,0);
+    assert.deepEqual(replay.events.map(event=>event.phase),['intent','outcome']);
+    const [intent,outcome]=replay.events;
+    const receipt=trust.transitions.find(item=>item.eventId===intent.eventId);
+    assert.ok(receipt);
+    assert.equal(intent.requestId,x.pairing.requestId);
+    assert.equal(intent.fingerprint,x.pairing.fingerprint);
+    assert.equal(outcome.requestId,intent.requestId);
+    assert.equal(outcome.fingerprint,intent.fingerprint);
+    assert.equal(outcome.deviceId,response.data.deviceId);
+    assert.equal(receipt.deviceId,outcome.deviceId);
+    assert.equal(receipt.previousRevision,intent.trustRevisionBefore);
+    assert.equal(receipt.revision,outcome.trustRevisionAfter);
+    const wal=readFileSync(path.join(auditDirectory,'owner-decisions-v1.jsonl'),'utf8');
+    for(const secret of [x.pairing.displayCode,x.pairing.nonce,x.createJwt()]){
+      assert.equal(wal.includes(secret),false);
+    }
+    const reopenedAudit=createDurableOwnerAudit({directory:auditDirectory});
+    assert.equal(reopenedAudit.inspect().pending,0);reopenedAudit.close();
+    const reopenedTrust=createDurableDeviceTrustStore({directory:x.trustDirectory});
+    assert.equal(reopenedTrust.revision(),1);
+    assert.equal(reopenedTrust.registry.listDevices()[0].deviceId,response.data.deviceId);
+  }finally{
+    if(auditOpen)audit.close();
+    await x.close();
+    rmSync(auditRoot,{recursive:true,force:true});
+  }
+});
+
+test('lost HTTP response after commit cannot duplicate an approval on retry',async()=>{
+  const auditRoot=mkdtempSync(path.join(tmpdir(),'g7-owner-audit-lost-response-'));
+  const audit=createDurableOwnerAudit({directory:path.join(auditRoot,'audit')});
+  let enterOutcome,releaseOutcome,markPersisted;
+  const outcomeEntered=new Promise(resolve=>{enterOutcome=resolve;});
+  const outcomeGate=new Promise(resolve=>{releaseOutcome=resolve;});
+  const outcomePersisted=new Promise(resolve=>{markPersisted=resolve;});
+  const x=await setup({auditWrite:async event=>{
+    if(event.phase==='outcome'){
+      enterOutcome();
+      await outcomeGate;
+    }
+    const written=audit.auditWrite(event);
+    if(event.phase==='outcome')markPersisted();
+    return written;
+  }});
+  try{
+    const csrf=(await x.pending()).data.csrf;
+    x.proof();
+    const controller=new AbortController();
+    const request=x.request('approve',{method:'POST',origin:ORIGIN,csrf,
+      body:x.approvePayload(),signal:controller.signal}).catch(error=>error);
+    await outcomeEntered;
+    controller.abort();
+    const lost=await request;
+    assert.equal(lost.name,'AbortError');
+    releaseOutcome();
+    await outcomePersisted;
+    const retry=await x.request('approve',{method:'POST',origin:ORIGIN,csrf,
+      body:x.approvePayload()});
+    assert.equal(retry.status,403);
+    assert.equal(x.trustStore.revision(),1);
+    assert.equal(x.registry.listDevices().length,1);
+    audit.close();
+    const replay=inspectDurableOwnerAudit({directory:path.join(auditRoot,'audit')});
+    assert.equal(replay.events.length,2);
+    assert.deepEqual(replay.events.map(event=>event.phase),['intent','outcome']);
+  }finally{
+    audit.close();
+    await x.close();
+    rmSync(auditRoot,{recursive:true,force:true});
+  }
 });
