@@ -10,6 +10,8 @@ import { request as httpsRequest } from 'node:https';
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto';
 import { loadOrCreateDeviceIdentity, bindApprovedDeviceIdentity } from '../packages/vpsc-agent/src/identity-store.mjs';
 import { analyzeI4ExecutionRecovery } from '../packages/vpsc-agent/src/governed-executor.mjs';
+import { analyzeOwnerPairingRecovery, reconcileOwnerPairingRecovery }
+  from '../gateway/dashboard/owner-pairing-reconciliation.mjs';
 
 const ROOT=fileURLToPath(new URL('../',import.meta.url));
 const HOST='g7-staging.test';
@@ -386,6 +388,42 @@ async function runPilot(){
     ensure(JSON.stringify(readAfterGatewayRestart).includes(DISPLAYED_READ.trim()),'Gateway restart lost approved device');
     trace('new session passed post-restart real MCP read');
 
+    await stopProcess(agentRestartProc,'SIGTERM');agentRestartProc=null;
+    await stopProcess(gatewayRestartProc,'SIGKILL');gatewayRestartProc=null;
+    ensure(allProcesses.every(proc=>proc.stopVerified===true),
+      'a known Gateway or agent process group remained live at reconciliation time');
+    trace('idle Gateway process stopped by SIGKILL');
+    const crashEvidence=analyzeOwnerPairingRecovery({auditDirectory:dirs.audit,trustDirectory:dirs.trust});
+    ensure(crashEvidence.state==='CONSISTENT_LOCK_HELD'&&crashEvidence.auditLockPresent===true&&
+      crashEvidence.auditLockStatus==='dead'&&
+      (!crashEvidence.trustLockPresent||crashEvidence.trustLockStatus==='dead'),
+      `Gateway SIGKILL recovery evidence was not safe: ${JSON.stringify(crashEvidence)}`);
+    const crashRecovery=reconcileOwnerPairingRecovery({auditDirectory:dirs.audit,
+      trustDirectory:dirs.trust,operatorConfirmedNoActiveWriters:true});
+    ensure(crashRecovery.state==='RECONCILED_CONSISTENT',
+      `Gateway SIGKILL recovery did not reconcile consistently: ${crashRecovery.state}`);
+    trace('stale locks reconciled after captured Gateway process groups were verified stopped');
+    gatewayRestartProc=launchProcess(path.join(ROOT,'gateway/staging/server.mjs'),
+      ['--config',gatewayConfigPath],{home:gatewayHome,tmp:gatewayTmp});
+    const gatewayAfterSigkillReady=await waitForEvent(gatewayRestartProc,'READY');
+    gatewayPort=gatewayAfterSigkillReady.port;
+    const restoredAfterSigkill=await waitHealth(gatewayPort,readFileSync(tlsCert));
+    ensure(restoredAfterSigkill.trustRevision===restored.trustRevision&&
+      restoredAfterSigkill.policyRevision===restored.policyRevision&&
+      restoredAfterSigkill.bindingRevision===restored.bindingRevision,
+      'Gateway durable state changed after SIGKILL restart');
+    replacePrivateJson(agentConfigPath,makeAgentConfig(gatewayPort));
+    agentRestartProc=startAgent();
+    const agentAfterGatewaySigkill=await waitForEvent(agentRestartProc,'READY');
+    await waitForEvent(agentRestartProc,'ONLINE');
+    ensure(agentAfterGatewaySigkill.deviceId===deviceId,
+      'agent failed to establish a fresh session after Gateway SIGKILL');
+    const readAfterGatewaySigkill=assertMcpOk(await ownerCall('read_file',{path:inputFile}),
+      'read after Gateway SIGKILL restart');
+    ensure(JSON.stringify(readAfterGatewaySigkill).includes(DISPLAYED_READ.trim()),
+      'Gateway SIGKILL restart lost approved device access');
+    trace('new session passed post-Gateway-SIGKILL real MCP read');
+
     const revokeGrant=await post(gatewayPort,readFileSync(tlsCert),'/stage/revoke-grant',{
       deviceId,expectedRevision:policyRevision,grantId:writeGrant.grantId,
     },{headers:controlHeaders});
@@ -437,6 +475,8 @@ async function runPilot(){
       machineAuthentication:{clientIdBinding:true,ed25519Fingerprint:identity.fingerprint},
       operations:{realMcpRead:true,governedWrite:true,revokedGrantDenied:true},
       restart:{agent:true,gateway:true,identityPersistent:true,newGatewaySession:true,
+        gatewayAfterSigkill:true,gatewayAfterSigkillRecovery:crashRecovery.state,
+        gatewayAfterSigkillTrustRevision:restoredAfterSigkill.trustRevision,
         trustRevision:restored.trustRevision,policyRevision:restored.policyRevision},
       revocation:{grantBlocksDispatch:true,deviceBlocksDispatch:true,trustRevision:revokedDevice.json.trustRevision},
       security:{invalidOwnerRejected:true,ownerTokenRejectedByMachineIngress:true,

@@ -55,6 +55,8 @@ test('standalone staging pilot runs Gateway and agent as separate processes',asy
   assert.equal(report.operations.realMcpRead,true);
   assert.equal(report.operations.governedWrite,true);
   assert.equal(report.restart.gateway,true);
+  assert.equal(report.restart.gatewayAfterSigkill,true);
+  assert.equal(report.restart.gatewayAfterSigkillRecovery,'RECONCILED_CONSISTENT');
   assert.equal(report.restart.agent,true);
   assert.equal(report.revocation.grantBlocksDispatch,true);
   assert.equal(report.security.invalidOwnerRejected,true);
