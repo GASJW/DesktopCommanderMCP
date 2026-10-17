@@ -36,17 +36,26 @@ test('staging configuration reader rejects symlinks and writable parent director
   }finally{rmSync(parent,{recursive:true,force:true});}
 });
 
-test('standalone staging pilot runs Gateway and agent as separate processes',async()=>{
+async function runPilot(scenario){
+  const env={PATH:process.env.PATH??'/usr/bin:/bin',TMPDIR:process.env.TMPDIR??'',
+    VPSC_STAGING_MCP_ENTRYPOINT:MCP_ENTRYPOINT};
+  if(scenario!==undefined){
+    env.NODE_TEST_CONTEXT=process.env.NODE_TEST_CONTEXT;
+    env.VPSC_STAGING_TEST_ACTIVE_JOB='1';
+    env.VPSC_STAGING_TEST_SCENARIO=scenario;
+  }
   const child=spawn(NODE,[PILOT,'--json'],{cwd:ROOT,stdio:['ignore','pipe','pipe'],
     ...(typeof process.getuid==='function'&&process.getuid()===0?{uid:65534,gid:65534}:{}),
-    env:{PATH:process.env.PATH??'/usr/bin:/bin',TMPDIR:process.env.TMPDIR??'',
-      VPSC_STAGING_MCP_ENTRYPOINT:MCP_ENTRYPOINT}});
+    env});
   let stdout='',stderr='';
   child.stdout.setEncoding('utf8').on('data',chunk=>{stdout+=chunk;});
   child.stderr.setEncoding('utf8').on('data',chunk=>{stderr+=chunk;});
   const [code]=await once(child,'exit');
   assert.equal(code,0,stderr||stdout);
-  const report=JSON.parse(stdout.trim().split('\n').at(-1));
+  return JSON.parse(stdout.trim().split('\n').at(-1));
+}
+
+function assertBasePilot(report){
   assert.equal(report.status,'pass_with_limitations',JSON.stringify(report));
   assert.equal(report.gateway.processIndependent,true);
   assert.equal(report.agent.processIndependent,true);
@@ -64,7 +73,77 @@ test('standalone staging pilot runs Gateway and agent as separate processes',asy
   assert.equal(report.security.invalidMachineSecretRejected,true);
   assert.equal(report.security.crossDeviceChallengeRejected,true);
   assert.equal(report.security.mismatchedMachineClientIdRejected,true);
-  assert.equal(report.cancellation.cooperativeDuringExecution,'not_certified_by_standalone_pilot');
   assert.equal(report.cleanup.processGroupsGone,true);
   assert.equal(report.cleanup.temporaryStateRemoved,true);
+}
+
+test('ordinary standalone staging pilot remains available without a test fixture',async t=>{
+  const report=await runPilot();
+  t.diagnostic(JSON.stringify(report.cancellation));
+  assertBasePilot(report);
+  assert.equal(report.cancellation.scenario,'not_tested_outside_node_test');
+  assert.equal(report.cancellation.activeExecution.startProven,false);
+});
+
+test('standalone Owner cancellation is acknowledged before execution and during a live job',async t=>{
+  const report=await runPilot('owner-cancel');
+  t.diagnostic(JSON.stringify(report.cancellation));
+  assertBasePilot(report);
+  assert.equal(report.cancellation.afterReceiptBeforeExecution.receivedByAgent,true);
+  assert.equal(report.cancellation.afterReceiptBeforeExecution.acknowledged,true);
+  assert.equal(report.cancellation.afterReceiptBeforeExecution.agentExecutionStatus,'cancelled');
+  assert.equal(report.cancellation.afterReceiptBeforeExecution.gatewayAcknowledgementStatus,'ambiguous');
+  assert.equal(report.cancellation.afterReceiptBeforeExecution.ownerResult,'ambiguous_after_disconnect');
+  assert.equal(report.cancellation.afterReceiptBeforeExecution.noExecutionIntent,true);
+  assert.equal(report.cancellation.followUpReadSucceeded,true);
+  assert.equal(report.cancellation.activeExecution.startProven,true);
+  assert.equal(report.cancellation.activeExecution.processWasLiveAtCancel,true);
+  assert.equal(report.cancellation.activeExecution.cancelAcknowledged,true);
+  assert.equal(report.cancellation.activeExecution.acknowledgedStatus,'ambiguous');
+  assert.equal(report.cancellation.activeExecution.gatewayAcknowledgementStatus,'ambiguous');
+  assert.equal(report.cancellation.activeExecution.processStopped,true);
+  assert.equal(report.cancellation.activeExecution.automaticReplay,false);
+});
+
+test('standalone Gateway grant revocation fences a live job and its result',async t=>{
+  const report=await runPilot('grant-revoke');
+  t.diagnostic(JSON.stringify(report.cancellation));
+  assertBasePilot(report);
+  assert.equal(report.cancellation.activeExecution.startProven,true);
+  assert.equal(report.cancellation.activeExecution.processWasLiveAtCancel,true);
+  assert.equal(report.cancellation.activeExecution.cancelAcknowledged,true);
+  assert.equal(report.cancellation.activeExecution.acknowledgedStatus,'ambiguous');
+  assert.equal(report.cancellation.activeExecution.gatewayAcknowledgementStatus,'ambiguous');
+  assert.equal(report.cancellation.activeExecution.processStopped,true);
+  assert.equal(report.cancellation.activeExecution.automaticReplay,false);
+  assert.equal(report.cancellation.grantRevocationDuringJob.revoked,true);
+  assert.equal(report.cancellation.grantRevocationDuringJob.commitBeforeCommandTimeout,true);
+  assert.equal(report.cancellation.grantRevocationDuringJob.acknowledgementAfterRevocationRequest,true);
+  assert.equal(report.cancellation.grantRevocationDuringJob.acknowledgementBeforeCommandTimeout,true);
+  assert.ok(report.cancellation.grantRevocationDuringJob.commitElapsedMs<
+    report.cancellation.grantRevocationDuringJob.commandTimeoutMs-500);
+  assert.ok(report.cancellation.grantRevocationDuringJob.acknowledgementElapsedMs<
+    report.cancellation.grantRevocationDuringJob.commandTimeoutMs-500);
+  assert.equal(report.cancellation.activeExecution.responseFenced,true);
+  assert.ok(report.cancellation.activeExecution.ownerResponseStatus>=400);
+});
+
+test('standalone device trust revocation fences a live job and its result',async t=>{
+  const report=await runPilot('device-revoke');
+  t.diagnostic(JSON.stringify(report.cancellation));
+  assertBasePilot(report);
+  assert.equal(report.cancellation.activeExecution.startProven,true);
+  assert.equal(report.cancellation.activeExecution.processWasLiveAtCancel,true);
+  assert.equal(report.cancellation.activeExecution.processStopped,true);
+  assert.equal(report.cancellation.activeExecution.automaticReplay,false);
+  assert.equal(report.cancellation.deviceRevocationDuringJob.revoked,true);
+  assert.equal(report.cancellation.deviceRevocationDuringJob.sessionRejectionObserved,true);
+  assert.equal(report.cancellation.deviceRevocationDuringJob.commitBeforeCommandTimeout,true);
+  assert.ok(report.cancellation.deviceRevocationDuringJob.commitElapsedMs<
+    report.cancellation.deviceRevocationDuringJob.commandTimeoutMs);
+  assert.equal(report.cancellation.activeExecution.responseFenced,true);
+  assert.equal(report.cancellation.activeExecution.ownerResponseStatus,503);
+  assert.equal(report.cancellation.activeExecution.ownerResponseCode,'AMBIGUOUS_TIMEOUT');
+  assert.ok(['ambiguous','unavailable_after_device_revocation'].includes(
+    report.cancellation.activeExecution.acknowledgedStatus));
 });

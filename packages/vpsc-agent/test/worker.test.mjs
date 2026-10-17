@@ -111,6 +111,83 @@ test('authenticated cancel control aborts only the active request and reports am
   assert.equal(f.calls.filter(item=>item?.type==='result').length,0);
 });
 
+test('worker accepts a conservative ambiguous ack and continues when local execution was cancelled before intent',async()=>{
+  const f=fixture();
+  const ownerDigest='c'.repeat(64),secondRequestId=randomUUID();
+  const frame={version:1,method:'tools/call',deviceId:DEVICE,sessionId:SESSION,
+    requestId:f.requestId,authorization:{version:1,claims:{ownerDigest},signature:'A'.repeat(86)},
+    params:{name:'read_file',arguments:{path:'/approved/cancelled-before-intent.txt'}}};
+  const secondFrame={...frame,requestId:secondRequestId,
+    params:{name:'read_file',arguments:{path:'/approved/allowed-after-cancel.txt'}}};
+  let polls=0,executions=[];
+  f.client.pollControl=async()=>{
+    const poll=polls++;
+    if(poll===0)return {frame,cancel:null};
+    if(poll===1)return {frame:null,cancel:{version:1,type:'cancel',deviceId:DEVICE,
+      sessionId:SESSION,requestId:f.requestId,ownerDigest}};
+    if(poll===2)return {frame:secondFrame,cancel:null};
+    return {frame:null,cancel:null};
+  };
+  f.client.cancelAck=async value=>{
+    f.calls.push({type:'cancel-ack',value});
+    return {accepted:true,status:'ambiguous'};
+  };
+  f.executor.handle=async(value,{signal}={})=>{
+    executions.push(value.requestId);
+    if(value.requestId===f.requestId){
+      return new Promise((_resolve,reject)=>{
+        const cancel=()=>reject(Object.assign(Error('cancelled before intent'),{code:'CANCELLED'}));
+        if(signal.aborted)cancel();else signal.addEventListener('abort',cancel,{once:true});
+      });
+    }
+    return {content:[{type:'text',text:'next operation completed'}]};
+  };
+  const worker=createAgentWorker({deviceId:DEVICE,client:f.client,executor:f.executor,pollIntervalMs:25});
+  const running=worker.run();
+  await waitFor(()=>f.calls.some(item=>item?.type==='result'&&item.id===secondRequestId));
+  worker.stop();
+  await running;
+  const acknowledgement=f.calls.find(item=>item?.type==='cancel-ack').value;
+  assert.equal(acknowledgement.requestId,f.requestId);
+  assert.deepEqual(executions,[f.requestId,secondRequestId]);
+  assert.deepEqual(f.calls.filter(item=>item?.type==='result').map(item=>item.id),[secondRequestId]);
+});
+
+test('cancellation arriving after completion is acknowledged as completed without replay or rollback',async()=>{
+  const f=fixture();
+  const ownerDigest='b'.repeat(64);
+  const frame={version:1,method:'tools/call',deviceId:DEVICE,sessionId:SESSION,
+    requestId:f.requestId,authorization:{version:1,claims:{ownerDigest},signature:'A'.repeat(86)},
+    params:{name:'read_file',arguments:{path:'/approved/test.txt'}}};
+  let polls=0,executions=0;
+  f.client.pollControl=async()=>{
+    const poll=polls++;
+    if(poll===0)return {frame,cancel:null};
+    if(poll===1)return {frame:null,cancel:{version:1,type:'cancel',deviceId:DEVICE,
+      sessionId:SESSION,requestId:f.requestId,ownerDigest}};
+    return {frame:null,cancel:null};
+  };
+  f.client.cancelAck=async value=>{
+    f.calls.push({type:'cancel-ack',value});
+    return {accepted:true,status:value.status};
+  };
+  f.executor.handle=async()=>{
+    executions++;
+    return {content:[{type:'text',text:'completed before cancellation'}]};
+  };
+  const worker=createAgentWorker({deviceId:DEVICE,client:f.client,executor:f.executor,pollIntervalMs:25});
+  const running=worker.run();
+  await waitFor(()=>f.calls.some(item=>item?.type==='cancel-ack'));
+  worker.stop();
+  await running;
+  const acknowledgement=f.calls.find(item=>item?.type==='cancel-ack').value;
+  assert.equal(acknowledgement.requestId,f.requestId);
+  assert.equal(acknowledgement.status,'completed');
+  assert.equal(executions,1,'completed work is never replayed');
+  assert.equal(f.calls.filter(item=>item?.type==='result').length,0,
+    'a late cancellation cannot convert completion into a result or rollback claim');
+});
+
 test('mismatched cancellation control cannot abort or acknowledge another owner request',async()=>{
   const f=fixture();
   const ownerDigest='a'.repeat(64);

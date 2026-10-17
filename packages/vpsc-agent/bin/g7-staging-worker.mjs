@@ -8,6 +8,18 @@ import { createAgentWorker } from '../src/worker.mjs';
 import { readPrivateStagingFile } from '../../../gateway/staging/private-file.mjs';
 
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const TEST_SCENARIOS=new Set(['owner-cancel','grant-revoke','device-revoke']);
+function emitFixture(event,fields={}){
+  process.stdout.write(JSON.stringify({event,...fields,monotonicNs:process.hrtime.bigint().toString()})+'\n');
+}
+async function waitForFixtureAbort(signal){
+  if(!signal)throw Error();
+  if(signal.aborted)return;
+  await new Promise(resolve=>{
+    signal.addEventListener('abort',resolve,{once:true});
+    if(signal.aborted)resolve();
+  });
+}
 function safeFile(filename,{privateOnly=true}={}){
   return readPrivateStagingFile(filename,{privateOnly});
 }
@@ -67,6 +79,24 @@ async function stop(signal){
 }
 try{
   if(process.argv.length!==4||process.argv[2]!=='--config')throw Error();
+  const fixtureRequested=process.env.VPSC_STAGING_TEST_ACTIVE_JOB==='1';
+  const fixtureScenario=process.env.VPSC_STAGING_TEST_SCENARIO;
+  if(fixtureRequested&&(!process.env.NODE_TEST_CONTEXT||!TEST_SCENARIOS.has(fixtureScenario)))throw Error();
+  if(!fixtureRequested&&fixtureScenario!==undefined)throw Error();
+  const fixtureCall=async(method,operation,args)=>{
+    try{
+      const result=await operation(...args);
+      if(fixtureRequested)emitFixture('FIXTURE_CLIENT_CALL',{method,outcome:'success',
+        accepted:result?.accepted===true,status:result?.status??null,
+        hasFrame:result?.frame!==undefined&&result?.frame!==null,
+        hasCancel:result?.cancel!==undefined&&result?.cancel!==null});
+      return result;
+    }catch(error){
+      if(fixtureRequested)emitFixture('FIXTURE_CLIENT_CALL',{method,outcome:'error',
+        code:/^[A-Z_]{1,48}$/.test(error?.code??'')?error.code:'UNKNOWN'});
+      throw error;
+    }
+  };
   const config=parseConfig(process.argv[3]);
   const identity=loadOrCreateDeviceIdentity({directory:config.identityDirectory,platform:process.platform});
   if(!identity.deviceBinding||identity.deviceBinding.deviceId!==config.deviceId||
@@ -79,17 +109,46 @@ try{
   const observedClient={
     connect:async()=>{const session=await client.connect();connected=true;
       process.stdout.write(JSON.stringify({event:'READY',deviceId:config.deviceId,pid:process.pid})+'\n');return session;},
-    heartbeat:async(...args)=>{const value=await client.heartbeat(...args);
+    heartbeat:async(...args)=>{const value=await fixtureCall('heartbeat',client.heartbeat,args);
       if(!online){online=true;process.stdout.write(JSON.stringify({event:'ONLINE',deviceId:config.deviceId})+'\n');}
-      return value;},poll:(...args)=>client.poll(...args),
-    pollControl:(...args)=>client.pollControl(...args),result:(...args)=>client.result(...args),
-    cancelAck:(...args)=>client.cancelAck(...args),disconnect:(...args)=>client.disconnect(...args),
+      return value;},poll:(...args)=>fixtureCall('poll',client.poll,args),
+    pollControl:(...args)=>fixtureCall('pollControl',client.pollControl,args),
+    result:(...args)=>fixtureCall('result',client.result,args),
+    cancelAck:async(...args)=>{
+      const acknowledgement=await fixtureCall('cancelAck',client.cancelAck,args);
+      if(fixtureRequested)emitFixture('FIXTURE_CANCEL_ACK',{requestId:args[0]?.requestId,
+        status:args[0]?.status,gatewayStatus:acknowledgement?.status??null,
+        accepted:acknowledgement?.accepted===true});
+      return acknowledgement;
+    },disconnect:(...args)=>client.disconnect(...args),
     close:(...args)=>client.close(...args),
   };
-  const executor=createGovernedAgentExecutor({allowedRoot:config.allowedRoot,
+  let activeRequestId=null,firstReadHeld=false;
+  const baseExecutor=createGovernedAgentExecutor({allowedRoot:config.allowedRoot,
     entrypoint:config.mcpEntrypoint,ledgerDirectory:config.ledgerDirectory,
     deviceId:config.deviceId,fingerprint:identity.fingerprint,
-    gatewayPolicyPublicKey:config.policyPublicKeyPem});
+    gatewayPolicyPublicKey:config.policyPublicKeyPem,
+    ...(fixtureRequested?{testHooks:{sleepCommandForTimeout:true,
+      onCommandSpawn:pid=>emitFixture('FIXTURE_JOB_STARTED',{pid,requestId:activeRequestId})}}:{})});
+  const executor=fixtureRequested?{
+    start:(...args)=>baseExecutor.start(...args),
+    handle:async(frame,options={})=>{
+      const requestId=frame?.requestId,tool=frame?.params?.name;
+      const fixturePath=frame?.params?.arguments?.path;
+      if(fixtureScenario==='owner-cancel'&&tool==='read_file'&&!firstReadHeld&&
+         typeof fixturePath==='string'&&fixturePath.endsWith('/cancel-before-execution-probe.txt')){
+        firstReadHeld=true;
+        emitFixture('FIXTURE_OPERATION_RECEIVED',{requestId,tool});
+        await waitForFixtureAbort(options.signal);
+        emitFixture('FIXTURE_CANCEL_BEFORE_EXECUTION',{requestId});
+      }
+      activeRequestId=requestId;
+      emitFixture('FIXTURE_OPERATION_DELIVERED',{requestId,tool});
+      try{return await baseExecutor.handle(frame,options);}
+      finally{activeRequestId=null;}
+    },
+    close:(...args)=>baseExecutor.close(...args),
+  }:baseExecutor;
   const worker=createAgentWorker({deviceId:config.deviceId,client:observedClient,executor,
     pollIntervalMs:config.pollIntervalMs});
   const controller=new AbortController();
