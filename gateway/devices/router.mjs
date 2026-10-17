@@ -61,7 +61,7 @@ export function createDeviceRouter({
     return Object.freeze({deviceId,sessionId});
   }
   async function callDevice({deviceId, name, arguments:args = {}, requestId:requestedId,
-    authorization,signal} = {}) {
+    authorization,signal,beforeDispatch} = {}) {
     if (stopped) throw fail('CLOSED', 'Router closed');
     if (typeof deviceId !== 'string' || !UUID.test(deviceId)) {
       throw fail('BAD_DEVICE', 'Explicit deviceId required');
@@ -76,6 +76,9 @@ export function createDeviceRouter({
     if(signal!==undefined&&(!signal||typeof signal.aborted!=='boolean'||
        typeof signal.addEventListener!=='function'||typeof signal.removeEventListener!=='function')){
       throw fail('BAD_SIGNAL','Invalid operation cancellation signal');
+    }
+    if(beforeDispatch!==undefined&&typeof beforeDispatch!=='function'){
+      throw fail('BAD_PERMIT','Invalid pre-dispatch authorization callback');
     }
     if(signal?.aborted)throw fail('CANCELLED','Operation cancelled before device dispatch');
     if(authorization!==undefined&&(!authorization||typeof authorization!=='object'||
@@ -109,8 +112,6 @@ export function createDeviceRouter({
     }
     if (channel.pending.size >= maxPendingPerDevice) throw fail('BUSY', 'Device busy');
     if(channel.pending.has(requestId))throw fail('DUPLICATE_REQUEST','Execution request is already pending');
-    const frame = Object.freeze({version:1,deviceId,sessionId:channel.sessionId,requestId,
-      method:'tools/call',params,...(authorization?{authorization:Object.freeze({...authorization})}:{})});
     return new Promise((resolve,reject) => {
       const item={timer:null,resolve,reject,signal,dispatched:false,onAbort:null};
       const finish=(error)=>{
@@ -139,15 +140,52 @@ export function createDeviceRouter({
       channel.pending.set(requestId,item);
       signal?.addEventListener('abort',item.onAbort,{once:true});
       if(signal?.aborted){item.onAbort();return;}
-      Promise.resolve().then(() => {
-        if (stopped || active.get(deviceId) !== channel || !channel.pending.has(requestId) ||
-            !registry.isLiveSession(deviceId, channel.sessionId)) {
-          throw fail('AMBIGUOUS_DISCONNECT','Device unavailable; no replay');
+      Promise.resolve().then(async()=>{
+        let permit;
+        try{
+          if(stopped||active.get(deviceId)!==channel||!channel.pending.has(requestId)||
+             !registry.isLiveSession(deviceId,channel.sessionId)){
+            throw fail('AMBIGUOUS_DISCONNECT','Device unavailable; no replay');
+          }
+          if(beforeDispatch){
+            permit=await beforeDispatch(Object.freeze({deviceId,sessionId:channel.sessionId,
+              requestId,name,arguments:params.arguments}));
+            if(!permit||typeof permit!=='object'||Array.isArray(permit)||
+               Object.getPrototypeOf(permit)!==Object.prototype||
+               Object.keys(permit).sort().join(',')!=='authorization,release'||
+               !permit.authorization||typeof permit.authorization!=='object'||
+               Array.isArray(permit.authorization)||Object.getPrototypeOf(permit.authorization)!==Object.prototype||
+               typeof permit.release!=='function'){
+              throw fail('BAD_PERMIT','Pre-dispatch authorization permit is invalid');
+            }
+          }
+          if(stopped||active.get(deviceId)!==channel||!channel.pending.has(requestId)||
+             signal?.aborted||!registry.isLiveSession(deviceId,channel.sessionId)){
+            throw fail(signal?.aborted?'CANCELLED':'AMBIGUOUS_DISCONNECT',
+              'Device unavailable before transport handoff');
+          }
+          const boundAuthorization=permit?.authorization??authorization;
+          const frame=Object.freeze(copy({version:1,deviceId,sessionId:channel.sessionId,requestId,
+            method:'tools/call',params,...(boundAuthorization?{authorization:boundAuthorization}:{})},maxRequestBytes));
+          item.dispatched=true;
+          let sendResult;
+          try{sendResult=channel.send(frame);}
+          finally{
+            if(permit){const release=permit.release;permit=undefined;release();}
+          }
+          await sendResult;
+        }catch(error){
+          if(permit){
+            try{permit.release();}catch{}
+            permit=undefined;
+          }
+          if(item.dispatched){
+            finish(fail('AMBIGUOUS_DISPATCH','Transport handoff failed; outcome unknown'));
+          }else{
+            finish(error&&typeof error.code==='string'?error:
+              fail('AUTHORIZATION_FAILED','Operation authorization failed before dispatch'));
+          }
         }
-        item.dispatched=true;
-        return channel.send(frame);
-      }).catch(() => {
-        finish(fail('AMBIGUOUS_DISPATCH','Transport failed; outcome unknown'));
       });
     });
   }
