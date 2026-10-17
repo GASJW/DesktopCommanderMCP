@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { generateKeyPairSync,sign } from 'node:crypto';
+import { generateKeyPairSync,randomUUID,sign } from 'node:crypto';
 import { mkdtempSync,mkdirSync,writeFileSync,rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -9,6 +9,8 @@ import { createMachineAccessVerifier } from '../devices/machine-access.mjs';
 import { startMachineIngressLoopback } from '../devices/machine-ingress-loopback.mjs';
 import { createDeviceRegistry } from '../devices/registry.mjs';
 import { createDeviceRouter } from '../devices/router.mjs';
+import { createDurableMachineBindingStore } from '../devices/durable-machine-bindings.mjs';
+import { ownerIdentityDigest,ownerPrincipalId } from '../dashboard/owner-identity.mjs';
 import { createPairingCoordinator } from '../devices/pairing.mjs';
 import { createEphemeralPairingIdentity } from '../../packages/vpsc-agent/src/pairing.mjs';
 import { createLoopbackAgentClient } from '../../packages/vpsc-agent/src/loopback-client.mjs';
@@ -37,16 +39,39 @@ async function fixture(){
   const req=pairing.startPairing({name:'Gui-PC demo',platform:'win32',publicKeyPem:identity.publicKeyPem});
   assert.equal(pairing.provePossession(req.requestId,identity.prove(req)),true);
   const {deviceId}=pairing.approvePairing(req.requestId,identity.fingerprint);
+  const bindingDirectory=mkdtempSync(path.join(os.tmpdir(),'vpsc-machine-binding-test-'));
+  const owner={issuer:'https://test.cloudflareaccess.com',subject:'m2m-test-owner'};
+  const ownerId=ownerPrincipalId(owner),ownerDigest=ownerIdentityDigest(owner);
+  const approvalReceipt={ownerId,deviceId,eventId:randomUUID(),fingerprint:identity.fingerprint,
+    trustRevisionBefore:0,trustRevisionAfter:1,trustRevision:1};
+  const bindingEventId=randomUUID(),intent={event:'g7_owner_machine_binding',version:3,
+    eventId:bindingEventId,operation:'bind',ownerId,ownerDigest,clientId:machine,deviceId,
+    fingerprint:identity.fingerprint,approvalEventId:approvalReceipt.eventId,
+    trustRevisionBefore:0,trustRevisionAfter:1,trustRevision:1,bindingRevisionBefore:0,
+    phase:'intent'};
+  let decision={state:'NOT_FOUND',eventId:bindingEventId};
+  const machineBindingStore=createDurableMachineBindingStore({directory:bindingDirectory,
+    verifyApprovalReceipt:binding=>binding.ownerId===ownerId&&binding.deviceId===deviceId&&
+      binding.fingerprint===identity.fingerprint?approvalReceipt:null,
+    readBindingDecision:binding=>binding.bindingEventId===bindingEventId?decision:
+      {state:'NOT_FOUND',eventId:binding.bindingEventId},
+    readBindingHistory:()=>({completed:decision.state==='COMPLETE'?[decision]:[],
+      pending:decision.state==='PENDING'?[decision]:[]})});
+  decision={state:'PENDING',eventId:bindingEventId,intent,outcome:null};
+  machineBindingStore.bind({bindingEventId,ownerId,ownerDigest,clientId:machine,deviceId,
+    fingerprint:identity.fingerprint,approvalReceipt},{expectedRevision:0});
+  decision={state:'COMPLETE',eventId:bindingEventId,intent,
+    outcome:{...intent,phase:'outcome',outcome:'accepted',bindingRevisionAfter:1}};
   const ingress=await startMachineIngressLoopback({
-    registry,router,verifyMachineToken,machineBindings:new Map([[machine,deviceId]]),
-    enableTestIngress:true,
+    registry,router,verifyMachineToken,machineBindingStore,getTrustRevision:()=>1,enableTestIngress:true,
   });
   const jwt=makeJwt(privateKey);
   const signedFetch=(url,options)=>fetch(url,{...options,
     headers:{...options.headers,'cf-access-jwt-assertion':jwt}});
   const client=createLoopbackAgentClient({url:ingress.url,identity,deviceId,fetchFn:signedFetch});
-  return {registry,router,identity,ingress,client,deviceId,privateKey,jwt,
-    close:async()=>{router.close();await ingress.close();}};
+  return {registry,router,identity,ingress,client,deviceId,privateKey,jwt,machineBindingStore,
+    bindingDirectory,verifyMachineToken,close:async()=>{router.close();await ingress.close();machineBindingStore.close();
+      rmSync(bindingDirectory,{recursive:true,force:true});}};
 }
 async function request(url,route,body,headers={}){
   const res=await fetch(url+route,{method:'POST',headers:{
@@ -98,6 +123,22 @@ test('machine identity is cryptographically bound to exact authorized device',as
     assert.notEqual(anon.status,200);
   }finally{await x.close();}
 });
+test('durable Client-ID binding rejects a trusted deviceId with a different public-key fingerprint',async()=>{
+  const x=await fixture();
+  const replacement=createEphemeralPairingIdentity();
+  const original=x.registry.snapshotTrustedDevices()[0];
+  const mismatchedRegistry=createDeviceRegistry({initialTrustedDevices:[{...original,
+    publicKeyPem:replacement.publicKeyPem,fingerprint:replacement.fingerprint}]});
+  const mismatchedRouter=createDeviceRouter({registry:mismatchedRegistry});
+  const ingress=await startMachineIngressLoopback({registry:mismatchedRegistry,router:mismatchedRouter,
+    verifyMachineToken:x.verifyMachineToken,machineBindingStore:x.machineBindingStore,
+    getTrustRevision:()=>1,enableTestIngress:true});
+  try{
+    const response=await request(ingress.url,'/agent/challenge',{deviceId:x.deviceId},
+      {'cf-access-jwt-assertion':x.jwt});
+    assert.equal(response.status,403);
+  }finally{mismatchedRouter.close();await ingress.close();await x.close();}
+});
 test('M2M JWT bad issuer, audience and human sub rejected before agent challenge',async()=>{
   const x=await fixture();
   try{
@@ -142,6 +183,6 @@ test('revoked Ed25519 trust is not rescued by still-valid machine JWT',async()=>
   try{
     await x.client.connect();await x.client.heartbeat();
     x.registry.revokeDevice(x.deviceId);
-    await assert.rejects(x.client.poll(),/401/);
+    await assert.rejects(x.client.poll(),/403/);
   }finally{await x.close();}
 });

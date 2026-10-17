@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { constants, closeSync, fstatSync, fsyncSync, lstatSync,
   mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createDeviceRegistry } from './registry.mjs';
@@ -9,12 +9,16 @@ import { createDurableProcessLock, inspectDurableProcessLock,
 // G7.2e candidate. Server-side trust records contain PUBLIC keys only.
 // Not wired into gateway/server.mjs, Cloudflare or any live tool endpoint.
 const FILE='trusted-devices-v1.json';
+const OPERATION_GATE='.trusted-devices-operation.lock';
+const DISPATCH_PERMIT_PREFIX='.trust-dispatch-permit-';
 const MAX_BYTES=1024*1024;
 const MAX_TRANSITIONS=2048;
 const MAX_TEMP_FILES=16;
 const MAX_TEMP_BYTES=4*MAX_BYTES;
-const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const FINGERPRINT=/^[a-f0-9]{64}$/;
+const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const currentSessionProofs=new WeakMap();
+const trustError=(code,message)=>Object.assign(new Error(message),{code});
 function checkDirectory(directory,{create=false}={}){
   if(process.platform==='win32')throw new Error('VPS trust store requires POSIX owner-only ACLs');
   if(typeof directory!=='string'||!path.isAbsolute(directory)||
@@ -43,7 +47,8 @@ function checkDirectory(directory,{create=false}={}){
 }
 function trustedFile(directory){return path.join(directory,FILE);}
 function trustTempEvidence(directory){
-  const names=readdirSync(directory).filter(name=>name.startsWith('.trust-')).sort();
+  const names=readdirSync(directory).filter(name=>name.startsWith('.trust-')&&
+    !name.startsWith(DISPATCH_PERMIT_PREFIX)).sort();
   if(names.length>MAX_TEMP_FILES)throw Error('Trust temporary snapshot limit exceeded');
   let total=0;
   return names.map(name=>{
@@ -71,7 +76,50 @@ function assertNoTrustTemps(directory){
 }
 function assertNoWriterLock(directory){
   const lock=inspectDurableProcessLock(directory,'.trusted-devices-writer.lock');
-  if(lock.present)throw Error('Trust writer lock present; manual reconciliation required');
+  if(!lock.present)return;
+  if(lock.status==='active'){
+    throw trustError('TRUST_BUSY','Another verified trust writer is active');
+  }
+  throw trustError('TRUST_RECOVERY_REQUIRED',
+    'Trust writer lock present; owner is stale or cannot be verified; manual reconciliation required');
+}
+function trustDispatchPermits(directory,{allowActive=true}={}){
+  const names=readdirSync(directory).filter(name=>name.startsWith(DISPATCH_PERMIT_PREFIX)).sort();
+  if(names.length>64)throw trustError('TRUST_RECOVERY_REQUIRED','Trust dispatch permit limit exceeded');
+  const permits=[];
+  for(const name of names){
+    const permitId=name.slice(DISPATCH_PERMIT_PREFIX.length,-'.lock'.length);
+    if(!name.endsWith('.lock')||!UUID.test(permitId)){
+      throw trustError('TRUST_RECOVERY_REQUIRED','Unrecognized trust dispatch permit evidence');
+    }
+    let evidence;
+    try{evidence=inspectDurableProcessLock(directory,name);}
+    catch{throw trustError('TRUST_RECOVERY_REQUIRED','Trust dispatch permit identity is unverified');}
+    if(!evidence.present||evidence.owner?.kind!=='trust-dispatch-permit'||
+       evidence.status==='dead'||evidence.status==='unknown'){
+      throw trustError('TRUST_RECOVERY_REQUIRED','Stale trust dispatch permit requires operator reconciliation');
+    }
+    permits.push(evidence);
+  }
+  if(!allowActive&&permits.length){
+    throw trustError('TRUST_BUSY','A dispatched operation holds a trust authorization permit');
+  }
+  return permits;
+}
+function acquireTrustOperationGate(directory){
+  try{return createDurableProcessLock(directory,OPERATION_GATE,'trust-operation-gate');}
+  catch{
+    let evidence;
+    try{evidence=inspectDurableProcessLock(directory,OPERATION_GATE);}
+    catch{throw trustError('TRUST_RECOVERY_REQUIRED','Trust operation gate is uncertain');}
+    if(evidence.present&&evidence.status==='active'){
+      throw trustError('TRUST_BUSY','Another trust operation is being committed');
+    }
+    throw trustError('TRUST_RECOVERY_REQUIRED','Stale trust operation gate requires operator reconciliation');
+  }
+}
+function releaseTrustOperationGate(directory,owner){
+  removeOwnedDurableProcessLock({directory,name:OPERATION_GATE,owner});
 }
 function assertNoReconciliationLock(directory){
   const lock=path.join(directory,'.owner-pairing-reconciliation.lock');
@@ -210,6 +258,10 @@ export function createDurableDeviceTrustStore({directory,maxDevices=32,now=Date.
     assertNoWriterLock(directory);
     assertNoReconciliationLock(directory);
     assertNoTrustTemps(directory);
+    trustDispatchPermits(directory,{allowActive:true});
+    const operationGate=inspectDurableProcessLock(directory,OPERATION_GATE);
+    if(operationGate.present)throw trustError(operationGate.status==='active'?'TRUST_BUSY':
+      'TRUST_RECOVERY_REQUIRED','Trust operation gate is active or requires reconciliation');
     snapshot=readSnapshot(directory);
     assertNoWriterLock(directory);
     current=createDeviceRegistry({maxDevices,now,initialTrustedDevices:snapshot.devices});
@@ -236,6 +288,7 @@ export function createDurableDeviceTrustStore({directory,maxDevices=32,now=Date.
       assertNoWriterLock(directory);
       assertNoReconciliationLock(directory);
       assertNoTrustTemps(directory);
+      trustDispatchPermits(directory,{allowActive:true});
       const authoritative=readSnapshot(directory);
       if(authoritative.revision!==snapshot.revision||
          JSON.stringify(authoritative.devices)!==JSON.stringify(snapshot.devices)||
@@ -247,6 +300,7 @@ export function createDurableDeviceTrustStore({directory,maxDevices=32,now=Date.
       assertNoWriterLock(directory);
       assertNoReconciliationLock(directory);
     }catch(error){
+      if(error?.code==='TRUST_BUSY')throw error;
       blocked=true;
       throw error;
     }
@@ -275,15 +329,16 @@ export function createDurableDeviceTrustStore({directory,maxDevices=32,now=Date.
       historyStartDevices:snapshot.historyStartDevices,
       transitions:[...snapshot.transitions,{...transition,
         previousRevision:snapshot.revision,revision:nextRevision}]};
-    blocked=true; // Fail closed if ANY storage/lock failure or stale snapshot occurs.
-    // mkdir is exclusive across processes on a local POSIX filesystem. Never
-    // steal a pre-existing lock: after a crash, an operator must reconcile it.
     const lockName='.trusted-devices-writer.lock';
-    let locked=false, committed=false, staleSnapshot=false;
-    let lockOwner;
+    const gateOwner=acquireTrustOperationGate(directory);
+    let writerOwner=null,committed=false,staleSnapshot=false;
     try {
-      lockOwner=createDurableProcessLock(directory,lockName,'trust-writer');
-      locked=true;
+      // The operation gate serializes permit creation with mutations. A live
+      // dispatch permit is a retryable conflict, not evidence that this store
+      // is corrupt and not a reason to poison the facade.
+      trustDispatchPermits(directory,{allowActive:false});
+      blocked=true;
+      writerOwner=createDurableProcessLock(directory,lockName,'trust-writer');
       const lockDirFd=openSync(directory,constants.O_RDONLY|(constants.O_NOFOLLOW??0));
       try{fsyncSync(lockDirFd);}finally{closeSync(lockDirFd);}
       const actual=readSnapshot(directory);
@@ -300,24 +355,30 @@ export function createDurableDeviceTrustStore({directory,maxDevices=32,now=Date.
       committed=true;
       snapshot=next;
       current=candidate; // New registry discards sessions / challenges.
-      removeOwnedDurableProcessLock({directory,name:lockName,owner:lockOwner});
-      locked=false;
+      removeOwnedDurableProcessLock({directory,name:lockName,owner:writerOwner});
+      writerOwner=null;
       const dirFd=openSync(directory,constants.O_RDONLY|(constants.O_NOFOLLOW??0));
       try{fsyncSync(dirFd);}finally{closeSync(dirFd);}
+      releaseTrustOperationGate(directory,gateOwner);
       blocked=false;
-    } finally {
-      // On a failed durability step, do not remove the lock automatically:
-      // after a crash/uncertain write the next writer must stop for recovery.
-      // A deterministic pre-commit stale revision is safe to release.
-      if(locked&&!committed){
-        if(staleSnapshot){
-          removeOwnedDurableProcessLock({directory,name:lockName,owner:lockOwner});
-          locked=false;
-          const dirFd=openSync(directory,constants.O_RDONLY|(constants.O_NOFOLLOW??0));
-          try{fsyncSync(dirFd);}finally{closeSync(dirFd);}
-        }
-        // Keep the lock for every other failure: storage may be uncertain.
+    }catch(error){
+      if(error?.code==='TRUST_BUSY'&&!writerOwner&&!committed){
+        blocked=false;
+        releaseTrustOperationGate(directory,gateOwner);
+      }else if(staleSnapshot&&writerOwner&&!committed){
+        removeOwnedDurableProcessLock({directory,name:lockName,owner:writerOwner});
+        writerOwner=null;
+        releaseTrustOperationGate(directory,gateOwner);
+        blocked=true; // The instance is stale and must be reopened.
+      }else if(!writerOwner&&!committed){
+        blocked=true;
+        releaseTrustOperationGate(directory,gateOwner);
+      }else{
+        // A crash or storage error after writer acquisition leaves both fences
+        // in place. Recovery must inspect them; never unlock an uncertain commit.
+        blocked=true;
       }
+      throw error;
     }
   }
   function trustDevice(metadata,options={}) {
@@ -363,13 +424,111 @@ export function createDurableDeviceTrustStore({directory,maxDevices=32,now=Date.
       fingerprint:prior.fingerprint,deviceId});
     return true;
   }
+  function acquireDispatchPermit({deviceId,sessionId,expectedRevision}={}){
+    if(!UUID.test(deviceId??'')||!UUID.test(sessionId??'')||
+       !Number.isSafeInteger(expectedRevision)||expectedRevision<0){
+      throw trustError('TRUST_INVALID','A device, live session and expected trust revision are required');
+    }
+    requireHealthy();
+    const gateOwner=acquireTrustOperationGate(directory);
+    let gateHeld=true,permitOwner=null,permitName=null,uncertain=false;
+    try{
+      requireHealthy();
+      if(expectedRevision!==snapshot.revision){
+        throw trustError('TRUST_CHANGED','Trust revision changed before dispatch authorization');
+      }
+      if(!current.isLiveSession(deviceId,sessionId)){
+        throw trustError('TRUST_SESSION_STALE','Device session is no longer live');
+      }
+      const existing=trustDispatchPermits(directory,{allowActive:true});
+      if(existing.length>=64)throw trustError('TRUST_BUSY','Trust dispatch permit limit reached');
+      permitName=DISPATCH_PERMIT_PREFIX+randomUUID()+'.lock';
+      permitOwner=createDurableProcessLock(directory,permitName,'trust-dispatch-permit');
+      // The marker is durably visible before the gate is released. Every trust
+      // mutation takes this same gate and refuses to commit while a permit lives.
+      releaseTrustOperationGate(directory,gateOwner);gateHeld=false;
+      let released=false;
+      return Object.freeze({trustRevision:snapshot.revision,release:()=>{
+        if(released)return false;
+        try{removeOwnedDurableProcessLock({directory,name:permitName,owner:permitOwner});}
+        catch(error){blocked=true;throw trustError('TRUST_RECOVERY_REQUIRED',
+          'Trust dispatch permit release is uncertain; operator recovery is required');}
+        released=true;
+        return true;
+      }});
+    }catch(error){
+      if(permitOwner){uncertain=true;blocked=true;}
+      throw error;
+    }finally{
+      if(gateHeld&&!uncertain){
+        try{releaseTrustOperationGate(directory,gateOwner);}
+        catch{blocked=true;}
+      }
+    }
+  }
+  function withCurrentSession({deviceId,sessionId,expectedRevision}={},callback){
+    if(!UUID.test(deviceId??'')||!UUID.test(sessionId??'')||
+       !Number.isSafeInteger(expectedRevision)||expectedRevision<0||typeof callback!=='function'||
+       callback.constructor?.name==='AsyncFunction'){
+      throw trustError('TRUST_INVALID','A synchronous callback and exact device session are required');
+    }
+    const gateOwner=acquireTrustOperationGate(directory);
+    const proof=Object.freeze(Object.create(null));
+    try{
+      requireHealthy();
+      if(expectedRevision!==snapshot.revision||!current.isLiveSession(deviceId,sessionId)){
+        throw trustError('TRUST_SESSION_STALE','Device trust revision or session changed');
+      }
+      currentSessionProofs.set(proof,{directory,deviceId,sessionId,expectedRevision,gateOwner,
+        isCurrent:()=>!closed&&!blocked&&snapshot.revision===expectedRevision&&
+          current.isLiveSession(deviceId,sessionId)});
+      const result=callback(proof);
+      if(result&&typeof result.then==='function'){
+        throw trustError('TRUST_INVALID','Trust response guard callback must be synchronous');
+      }
+      return result;
+    }finally{
+      currentSessionProofs.delete(proof);
+      releaseTrustOperationGate(directory,gateOwner);
+    }
+  }
   const revision=()=>{requireHealthy();return snapshot.revision;};
   function close(){
     if(closed)return;
     closed=true;
     closeSync(directoryFd);
   }
-  return Object.freeze({registry,trustDevice,revokeDevice,revision,close});
+  return Object.freeze({registry,trustDevice,revokeDevice,revision,acquireDispatchPermit,
+    withCurrentSession,close});
+}
+
+// A proof is an in-process capability minted only while withCurrentSession
+// owns the operation gate. It is deliberately opaque and is useful only for
+// synchronously verifying read-only durable evidence under that same gate.
+export function isCurrentTrustSessionProof(proof,{directory,deviceId,sessionId,
+  expectedRevision,trustRevision}={}){
+  const state=proof&&typeof proof==='object'?currentSessionProofs.get(proof):undefined;
+  if(!state||state.directory!==directory||state.deviceId!==deviceId||
+     sessionId!==undefined&&state.sessionId!==sessionId||
+     state.expectedRevision!==expectedRevision||
+     trustRevision!==expectedRevision||!state.isCurrent())return false;
+  try{
+    const gate=inspectDurableProcessLock(directory,OPERATION_GATE);
+    if(!gate.present||gate.status!=='active'||gate.owner?.kind!=='trust-operation-gate'||
+       gate.owner?.token!==state.gateOwner.token||gate.owner?.pid!==state.gateOwner.pid||
+       gate.owner?.uid!==state.gateOwner.uid||gate.owner?.bootId!==state.gateOwner.bootId||
+       gate.owner?.startTicks!==state.gateOwner.startTicks)return false;
+    const writer=inspectDurableProcessLock(directory,'.trusted-devices-writer.lock');
+    if(writer.present)return false;
+    if(trustTempEvidence(directory).length!==0)return false;
+    // Dispatch permits prevent trust mutations and cannot change the revision.
+    // Accept only permits whose durable process owners remain verified active;
+    // dead, unknown, malformed, or foreign permit evidence remains fail-closed.
+    trustDispatchPermits(directory,{allowActive:true});
+    const reconciliation=inspectDurableProcessLock(directory,'.owner-pairing-reconciliation.lock');
+    if(reconciliation.present)return false;
+    return true;
+  }catch{return false;}
 }
 
 function trustLockEvidence(directory){
@@ -383,11 +542,30 @@ export function inspectDurableDeviceTrust({directory}={}){
   const snapshot=readSnapshot(directory);
   createDeviceRegistry({maxDevices:256,initialTrustedDevices:snapshot.devices});
   const lock=trustLockEvidence(directory);
+  const operationGate=inspectDurableProcessLock(directory,OPERATION_GATE);
+  const dispatchPermits=readdirSync(directory).filter(name=>name.startsWith(DISPATCH_PERMIT_PREFIX))
+    .sort().map(name=>{
+      const permitId=name.slice(DISPATCH_PERMIT_PREFIX.length,-'.lock'.length);
+      if(!name.endsWith('.lock')||!UUID.test(permitId)){
+        throw trustError('TRUST_RECOVERY_REQUIRED','Unrecognized trust dispatch permit evidence');
+      }
+      const permit=inspectDurableProcessLock(directory,name);
+      if(permit.present&&permit.owner?.kind!=='trust-dispatch-permit'){
+        throw trustError('TRUST_RECOVERY_REQUIRED','Trust dispatch permit kind is invalid');
+      }
+      return permit;
+    });
   const temporaryFiles=trustTempEvidence(directory);
   return Object.freeze({...snapshot,lockPresent:lock.present,
     lockStatus:lock.status,lockReason:lock.reason,lockDigest:lock.digest,
+    operationGatePresent:operationGate.present,operationGateStatus:operationGate.status,
+    operationGateDigest:operationGate.digest,
+    dispatchPermits:Object.freeze(dispatchPermits.map(item=>Object.freeze({name:item.name,
+      kind:item.owner?.kind,status:item.status,reason:item.reason,digest:item.digest}))),
     temporaryFiles:Object.freeze(temporaryFiles),
-    snapshotDigest:createHash('sha256').update(JSON.stringify({snapshot,temporaryFiles})).digest('hex')});
+    snapshotDigest:createHash('sha256').update(JSON.stringify({snapshot,temporaryFiles,
+      operationGatePresent:operationGate.present,operationGateStatus:operationGate.status,
+      operationGateDigest:operationGate.digest,dispatchPermits})).digest('hex')});
 }
 
 // Lock removal is only reachable through an explicit operator reconciliation.
@@ -408,8 +586,15 @@ export function releaseTrustWriterLockForReconciliation({directory,expectedRevis
     throw Error('Trust evidence changed during reconciliation');
   }
   const lock=trustLockEvidence(directory);
-  if(!lock.present)return false;
-  if(lock.status!=='dead')throw Error('Trust writer is active or unverified');
+  const operationGate=inspectDurableProcessLock(directory,OPERATION_GATE);
+  const permits=evidence.dispatchPermits;
+  if(lock.present&&lock.status!=='dead')throw Error('Trust writer is active or unverified');
+  if(operationGate.present&&operationGate.status!=='dead'){
+    throw Error('Trust operation gate is active or unverified');
+  }
+  if(permits.some(item=>item.status!=='dead')){
+    throw Error('Trust dispatch permit is active or unverified');
+  }
   for(const item of evidence.temporaryFiles){
     const filename=path.join(directory,item.name),current=lstatSync(filename);
     if(!current.isFile()||current.isSymbolicLink()||current.dev!==item.dev||
@@ -419,6 +604,14 @@ export function releaseTrustWriterLockForReconciliation({directory,expectedRevis
     }
     unlinkSync(filename);
   }
-  return removeDeadDurableProcessLock({directory,name:'.trusted-devices-writer.lock',
-    expectedDigest:lock.digest});
+  let removed=false;
+  if(lock.present)removed=removeDeadDurableProcessLock({directory,
+    name:'.trusted-devices-writer.lock',expectedDigest:lock.digest})||removed;
+  if(operationGate.present)removed=removeDeadDurableProcessLock({directory,
+    name:OPERATION_GATE,expectedDigest:operationGate.digest})||removed;
+  for(const permit of permits){
+    removed=removeDeadDurableProcessLock({directory,name:permit.name,
+      expectedDigest:permit.digest})||removed;
+  }
+  return removed;
 }

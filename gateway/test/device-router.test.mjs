@@ -146,6 +146,26 @@ test('pre-dispatch permit is acquired before transport handoff and released imme
   assert.deepEqual(await pending,{ok:true});
   s.router.close();
 });
+test('pre-dispatch permit remains held until an asynchronous transport completes handoff',async()=>{
+  const s=setup();let sent=0,released=0,finishHandoff,requestId;
+  s.router.attachTransport({deviceId:s.deviceId,sessionId:s.sessionId,send:frame=>{
+    requestId=frame.requestId;
+    sent++;return new Promise(resolve=>{finishHandoff=resolve;});
+  }});
+  const pending=s.router.callDevice({deviceId:s.deviceId,name:'write_file',arguments:{path:'/safe/new.txt'},
+    beforeDispatch:async()=>({authorization:{capability:'signed'},release:()=>{released++;}})});
+  pending.catch(()=>{});
+  await s.sleep(2);
+  assert.equal(sent,1);
+  assert.equal(released,0,'durable authorization remains fenced until transport handoff is complete');
+  finishHandoff();
+  await s.sleep(2);
+  assert.equal(released,1);
+  assert.equal(s.router.acceptResponse({deviceId:s.deviceId,sessionId:s.sessionId,
+    requestId,result:{written:true}}),true);
+  assert.deepEqual(await pending,{written:true});
+  s.router.close();
+});
 test('pre-dispatch denial never calls transport and does not retain an authorization permit',async()=>{
   const s=setup();let sent=0,released=0;
   s.router.attachTransport({deviceId:s.deviceId,sessionId:s.sessionId,send:()=>{sent++;}});
@@ -176,6 +196,26 @@ test('cancellation removes a queued task but stays ambiguous after agent receipt
   await assert.rejects(dispatched,errorCode('AMBIGUOUS_CANCELLED'));
   assert.equal(s.router.acceptResponse({deviceId:s.deviceId,sessionId:s.sessionId,
     requestId:received.requestId,result:{ok:true}}),false);
+  s.router.close();
+});
+test('authenticated cancellation acknowledgement is fenced to exact session, owner and request',async()=>{
+  const s=setup(),ownerDigest='b'.repeat(64),frames=[];
+  s.router.attachTransport({deviceId:s.deviceId,sessionId:s.sessionId,send:frame=>frames.push(frame)});
+  const pending=s.router.callDevice({deviceId:s.deviceId,name:'run_command',arguments:{},
+    beforeDispatch:async()=>({authorization:{approvalEventId:'d3911c43-4fc9-4cb8-a3d0-1bef1f04748a',
+      approvalTrustRevisionAfter:1,approvalTrustRevisionBefore:0,fingerprint:'a'.repeat(64),
+      ownerDigest,policyRevision:'1',trustRevision:1},release:()=>{}})});
+  const rejected=assert.rejects(pending,errorCode('AMBIGUOUS_CANCELLED'));
+  await s.sleep(2);
+  const frame=frames[0];assert.ok(frame);
+  const tuple={deviceId:s.deviceId,sessionId:s.sessionId,requestId:frame.requestId,
+    ownerDigest,status:'ambiguous'};
+  assert.equal(s.router.acceptCancellation({...tuple,ownerDigest:'c'.repeat(64)}),false);
+  assert.equal(s.router.acceptCancellation({...tuple,sessionId:'00000000-0000-4000-8000-000000000000'}),false);
+  assert.equal(s.router.acceptCancellation(tuple),true);
+  await rejected;
+  assert.equal(s.router.acceptResponse({deviceId:s.deviceId,sessionId:s.sessionId,
+    requestId:frame.requestId,result:{success:true}}),false);
   s.router.close();
 });
 test('send transport failure reports ambiguous outcome and does not retry',async()=>{

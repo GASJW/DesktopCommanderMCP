@@ -5,7 +5,7 @@ import { startLoopbackAgentPilot } from './loopback-pilot.mjs';
 // -> independent Ed25519 challenge/session/frame verification in inner pilot.
 // This DOES NOT configure Cloudflare or expose TLS/public hostname.
 const PATHS=new Set(['/agent/challenge','/agent/connect','/agent/heartbeat',
-  '/agent/poll','/agent/result','/agent/disconnect']);
+  '/agent/poll','/agent/result','/agent/cancel-ack','/agent/disconnect']);
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const BODY_MAX=256*1024;
 const RESULT_MAX=512*1024;
@@ -15,18 +15,23 @@ function send(res,status,json){
   res.end(JSON.stringify(json));
 }
 export async function startMachineIngressLoopback({
-  registry,router,verifyMachineToken,machineBindings,
+  registry,router,verifyMachineToken,machineBindings,machineBindingStore,getTrustRevision=()=>0,
+  shouldCancelOperation,
   enableTestIngress=false,host='127.0.0.1',port=0,
 }={}){
+  const durable=machineBindingStore&&typeof machineBindingStore.resolve==='function'&&
+    typeof machineBindingStore.revision==='function';
+  const legacy=machineBindings instanceof Map&&machineBindings.size>=1&&machineBindings.size<=32&&
+    Array.from(machineBindings).every(([c,d])=>typeof c==='string'&&c.length>=8&&c.length<=256&&
+      typeof d==='string'&&UUID.test(d));
   if(!enableTestIngress||host!=='127.0.0.1'||port!==0||
      !registry||!router||typeof verifyMachineToken!=='function'||
-     !(machineBindings instanceof Map)||machineBindings.size<1||machineBindings.size>32||
-     Array.from(machineBindings).some(([c,d])=>typeof c!=='string'||c.length<8||
-       c.length>256||typeof d!=='string'||!UUID.test(d))){
+     !(durable||legacy)||typeof getTrustRevision!=='function'){
     throw new TypeError('Machine ingress requires explicit loopback-only test configuration');
   }
-  const bound=new Map(machineBindings);
-  const inner=await startLoopbackAgentPilot({registry,router,enableLoopbackPilot:true});
+  const bound=legacy?new Map(machineBindings):null;
+  const inner=await startLoopbackAgentPilot({registry,router,shouldCancelOperation,
+    enableLoopbackPilot:true});
   const server=createServer(async(req,res)=>{
     if(!PATHS.has(req.url))return send(res,404,{error:'Not found'});
     if(req.method!=='POST')return send(res,405,{error:'Method not allowed'});
@@ -45,8 +50,23 @@ export async function startMachineIngressLoopback({
     if(!principal||typeof principal.clientId!=='string'){
       return send(res,401,{error:'Machine JWT invalid'});
     }
-    const deviceId=bound.get(principal.clientId);
+    let binding=null;
+    try{
+      if(durable)binding=machineBindingStore.resolve(principal.clientId);
+    }catch{return send(res,503,{error:'Machine binding unavailable'});}
+    const deviceId=durable?binding?.deviceId:bound.get(principal.clientId);
     if(!deviceId)return send(res,403,{error:'Machine not bound to trusted device'});
+    let trusted;
+    try{
+      const revision=getTrustRevision();
+      trusted=registry.snapshotTrustedDevices().find(device=>device.deviceId===deviceId);
+      if(!Number.isSafeInteger(revision)||revision<0||!trusted||
+         durable&&(binding.fingerprint!==trusted.fingerprint||
+           binding.trustRevisionAfter>revision||binding.trustRevision>revision)){
+        inner.invalidateDevice(deviceId);
+        return send(res,403,{error:'Machine binding does not match current device trust'});
+      }
+    }catch{inner.invalidateDevice(deviceId);return send(res,503,{error:'Device trust unavailable'});}
     let raw;
     try{
       const chunks=[];let total=0;
@@ -100,6 +120,7 @@ export async function startMachineIngressLoopback({
   }catch(e){await inner.close();throw e;}
   return Object.freeze({
     url:'http://127.0.0.1:'+server.address().port,
+    operationState:inner.operationState,
     close:async()=>{
       server.closeAllConnections();
       await new Promise(resolve=>server.close(resolve));

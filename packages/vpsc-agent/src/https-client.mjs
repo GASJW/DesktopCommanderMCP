@@ -5,7 +5,7 @@ import { signedAgentRequest } from './frame.mjs';
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CLIENT=/^[A-Za-z0-9_.-]{8,256}$/;
 const ROUTES=new Set(['/agent/challenge','/agent/connect','/agent/heartbeat',
-  '/agent/poll','/agent/result','/agent/disconnect']);
+  '/agent/poll','/agent/result','/agent/cancel-ack','/agent/disconnect']);
 const MAX_BYTES=256*1024;
 const MAX_RESPONSE=512*1024;
 const NONCE=/^[A-Za-z0-9_-]{43}$/;
@@ -47,6 +47,14 @@ export function createHttpsAgentClient({
      typeof fetchFn!=='function'||
      !Number.isSafeInteger(timeoutMs)||timeoutMs<1000||timeoutMs>60_000){
     throw fail('CONFIG','Invalid agent HTTPS identity or service token');
+  }
+  if(identity.legacyDeviceBinding){
+    throw fail('CONFIG','Legacy device binding lacks durable Owner machine-binding evidence; migrate it first');
+  }
+  if(identity.deviceBinding&&(
+     identity.deviceBinding.deviceId!==deviceId||identity.deviceBinding.clientId!==clientId||
+     identity.deviceBinding.fingerprint!==identity.fingerprint)){
+    throw fail('CONFIG','HTTPS client identity differs from its durable approval binding');
   }
   let sessionId=null,sequence=0,closed=false;
   function ambiguousResponse(){
@@ -136,11 +144,29 @@ export function createHttpsAgentClient({
   }
   async function poll(){
     const answer=await request('/agent/poll',{},true);
-    if(!exactKeys(answer,'frame')||!(answer.frame===null||
+    if(!exactKeys(answer,'frame')&& !exactKeys(answer,'cancel,frame'))return ambiguousResponse();
+    if(!(answer.frame===null||
        answer.frame&&typeof answer.frame==='object'&&!Array.isArray(answer.frame))){
       return ambiguousResponse();
     }
     return answer.frame;
+  }
+  async function pollControl(){
+    const answer=await request('/agent/poll',{},true);
+    if(!exactKeys(answer,'frame')&&!exactKeys(answer,'cancel,frame'))return ambiguousResponse();
+    if(!(answer.frame===null||answer.frame&&typeof answer.frame==='object'&&!Array.isArray(answer.frame))||
+       !(answer.cancel===undefined||answer.cancel===null||
+         answer.cancel&&typeof answer.cancel==='object'&&!Array.isArray(answer.cancel))){
+      return ambiguousResponse();
+    }
+    if(answer.cancel!==undefined&&answer.cancel!==null&&
+       (!exactKeys(answer.cancel,'deviceId,ownerDigest,requestId,sessionId,type,version')||
+        answer.cancel.version!==1||answer.cancel.type!=='cancel'||
+        answer.cancel.deviceId!==deviceId||answer.cancel.sessionId!==sessionId||
+        !UUID.test(answer.cancel.requestId??'')||!/^[a-f0-9]{64}$/.test(answer.cancel.ownerDigest??''))){
+      return ambiguousResponse();
+    }
+    return Object.freeze({frame:answer.frame,cancel:answer.cancel??null});
   }
   async function disconnect(){
     if(!sessionId)return Object.freeze({disconnected:false});
@@ -164,6 +190,18 @@ export function createHttpsAgentClient({
     if(!exactKeys(answer,'accepted')||answer.accepted!==true)return ambiguousResponse();
     return answer;
   };
+  async function cancelAck({requestId,ownerDigest,status}={}){
+    if(typeof requestId!=='string'||!UUID.test(requestId)||
+       !/^[a-f0-9]{64}$/.test(ownerDigest??'')||
+       !['cancelled','completed','ambiguous'].includes(status)){
+      throw fail('BAD_PAYLOAD','Invalid cancellation acknowledgement');
+    }
+    const answer=await request('/agent/cancel-ack',{requestId,ownerDigest,status},true);
+    if(!exactKeys(answer,'accepted,status')||answer.accepted!==true||answer.status!==status){
+      return ambiguousResponse();
+    }
+    return answer;
+  }
   function close(){closed=true;sessionId=null;}
-  return Object.freeze({connect,heartbeat,poll,result,disconnect,close});
+  return Object.freeze({connect,heartbeat,poll,pollControl,result,cancelAck,disconnect,close});
 }

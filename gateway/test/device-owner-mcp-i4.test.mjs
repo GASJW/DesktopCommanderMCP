@@ -44,8 +44,19 @@ async function setup(t,{authorizeDevice=()=>true,getTrustRevision=()=>7,grant=tr
     finally{permit.release();}
     return {content:[{type:'text',text:'ok'}]};
   }};
+  const deviceRegistry={listDevices:()=>[{deviceId:DEVICE}],isLiveSession:()=>true};
+  const trustStore={
+    acquireDispatchPermit:({expectedRevision})=>{
+      if(getTrustRevision()!==expectedRevision)throw Object.assign(Error('stale'),{code:'TRUST_CHANGED'});
+      return {trustRevision:expectedRevision,release:()=>true};
+    },
+    withCurrentSession:({expectedRevision},callback)=>{
+      if(getTrustRevision()!==expectedRevision)throw Object.assign(Error('stale'),{code:'TRUST_SESSION_STALE'});
+      return callback();
+    },
+  };
   const handler=createRemoteDeviceMcpHandler({accessVerifier,
-    deviceRegistry:{listDevices:()=>[{deviceId:DEVICE}],isLiveSession:()=>true},router,
+    deviceRegistry,trustStore,router,
     authorizeDevice,grantStore,policySigningKey:policyKeys.privateKey,getTrustRevision,
     getDeviceApprovalReceipt:()=>({eventId:APPROVAL_EVENT,deviceId:DEVICE,fingerprint:FINGERPRINT,
       trustRevisionBefore:6,trustRevisionAfter:7,trustRevision:7}),

@@ -93,6 +93,24 @@ test('reject weak configuration, missing token, unknown identity and unpinned ho
     {deviceId:'fake'}, {identity:null}, {timeoutMs:120_000}
   ])assert.throws(()=>createHttpsAgentClient(makeInvalid(override)),e=>e.code==='CONFIG');
 });
+test('durably approved identity cannot be routed as another device or Client-ID',()=>{
+  const raw=createEphemeralPairingIdentity();
+  const identity={...raw,deviceBinding:{deviceId:DEVICE,clientId:CLIENT,
+    fingerprint:raw.fingerprint,approvalEventId:'f1a2b3c4-d5e6-4a9f-8abc-1bb9b99c0003',
+    trustRevisionBefore:0,trustRevisionAfter:1,trustRevision:1}};
+  assert.throws(()=>createHttpsAgentClient(makeInvalid({identity,
+    deviceId:'f1a2b3c4-d5e6-4a9f-8abc-1bb9b99c0004'})),e=>e.code==='CONFIG');
+  assert.throws(()=>createHttpsAgentClient(makeInvalid({identity,clientId:'other-agent.access'})),
+    e=>e.code==='CONFIG');
+});
+test('legacy partial device binding cannot authorize HTTPS transport before v3 migration',()=>{
+  const identity=createEphemeralPairingIdentity();
+  const legacyDeviceBinding={deviceId:DEVICE,clientId:CLIENT,fingerprint:identity.fingerprint,
+    approvalEventId:'f1a2b3c4-d5e6-4a9f-8abc-1bb9b99c0003',trustRevisionBefore:0,
+    trustRevisionAfter:1,trustRevision:1};
+  assert.throws(()=>createHttpsAgentClient(makeInvalid({identity:{...identity,
+    deviceBinding:null,legacyDeviceBinding}})),error=>error.code==='CONFIG');
+});
 test('HTTPS agent sends Service Token headers to edge and signs device frames',async()=>{
   const x=await harness();
   try{

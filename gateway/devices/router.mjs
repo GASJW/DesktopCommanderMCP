@@ -43,7 +43,9 @@ export function createDeviceRouter({
       channel.pending.delete(id);
       clearTimeout(item.timer);
       item.signal?.removeEventListener('abort',item.onAbort);
-      item.reject(error);
+      let removed=false;
+      try{removed=channel.cancel?.(id)===true;}catch{}
+      item.reject(removed?fail('CANCELLED','Operation was removed before agent delivery'):error);
     }
   };
   function attachTransport({deviceId, sessionId, send, cancel} = {}) {
@@ -113,7 +115,8 @@ export function createDeviceRouter({
     if (channel.pending.size >= maxPendingPerDevice) throw fail('BUSY', 'Device busy');
     if(channel.pending.has(requestId))throw fail('DUPLICATE_REQUEST','Execution request is already pending');
     return new Promise((resolve,reject) => {
-      const item={timer:null,resolve,reject,signal,dispatched:false,onAbort:null};
+      const item={timer:null,resolve,reject,signal,dispatched:false,delivered:false,onAbort:null,
+        authorizationOwnerDigest:authorization?.ownerDigest};
       const finish=(error)=>{
         if(!channel.pending.delete(requestId))return false;
         clearTimeout(item.timer);signal?.removeEventListener('abort',item.onAbort);
@@ -165,15 +168,17 @@ export function createDeviceRouter({
               'Device unavailable before transport handoff');
           }
           const boundAuthorization=permit?.authorization??authorization;
+          item.authorizationOwnerDigest=boundAuthorization?.claims?.ownerDigest??
+            boundAuthorization?.ownerDigest??authorization?.ownerDigest;
           const frame=Object.freeze(copy({version:1,deviceId,sessionId:channel.sessionId,requestId,
             method:'tools/call',params,...(boundAuthorization?{authorization:boundAuthorization}:{})},maxRequestBytes));
           item.dispatched=true;
-          let sendResult;
-          try{sendResult=channel.send(frame);}
-          finally{
+          try{
+            await channel.send(frame);
+            item.delivered=true;
+          }finally{
             if(permit){const release=permit.release;permit=undefined;release();}
           }
-          await sendResult;
         }catch(error){
           if(permit){
             try{permit.release();}catch{}
@@ -195,6 +200,7 @@ export function createDeviceRouter({
     if (stopped || !channel || channel.sessionId !== sessionId ||
         !registry.isLiveSession(deviceId, sessionId) || typeof requestId !== 'string' ||
         !UUID.test(requestId) || !channel.pending.has(requestId)) return false;
+    if(!channel.pending.get(requestId)?.delivered)return false;
     let payload;
     try { payload = copy(result,maxResponseBytes); } catch {
       const item=channel.pending.get(requestId);
@@ -210,6 +216,39 @@ export function createDeviceRouter({
     item.resolve(payload);
     return true;
   }
+  // Only the authenticated transport may report the terminal state of a
+  // cancellation control previously issued for this exact live request.
+  function acceptCancellation({deviceId,sessionId,requestId,ownerDigest,status}={}){
+    const channel=active.get(deviceId);
+    if(stopped||!channel||channel.sessionId!==sessionId||
+       !registry.isLiveSession(deviceId,sessionId)||!UUID.test(requestId??'')||
+       !DIGEST.test(ownerDigest??'')||!['cancelled','completed','ambiguous'].includes(status))return false;
+    const item=channel.pending.get(requestId);
+    if(!item||!item.delivered||item.authorizationOwnerDigest!==ownerDigest)return false;
+    channel.pending.delete(requestId);clearTimeout(item.timer);
+    item.signal?.removeEventListener('abort',item.onAbort);
+    item.reject(status==='cancelled'
+      ?fail('CANCELLED','Agent confirmed cancellation before execution')
+      :fail('AMBIGUOUS_CANCELLED',status==='completed'
+        ?'Operation completed before cancellation; no rollback was performed'
+        :'Cancellation outcome is ambiguous; do not replay'));
+    return true;
+  }
+  // Policy invalidation while a frame is still queued is a known no-effect
+  // cancellation. This is separate from post-delivery cancellation, which is
+  // always ambiguous until the authenticated agent reports its outcome.
+  function rejectBeforeDelivery({deviceId,sessionId,requestId}={}){
+    const channel=active.get(deviceId),item=channel?.pending.get(requestId);
+    if(stopped||!channel||channel.sessionId!==sessionId||!item||item.delivered||
+       !registry.isLiveSession(deviceId,sessionId))return false;
+    let removed=false;
+    try{removed=channel.cancel?.(requestId)===true;}catch{}
+    if(!removed)return false;
+    channel.pending.delete(requestId);clearTimeout(item.timer);
+    item.signal?.removeEventListener('abort',item.onAbort);
+    item.reject(fail('AUTHORIZATION_REVOKED','Authorization changed before agent delivery'));
+    return true;
+  }
   function detachTransport({deviceId,sessionId} = {}) {
     const channel=active.get(deviceId);
     if (!channel || channel.sessionId !== sessionId) return false;
@@ -223,5 +262,6 @@ export function createDeviceRouter({
     for (const channel of active.values()) endPending(channel,fail('CLOSED','Router closed'));
     active.clear();
   }
-  return Object.freeze({attachTransport,callDevice,acceptResponse,detachTransport,close});
+  return Object.freeze({attachTransport,callDevice,acceptResponse,acceptCancellation,rejectBeforeDelivery,
+    detachTransport,close});
 }

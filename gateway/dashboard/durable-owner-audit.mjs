@@ -13,14 +13,25 @@ const LOG = 'owner-decisions-v1.jsonl';
 const LOCK = '.owner-decisions-writer.lock';
 const DOMAIN_V1 = 'VPSC-G7-OWNER-DECISION-AUDIT-v1\n';
 const DOMAIN_V2 = 'VPSC-G7-OWNER-DECISION-AUDIT-v2\n';
+const DOMAIN_V3 = 'VPSC-G7-OWNER-DECISION-AUDIT-v3\n';
 const MAX_BYTES = 4 * 1024 * 1024;
-const MAX_LINE = 1024;
+const MAX_LINE = 2048;
 const HEX24 = /^[a-f0-9]{24}$/;
+const HEX64 = /^[a-f0-9]{64}$/;
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 const EXACT_INTENT = 'at,event,eventId,operation,ownerId,phase,targetId,version';
 const EXACT_OUTCOME = 'at,event,eventId,operation,outcome,ownerId,phase,targetId,version';
 const EXACT_INTENT_V2 = 'at,event,eventId,fingerprint,operation,ownerId,phase,requestId,trustRevisionBefore,version';
 const EXACT_OUTCOME_V2 = 'at,deviceId,event,eventId,fingerprint,operation,outcome,ownerId,phase,requestId,trustRevisionAfter,trustRevisionBefore,version';
+const EXACT_INTENT_V3 = 'approvalEventId,at,bindingRevisionBefore,clientId,deviceId,event,eventId,fingerprint,operation,ownerDigest,ownerId,phase,trustRevision,trustRevisionAfter,trustRevisionBefore,version';
+const EXACT_OUTCOME_V3 = 'approvalEventId,at,bindingRevisionAfter,bindingRevisionBefore,clientId,deviceId,event,eventId,fingerprint,operation,outcome,ownerDigest,ownerId,phase,trustRevision,trustRevisionAfter,trustRevisionBefore,version';
+const MACHINE_CLIENT = /^[A-Za-z0-9_.-]{8,256}$/;
+
+function validTimestamp(at) {
+  return typeof at==='string'&&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(at)&&
+    Number.isFinite(Date.parse(at))&&new Date(at).toISOString()===at;
+}
 
 function privateDirectory(directory,{create=true}={}) {
   if (process.platform === 'win32' || typeof process.getuid !== 'function') {
@@ -92,7 +103,7 @@ function canonicalEvent(e) {
     throw new TypeError('Invalid pairing audit event');
   }
   const keys=Object.keys(e).sort().join(',');
-  if(e.version===1){
+  if(e.event==='g7_owner_pairing'&&e.version===1){
     if(keys!==(e.phase==='intent'?EXACT_INTENT:EXACT_OUTCOME)||
        e.event!=='g7_owner_pairing'||!UUID.test(e.eventId)||!HEX24.test(e.ownerId)||
        !HEX24.test(e.targetId)||!['approve','reject'].includes(e.operation)||
@@ -100,17 +111,44 @@ function canonicalEvent(e) {
        (e.phase==='outcome'&&!['accepted','denied'].includes(e.outcome))){
       throw new TypeError('Invalid pairing audit event');
     }
-    if(typeof e.at!=='string'||
-       !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(e.at)||
-       !Number.isFinite(Date.parse(e.at))||new Date(e.at).toISOString()!==e.at){
+    if(!validTimestamp(e.at)){
       throw new TypeError('Invalid pairing audit event');
     }
     return {event:'g7_owner_pairing',version:1,at:e.at,eventId:e.eventId.toLowerCase(),
       operation:e.operation,ownerId:e.ownerId,targetId:e.targetId,phase:e.phase,
       ...(e.phase==='outcome'?{outcome:e.outcome}:{})};
   }
-  if(e.version!==2||keys!==(e.phase==='intent'?EXACT_INTENT_V2:EXACT_OUTCOME_V2)||
-     e.event!=='g7_owner_pairing'||!UUID.test(e.eventId)||!HEX24.test(e.ownerId)||
+  if(e.event==='g7_owner_machine_binding'&&e.version===3){
+    if(keys!==(e.phase==='intent'?EXACT_INTENT_V3:EXACT_OUTCOME_V3)||
+       !UUID.test(e.eventId??'')||e.operation!=='bind'||!HEX24.test(e.ownerId??'')||
+       !HEX64.test(e.ownerDigest??'')||!MACHINE_CLIENT.test(e.clientId??'')||
+       !UUID.test(e.deviceId??'')||!HEX64.test(e.fingerprint??'')||
+       !UUID.test(e.approvalEventId??'')||
+       !Number.isSafeInteger(e.trustRevisionBefore)||e.trustRevisionBefore<0||
+       !Number.isSafeInteger(e.trustRevisionAfter)||
+       e.trustRevisionAfter!==e.trustRevisionBefore+1||
+       !Number.isSafeInteger(e.trustRevision)||e.trustRevision<e.trustRevisionAfter||
+       !Number.isSafeInteger(e.bindingRevisionBefore)||e.bindingRevisionBefore<0||
+       !['intent','outcome'].includes(e.phase)||
+       (e.phase==='outcome'&&(e.outcome!=='accepted'||
+         !Number.isSafeInteger(e.bindingRevisionAfter)||
+         e.bindingRevisionAfter!==e.bindingRevisionBefore+1))||
+       !validTimestamp(e.at)){
+      throw new TypeError('Invalid machine binding audit event');
+    }
+    const base={event:'g7_owner_machine_binding',version:3,at:e.at,
+      eventId:e.eventId.toLowerCase(),operation:'bind',ownerId:e.ownerId,
+      ownerDigest:e.ownerDigest,clientId:e.clientId,deviceId:e.deviceId.toLowerCase(),
+      fingerprint:e.fingerprint,approvalEventId:e.approvalEventId.toLowerCase(),
+      trustRevisionBefore:e.trustRevisionBefore,trustRevisionAfter:e.trustRevisionAfter,
+      trustRevision:e.trustRevision,bindingRevisionBefore:e.bindingRevisionBefore,
+      phase:e.phase};
+    return e.phase==='intent'?base:{...base,outcome:e.outcome,
+      bindingRevisionAfter:e.bindingRevisionAfter};
+  }
+  if(e.event!=='g7_owner_pairing'||e.version!==2||
+     keys!==(e.phase==='intent'?EXACT_INTENT_V2:EXACT_OUTCOME_V2)||
+     !UUID.test(e.eventId)||!HEX24.test(e.ownerId)||
      !UUID.test(e.requestId)||!/^[a-f0-9]{64}$/.test(e.fingerprint)||
      !Number.isSafeInteger(e.trustRevisionBefore)||e.trustRevisionBefore<0||
      !['approve','reject'].includes(e.operation)||!['intent','outcome'].includes(e.phase)||
@@ -127,9 +165,7 @@ function canonicalEvent(e) {
       throw new TypeError('Invalid pairing audit revision outcome');
     }
   }
-  if(typeof e.at!=='string'||
-     !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(e.at)||
-     !Number.isFinite(Date.parse(e.at))||new Date(e.at).toISOString()!==e.at){
+  if(!validTimestamp(e.at)){
     throw new TypeError('Invalid pairing audit event');
   }
   if(e.phase==='intent')return {event:'g7_owner_pairing',version:2,at:e.at,
@@ -144,7 +180,8 @@ function canonicalEvent(e) {
 }
 function digest(seq, previous, event,version=event.version) {
   return createHash('sha256')
-    .update(version===1?DOMAIN_V1:DOMAIN_V2).update(JSON.stringify({ seq, previous, event }))
+    .update(version===1?DOMAIN_V1:version===2?DOMAIN_V2:DOMAIN_V3)
+    .update(JSON.stringify({ seq, previous, event }))
     .digest('hex');
 }
 function advance(state, event) {
@@ -155,11 +192,22 @@ function advance(state, event) {
     state.pending.set(event.eventId, event);
   } else {
     const prior = state.pending.get(event.eventId);
-    const sameDecision=prior&&prior.version===event.version&&prior.ownerId===event.ownerId&&
-      prior.operation===event.operation&&
-      (event.version===1?prior.targetId===event.targetId:
+    let sameDecision=prior&&prior.version===event.version&&prior.event===event.event&&
+      prior.ownerId===event.ownerId&&prior.operation===event.operation;
+    if(sameDecision&&event.event==='g7_owner_pairing'){
+      sameDecision=event.version===1?prior.targetId===event.targetId:
         prior.requestId===event.requestId&&prior.fingerprint===event.fingerprint&&
-        prior.trustRevisionBefore===event.trustRevisionBefore);
+        prior.trustRevisionBefore===event.trustRevisionBefore;
+    }else if(sameDecision&&event.event==='g7_owner_machine_binding'){
+      sameDecision=prior.ownerDigest===event.ownerDigest&&prior.clientId===event.clientId&&
+        prior.deviceId===event.deviceId&&prior.fingerprint===event.fingerprint&&
+        prior.approvalEventId===event.approvalEventId&&
+        prior.trustRevisionBefore===event.trustRevisionBefore&&
+        prior.trustRevisionAfter===event.trustRevisionAfter&&
+        prior.trustRevision===event.trustRevision&&
+        prior.bindingRevisionBefore===event.bindingRevisionBefore&&
+        event.bindingRevisionAfter===event.bindingRevisionBefore+1;
+    }
     if (!sameDecision) {
       throw new Error('Pairing audit outcome without matching intent');
     }
@@ -190,7 +238,7 @@ function replay(bytes) {
     try { record = JSON.parse(line); } catch { throw new Error('Corrupt audit WAL JSON'); }
     if (!record || Array.isArray(record) ||
         Object.keys(record).sort().join(',') !== 'event,hash,previous,seq,version' ||
-        ![1,2].includes(record.version) || !Number.isSafeInteger(record.seq) ||
+        ![1,2,3].includes(record.version) || !Number.isSafeInteger(record.seq) ||
         record.seq !== state.seq + 1 || record.previous !== state.hash ||
         typeof record.hash !== 'string' || !/^[a-f0-9]{64}$/.test(record.hash)) {
       throw new Error('Invalid audit WAL sequence or header');
@@ -327,6 +375,44 @@ export function inspectDurableOwnerAudit({directory}={}){
     events:Object.freeze(state.events.slice()),
     pending:Object.freeze(Array.from(state.pending.values())),lockPresent:lock.present,
     lockStatus:lock.status,lockReason:lock.reason,lockDigest:lock.digest});
+}
+
+// Read a binding decision only after replay has validated the complete WAL
+// schema, hash chain, and exact intent/outcome pairing. A missing outcome is
+// surfaced as pending evidence and is never inferred from the binding store.
+export function readDurableOwnerMachineBindingDecision({directory,eventId}={}){
+  if(!UUID.test(eventId??''))throw new TypeError('Machine binding eventId must be a UUID');
+  const evidence=inspectDurableOwnerAudit({directory});
+  const events=evidence.events.filter(event=>event.event==='g7_owner_machine_binding'&&
+    event.eventId===eventId.toLowerCase());
+  const intent=events.find(event=>event.phase==='intent');
+  const outcome=events.find(event=>event.phase==='outcome');
+  if(!intent)return Object.freeze({state:'NOT_FOUND',eventId:eventId.toLowerCase()});
+  return Object.freeze({state:outcome?'COMPLETE':'PENDING',eventId:intent.eventId,
+    intent,outcome:outcome??null});
+}
+
+// Enumerate every validated binding transition so the machine binding snapshot
+// cannot silently roll back to revision zero if the independent snapshot file
+// is lost or replaced. A decision is usable only when its complete WAL chain
+// and exact intent/outcome pair have already passed replay validation.
+export function readDurableOwnerMachineBindingHistory({directory}={}){
+  const evidence=inspectDurableOwnerAudit({directory});
+  const intents=new Map(),outcomes=new Map();
+  for(const event of evidence.events){
+    if(event.event!=='g7_owner_machine_binding'||event.version!==3)continue;
+    const target=event.phase==='intent'?intents:outcomes;
+    if(target.has(event.eventId))throw Error('Duplicate machine binding decision in Owner audit');
+    target.set(event.eventId,event);
+  }
+  const completed=[],pending=[];
+  for(const [eventId,intent] of intents){
+    const outcome=outcomes.get(eventId);
+    (outcome?completed:pending).push(Object.freeze({state:outcome?'COMPLETE':'PENDING',
+      eventId,intent,outcome:outcome??null}));
+  }
+  if(outcomes.size!==completed.length)throw Error('Machine binding audit outcome has no intent');
+  return Object.freeze({completed:Object.freeze(completed),pending:Object.freeze(pending)});
 }
 
 // The recovery coordinator calls this only after obtaining its own exclusive

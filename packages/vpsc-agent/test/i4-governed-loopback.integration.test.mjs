@@ -45,7 +45,7 @@ test('I4 signed agent loopback routes common governed operations through the own
   writeFileSync(largeFile,largeContent);
   const identityFingerprint=identity.fingerprint;
   const ownerDigest=createHash('sha256').update('VPSC-I4-OWNER-v1\n')
-    .update(JSON.stringify(['https://i4-loopback-owner.invalid','owner-i4'])).digest('hex');
+    .update(JSON.stringify(['https://i4-loopback-owner.cloudflareaccess.com','owner-i4'])).digest('hex');
   const grantStore=createDurableToolGrantStore({directory:policyDirectory});
   const policyKeys=generateKeyPairSync('ed25519');
   const grantIds={};let policyRevision=0;
@@ -65,11 +65,25 @@ test('I4 signed agent loopback routes common governed operations through the own
   const executor=createGovernedAgentExecutor({allowedRoot:root,
     entrypoint:process.env.VPSC_TEST_REAL_MCP_ENTRY??FIXTURE,ledgerDirectory:state,
     gatewayPolicyPublicKey:policyKeys.publicKey,deviceId,fingerprint:identityFingerprint});
+  const trustStore={
+    acquireDispatchPermit:({deviceId:target,sessionId,expectedRevision})=>{
+      if(expectedRevision!==1||!registry.isLiveSession(target,sessionId)){
+        throw Object.assign(Error('Trust session unavailable'),{code:'TRUST_SESSION_STALE'});
+      }
+      return {trustRevision:1,release:()=>true};
+    },
+    withCurrentSession:({deviceId:target,sessionId,expectedRevision},callback)=>{
+      if(expectedRevision!==1||!registry.isLiveSession(target,sessionId)){
+        throw Object.assign(Error('Trust session unavailable'),{code:'TRUST_SESSION_STALE'});
+      }
+      return callback();
+    },
+  };
   const ownerServer=createServer(createRemoteDeviceMcpHandler({
     accessVerifier:{verifyPrincipal:async token=>{
       if(token!=='synthetic-owner-jwt')throw Error('owner authentication failed');
-      return {issuer:'https://i4-loopback-owner.invalid',subject:'owner-i4'};
-    }},deviceRegistry:registry,router,
+      return {issuer:'https://i4-loopback-owner.cloudflareaccess.com',subject:'owner-i4'};
+    }},deviceRegistry:registry,trustStore,router,
     authorizeDevice:async(owner,id)=>owner.subject==='owner-i4'&&id===deviceId,
     grantStore,policySigningKey:policyKeys.privateKey,
     getDeviceApprovalReceipt:()=>({eventId:approvalEventId,deviceId,fingerprint:identity.fingerprint,

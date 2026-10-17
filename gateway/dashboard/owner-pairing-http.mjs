@@ -1,5 +1,7 @@
-import { createHmac, createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createOwnerPairingReview } from './owner-pairing-review.mjs';
+import { isOwnerPrincipal, ownerPrincipalId } from './owner-identity.mjs';
+export { ownerPrincipalId } from './owner-identity.mjs';
 
 // Inert HTTP owner approval boundary: NOT imported by Gateway server.
 // Requires real Cloudflare owner JWT verifier + a synchronous durable audit
@@ -25,17 +27,8 @@ function response(res,status,body,methods){
   res.writeHead(status,headers);
   res.end(JSON.stringify(body));
 }
-const digest=value=>createHash('sha256').update(value).digest('hex').slice(0,24);
 function validOwner(value){
-  return value && typeof value.issuer==='string' &&
-    /^https:\/\/[a-z0-9-]+\.cloudflareaccess\.com$/.test(value.issuer) &&
-    typeof value.subject==='string' && value.subject.length>0 && value.subject.length<=1024;
-}
-// Stable privacy-preserving identity used to bind durable approval outcomes
-// to the verified owner principal without persisting an email address.
-export function ownerPrincipalId(owner){
-  if(!validOwner(owner))throw new TypeError('Verified owner principal required');
-  return digest(owner.issuer+'\0'+owner.subject);
+  return isOwnerPrincipal(value);
 }
 export function createOwnerPairingHttp({
   coordinator,accessVerifier,expectedOrigin,auditWrite,now=Date.now,
