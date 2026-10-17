@@ -1,0 +1,110 @@
+#!/usr/bin/env node
+import path from 'node:path';
+import { request as httpsRequest } from 'node:https';
+import { createHttpsAgentClient } from '../src/https-client.mjs';
+import { loadOrCreateDeviceIdentity } from '../src/identity-store.mjs';
+import { createGovernedAgentExecutor } from '../src/governed-executor.mjs';
+import { createAgentWorker } from '../src/worker.mjs';
+import { readPrivateStagingFile } from '../../../gateway/staging/private-file.mjs';
+
+const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+function safeFile(filename,{privateOnly=true}={}){
+  return readPrivateStagingFile(filename,{privateOnly});
+}
+function parseConfig(filename){
+  if(process.platform!=='linux'||typeof process.getuid!=='function'||process.getuid()===0)throw Error();
+  const value=JSON.parse(readPrivateStagingFile(filename).toString('utf8'));
+  const keys='allowedRoot,deviceId,hostname,identityDirectory,ledgerDirectory,mcpEntrypoint,port,policyPublicKeyPem,version,clientId,clientSecret,caPath,pollIntervalMs';
+  if(!value||typeof value!=='object'||Array.isArray(value)||Object.getPrototypeOf(value)!==Object.prototype||
+     Object.keys(value).sort().join(',')!==keys.split(',').sort().join(',')||value.version!==1||
+     !UUID.test(value.deviceId??'')||typeof value.hostname!=='string'||
+     !/^[a-z0-9.-]{6,255}$/.test(value.hostname)||!value.hostname.includes('.')||
+     value.hostname==='localhost'||value.hostname.endsWith('.local')||
+     !Number.isSafeInteger(value.port)||value.port<1||value.port>65535||
+     typeof value.clientId!=='string'||!/^[A-Za-z0-9_.-]{8,256}$/.test(value.clientId)||
+     typeof value.clientSecret!=='string'||value.clientSecret.length<24||/[\r\n\0]/.test(value.clientSecret)||
+     ![value.allowedRoot,value.identityDirectory,value.ledgerDirectory,value.mcpEntrypoint,value.caPath]
+       .every(item=>typeof item==='string'&&path.isAbsolute(item)&&path.normalize(item)===item)||
+     typeof value.policyPublicKeyPem!=='string'||
+     !Number.isSafeInteger(value.pollIntervalMs)||value.pollIntervalMs<25||value.pollIntervalMs>5000)throw Error();
+  value.ca=safeFile(value.caPath,{privateOnly:false});
+  return value;
+}
+function stagingFetch(config){
+  return (input,options)=>new Promise((resolve,reject)=>{
+    const url=new URL(input);
+    if(url.protocol!=='https:'||url.hostname!==config.hostname||url.port||url.pathname==='/'||
+       options.redirect!=='error'||options.credentials!=='omit'||options.cache!=='no-store'){
+      reject(Error('staging destination denied'));return;
+    }
+    const headers={...options.headers,host:config.hostname};
+    const request=httpsRequest({hostname:'127.0.0.1',port:config.port,servername:config.hostname,
+      method:options.method,path:url.pathname,headers,ca:config.ca,rejectUnauthorized:true},response=>{
+      const chunks=[];let size=0;
+      response.on('data',chunk=>{size+=chunk.length;if(size>512*1024){request.destroy(Error('response limit'));return;}chunks.push(chunk);});
+      response.on('end',()=>resolve(new Response(Buffer.concat(chunks,size),{
+        status:response.statusCode,headers:response.headers,
+      })));
+    });
+    const abort=()=>request.destroy(Error('staging request aborted'));
+    if(options.signal?.aborted)abort();
+    else options.signal?.addEventListener('abort',abort,{once:true});
+    request.once('error',reject);
+    request.once('close',()=>options.signal?.removeEventListener('abort',abort));
+    request.end(options.body);
+  });
+}
+
+let active;
+let stopping=false;
+async function stop(signal){
+  if(stopping)return;
+  stopping=true;
+  active?.controller.abort();
+  try{await active?.done;}
+  catch(error){process.stderr.write(JSON.stringify({event:'WORKER_STOPPED',signal,
+    code:/^[A-Z_]{1,48}$/.test(error?.code??'')?error.code:'WORKER_ERROR'})+'\n');}
+}
+try{
+  if(process.argv.length!==4||process.argv[2]!=='--config')throw Error();
+  const config=parseConfig(process.argv[3]);
+  const identity=loadOrCreateDeviceIdentity({directory:config.identityDirectory,platform:process.platform});
+  if(!identity.deviceBinding||identity.deviceBinding.deviceId!==config.deviceId||
+     identity.deviceBinding.clientId!==config.clientId||identity.deviceBinding.fingerprint!==identity.fingerprint)
+    throw Error();
+  const client=createHttpsAgentClient({gatewayUrl:`https://${config.hostname}/`,
+    expectedHostname:config.hostname,identity,deviceId:config.deviceId,clientId:config.clientId,
+    clientSecret:config.clientSecret,fetchFn:stagingFetch(config)});
+  let connected=false,online=false;
+  const observedClient={
+    connect:async()=>{const session=await client.connect();connected=true;
+      process.stdout.write(JSON.stringify({event:'READY',deviceId:config.deviceId,pid:process.pid})+'\n');return session;},
+    heartbeat:async(...args)=>{const value=await client.heartbeat(...args);
+      if(!online){online=true;process.stdout.write(JSON.stringify({event:'ONLINE',deviceId:config.deviceId})+'\n');}
+      return value;},poll:(...args)=>client.poll(...args),
+    pollControl:(...args)=>client.pollControl(...args),result:(...args)=>client.result(...args),
+    cancelAck:(...args)=>client.cancelAck(...args),disconnect:(...args)=>client.disconnect(...args),
+    close:(...args)=>client.close(...args),
+  };
+  const executor=createGovernedAgentExecutor({allowedRoot:config.allowedRoot,
+    entrypoint:config.mcpEntrypoint,ledgerDirectory:config.ledgerDirectory,
+    deviceId:config.deviceId,fingerprint:identity.fingerprint,
+    gatewayPolicyPublicKey:config.policyPublicKeyPem});
+  const worker=createAgentWorker({deviceId:config.deviceId,client:observedClient,executor,
+    pollIntervalMs:config.pollIntervalMs});
+  const controller=new AbortController();
+  const done=worker.run({signal:controller.signal});
+  active={controller,done};
+  done.then(result=>{
+    if(result?.status==='stopped')process.stdout.write(JSON.stringify({event:'STOPPED',connected})+'\n');
+  },error=>{
+    process.stderr.write(JSON.stringify({event:'WORKER_FAILED',
+      code:/^[A-Z_]{1,48}$/.test(error?.code??'')?error.code:'WORKER_ERROR'})+'\n');
+    process.exitCode=1;
+  });
+  process.once('SIGTERM',()=>void stop('SIGTERM'));
+  process.once('SIGINT',()=>void stop('SIGINT'));
+}catch{
+  process.stderr.write(JSON.stringify({event:'STARTUP_FAILED',code:'CONFIG_OR_IDENTITY'})+'\n');
+  process.exitCode=1;
+}
