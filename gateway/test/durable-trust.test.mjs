@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { generateKeyPairSync, sign } from 'node:crypto';
+import { createHash, createPublicKey, generateKeyPairSync, randomUUID, sign } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
@@ -17,6 +17,59 @@ const generate=()=>{
     sign:challenge=>sign(null,challenge,privateKey).toString('base64url') };
 };
 const metadata=(key,name='Gui-PC')=>({name,platform:'win32',publicKeyPem:key.publicKeyPem});
+function runTrustRace(directory,jobs){
+  return new Promise((resolve,reject)=>{
+    const source=`
+      import {createDurableDeviceTrustStore} from './gateway/devices/durable-trust.mjs';
+      const [directory,operation,deviceId,name,publicKeyPem,eventId,requestId,fingerprint]=process.argv.slice(1);
+      const store=createDurableDeviceTrustStore({directory});
+      process.stdout.write('READY\\n');
+      process.stdin.once('data',()=>{
+        try{
+          if(operation==='approve')store.trustDevice({name,platform:'linux',publicKeyPem},
+            {expectedRevision:store.revision(),decision:{eventId,requestId,fingerprint}});
+          else store.revokeDevice(deviceId);
+          process.stdout.write('RESULT:OK\\n');
+        }catch{process.stdout.write('RESULT:ERR\\n');}
+        process.stdin.destroy();
+      });
+    `;
+    const children=jobs.map(job=>spawn(process.execPath,
+      ['--input-type=module','-e',source,directory,job.operation,job.deviceId??'',
+        job.name??'',job.publicKeyPem??'',job.eventId??'',job.requestId??'',job.fingerprint??''],
+      {cwd:process.cwd()}));
+    const output=children.map(()=> '');
+    const ready=children.map(()=> false);
+    let exited=0,finished=false;
+    const timer=setTimeout(()=>{
+      if(finished)return;
+      for(const child of children)child.kill('SIGKILL');
+      finished=true;reject(Error(`trust race timed out: ${output.join(' | ')}`));
+    },10_000);
+    const maybeStart=()=>{
+      if(ready.every(Boolean))for(const child of children)child.stdin.write('go\n');
+    };
+    children.forEach((child,index)=>{
+      child.stdout.setEncoding('utf8');child.stderr.setEncoding('utf8');
+      child.stdout.on('data',chunk=>{
+        output[index]+=chunk;
+        if(!ready[index]&&output[index].includes('READY\n')){ready[index]=true;maybeStart();}
+      });
+      child.on('error',error=>{if(!finished){finished=true;clearTimeout(timer);reject(error);}});
+      child.on('exit',(code,signal)=>{
+        if(code!==0&&!finished){finished=true;clearTimeout(timer);
+          reject(Error(`trust race child failed: ${code??signal}; ${output[index]}`));return;}
+        exited++;
+        if(exited===children.length&&!finished){
+          finished=true;clearTimeout(timer);
+          const results=output.map(text=>text.match(/RESULT:(OK|ERR)\n/)?.[1]);
+          if(results.some(result=>!result))reject(Error(`missing trust race result: ${output.join(' | ')}`));
+          else resolve(results);
+        }
+      });
+    });
+  });
+}
 async function tempProcess(testFn){
   const parent=mkdtempSync(path.join(os.tmpdir(),'vpsc-g7-crash-'));
   const directory=path.join(parent,'server');
@@ -51,6 +104,43 @@ test('trust records persist deviceId and public fingerprint across server restar
     assert.equal(another.registry.snapshotTrustedDevices()[0].fingerprint,trusted.fingerprint);
   });
 });
+test('owner trust transition atomically stores the audit event binding and revision pair',()=>{
+  temp(dir=>{
+    const store=createDurableDeviceTrustStore({directory:dir});
+    const key=generate();
+    const fingerprint=createHash('sha256').update(createPublicKey(key.publicKeyPem)
+      .export({type:'spki',format:'der'})).digest('hex');
+    const decision={eventId:randomUUID(),requestId:randomUUID(),fingerprint};
+    const trusted=store.trustDevice(metadata(key),{expectedRevision:0,decision});
+    const snapshot=JSON.parse(readFileSync(file(dir),'utf8'));
+    assert.equal(snapshot.version,2);
+    assert.equal(snapshot.revision,1);
+    assert.deepEqual(snapshot.transitions,[{
+      eventId:decision.eventId,requestId:decision.requestId,fingerprint,
+      deviceId:trusted.deviceId,operation:'approve',previousRevision:0,revision:1,
+    }]);
+  });
+});
+test('eventId and requestId cannot authorize a second trust transition after restart',()=>{
+  temp(dir=>{
+    const first=createDurableDeviceTrustStore({directory:dir});
+    const eventId=randomUUID(),requestId=randomUUID();
+    const key=generate();
+    const fingerprint=createHash('sha256').update(createPublicKey(key.publicKeyPem)
+      .export({type:'spki',format:'der'})).digest('hex');
+    first.trustDevice(metadata(key),{expectedRevision:0,decision:{eventId,requestId,fingerprint}});
+    const restarted=createDurableDeviceTrustStore({directory:dir});
+    const different=generate();
+    const otherFingerprint=createHash('sha256').update(createPublicKey(different.publicKeyPem)
+      .export({type:'spki',format:'der'})).digest('hex');
+    assert.throws(()=>restarted.trustDevice(metadata(different),{expectedRevision:1,
+      decision:{eventId,requestId:randomUUID(),fingerprint:otherFingerprint}}),/already applied/);
+    assert.throws(()=>restarted.trustDevice(metadata(different),{expectedRevision:1,
+      decision:{eventId:randomUUID(),requestId,fingerprint:otherFingerprint}}),/already applied/);
+    assert.equal(restarted.revision(),1);
+    assert.equal(restarted.registry.listDevices().length,1);
+  });
+});
 test('restarted OS process reads same deviceId, never an inherited online session',()=>{
   temp(dir=>{
     const key=generate();
@@ -81,7 +171,8 @@ test('saved file exposes no session secrets or private key material and retains 
     assert.equal(saved.includes('sessionId'),false);
     assert.equal(saved.includes('nonce'),false);
     const object=JSON.parse(saved);
-    assert.deepEqual(Object.keys(object).sort(),['devices','revision','version']);
+    assert.deepEqual(Object.keys(object).sort(),
+      ['devices','historyStartDevices','historyStartRevision','revision','transitions','version']);
     assert.deepEqual(Object.keys(object.devices[0]).sort(),
       ['deviceId','fingerprint','name','platform','publicKeyPem']);
     assert.equal(object.devices[0].deviceId,d.deviceId);
@@ -175,7 +266,8 @@ test('tampered metadata and fingerprint fail closed on restoration',()=>{
     const o=JSON.parse(readFileSync(file(dir),'utf8'));
     o.devices[0].fingerprint='0'.repeat(64);
     writeFileSync(file(dir),JSON.stringify(o));
-    assert.throws(()=>createDurableDeviceTrustStore({directory:dir}),/Invalid or duplicated trusted identity/);
+    assert.throws(()=>createDurableDeviceTrustStore({directory:dir}),
+      /Invalid or duplicated trusted identity|contradicts transition history/);
   });
 });
 test('stored revisions reject unknown schema or invalid values',()=>{
@@ -224,6 +316,10 @@ test('trust revision exhaustion denies mutation and blocks further session acces
     store.trustDevice(metadata(generate()));
     const snapshot=JSON.parse(readFileSync(file(dir),'utf8'));
     snapshot.revision=Number.MAX_SAFE_INTEGER;
+    snapshot.version=1;
+    delete snapshot.historyStartRevision;
+    delete snapshot.historyStartDevices;
+    delete snapshot.transitions;
     writeFileSync(file(dir),JSON.stringify(snapshot));
     const restarted=createDurableDeviceTrustStore({directory:dir});
     assert.throws(()=>restarted.trustDevice(metadata(generate())),/revision exhausted/);
@@ -246,26 +342,32 @@ test('pre-commit stale snapshot releases its own lock for recovery',()=>{
     const store=createDurableDeviceTrustStore({directory:dir});
     store.trustDevice(metadata(generate(),'first'));
     const lock=path.join(dir,'.trusted-devices-writer.lock');
-    const originalMkdirSync=fs.mkdirSync;
-    fs.mkdirSync=(...args)=>{
-      const result=originalMkdirSync(...args);
-      if(args[0]===lock){
+    const originalFsyncSync=fs.fsyncSync;
+    let snapshotChanged=false;
+    fs.fsyncSync=(fd)=>{
+      let target='';try{target=fs.readlinkSync(`/proc/self/fd/${fd}`);}catch{}
+      if(!snapshotChanged&&target===dir&&lstatSync(lock).isDirectory()){
         const snapshot=JSON.parse(readFileSync(file(dir),'utf8'));
         snapshot.revision++;
+        snapshot.historyStartRevision=snapshot.revision;
+        snapshot.historyStartDevices=snapshot.devices.map(({deviceId,fingerprint})=>({deviceId,fingerprint}));
+        snapshot.transitions=[];
         writeFileSync(file(dir),JSON.stringify(snapshot)+'\n');
+        snapshotChanged=true;
       }
-      return result;
+      return originalFsyncSync(fd);
     };
     syncBuiltinESMExports();
     try{
       assert.throws(()=>store.trustDevice(metadata(generate(),'second')),
         /Trust store changed by another process/);
+      assert.equal(snapshotChanged,true);
       assert.throws(()=>lstatSync(lock),{code:'ENOENT'});
       const recovered=createDurableDeviceTrustStore({directory:dir});
       assert.equal(recovered.revision(),2);
       assert.equal(recovered.registry.listDevices().length,1);
     }finally{
-      fs.mkdirSync=originalMkdirSync;
+      fs.fsyncSync=originalFsyncSync;
       syncBuiltinESMExports();
     }
   });
@@ -323,6 +425,53 @@ test('two OS processes racing from one trust revision commit at most one writer'
     setTimeout(()=>reject(Error(`writer children did not finish: ${outputs.join(' | ')}`)),10_000).unref();
   }));
 });
+test('two OS processes cannot apply one owner decision to two device keys',async()=>{
+  await tempAsync(async dir=>{
+    createDurableDeviceTrustStore({directory:dir});
+    const eventId=randomUUID(),requestId=randomUUID();
+    const keys=[generate(),generate()];
+    const jobs=keys.map((key,index)=>({operation:'approve',name:`device-${index}`,
+      publicKeyPem:key.publicKeyPem,eventId,requestId,
+      fingerprint:createHash('sha256').update(createPublicKey(key.publicKeyPem)
+        .export({type:'spki',format:'der'})).digest('hex')}));
+    const results=await runTrustRace(dir,jobs);
+    assert.equal(results.filter(result=>result==='OK').length,1);
+    assert.equal(results.filter(result=>result==='ERR').length,1);
+    const restarted=createDurableDeviceTrustStore({directory:dir});
+    assert.equal(restarted.revision(),1);
+    assert.equal(restarted.registry.snapshotTrustedDevices().length,1);
+    const snapshot=JSON.parse(readFileSync(file(dir),'utf8'));
+    assert.equal(snapshot.transitions.filter(item=>item.eventId===eventId).length,1);
+    assert.equal(snapshot.transitions[0].requestId,requestId);
+  });
+});
+test('approval racing a revocation cannot overwrite the competing trust revision',async()=>{
+  await tempAsync(async dir=>{
+    const initial=createDurableDeviceTrustStore({directory:dir});
+    const existing=initial.trustDevice(metadata(generate(),'existing'));
+    const next=generate(),eventId=randomUUID(),requestId=randomUUID();
+    const fingerprint=createHash('sha256').update(createPublicKey(next.publicKeyPem)
+      .export({type:'spki',format:'der'})).digest('hex');
+    const results=await runTrustRace(dir,[
+      {operation:'revoke',deviceId:existing.deviceId},
+      {operation:'approve',name:'new',publicKeyPem:next.publicKeyPem,eventId,requestId,fingerprint},
+    ]);
+    assert.equal(results.filter(result=>result==='OK').length,1);
+    assert.equal(results.filter(result=>result==='ERR').length,1);
+    const restarted=createDurableDeviceTrustStore({directory:dir});
+    assert.equal(restarted.revision(),2);
+    const snapshot=JSON.parse(readFileSync(file(dir),'utf8'));
+    if(snapshot.transitions[1].operation==='revoke'){
+      assert.equal(results[0],'OK');assert.equal(results[1],'ERR');
+      assert.deepEqual(restarted.registry.snapshotTrustedDevices(),[]);
+    }else{
+      assert.equal(snapshot.transitions[1].operation,'approve');
+      assert.equal(results[0],'ERR');assert.equal(results[1],'OK');
+      assert.deepEqual(new Set(restarted.registry.snapshotTrustedDevices().map(d=>d.deviceId)),
+        new Set([existing.deviceId,snapshot.transitions[1].deviceId]));
+    }
+  });
+});
 test('exclusive lock blocks writers and keeps service fail-closed',()=>{
   temp(dir=>{
     const store=createDurableDeviceTrustStore({directory:dir});
@@ -337,9 +486,14 @@ test('killed writer process leaves a durable lock that blocks restart',async()=>
     const source=`
       import fs from 'node:fs';
       import {syncBuiltinESMExports} from 'node:module';
-      fs.fsyncSync=()=>{
+      const originalFsyncSync=fs.fsyncSync;
+      fs.fsyncSync=(fd)=>{
+        const lock=path.join(process.argv[1],'.trusted-devices-writer.lock');
+        let target='';try{target=fs.readlinkSync('/proc/self/fd/'+fd);}catch{}
+        if(target!==process.argv[1]||!fs.existsSync(lock))return originalFsyncSync(fd);
         process.stdout.write('LOCKED\\n');
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,120000);
+        return originalFsyncSync(fd);
       };
       syncBuiltinESMExports();
       const {createDurableDeviceTrustStore}=await import('./gateway/devices/durable-trust.mjs');

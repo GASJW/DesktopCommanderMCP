@@ -99,7 +99,18 @@ export function createPairingCoordinator({
       proofVerified:item.proved,createdAt:new Date(item.createdAt).toISOString(),
     })).sort((a,b)=>a.createdAt.localeCompare(b.createdAt));
   }
-  function approvePairing(requestId, expectedFingerprint) {
+  function inspectPairing(requestId) {
+    prune();
+    const record=pending.get(requestId);
+    if(!record)return null;
+    return Object.freeze({requestId,fingerprint:record.fingerprint,proofVerified:record.proved,
+      name:record.name,platform:record.platform,createdAt:new Date(record.createdAt).toISOString()});
+  }
+  function trustRevision() {
+    if(typeof registry.revision!=='function')throw Error('Durable trust revision required');
+    return registry.revision();
+  }
+  function approvePairing(requestId, expectedFingerprint, decision) {
     prune();
     const record = pending.get(requestId);
     if (!record || !record.proved || typeof expectedFingerprint !== 'string' ||
@@ -107,9 +118,21 @@ export function createPairingCoordinator({
       throw new Error('Pairing requires verified proof and matching owner-reviewed fingerprint');
     }
     // A failed registry trust does not auto-retry or approve the request.
+    let trustOptions;
+    if(decision!==undefined){
+      if(!decision||typeof decision!=='object'||Array.isArray(decision)||
+         Object.keys(decision).sort().join(',')!=='eventId,trustRevisionBefore'||
+         !UUID.test(decision.eventId)||!Number.isSafeInteger(decision.trustRevisionBefore)||
+         decision.trustRevisionBefore<0){
+        throw new TypeError('Invalid owner pairing decision');
+      }
+      trustOptions={expectedRevision:decision.trustRevisionBefore,decision:{
+        eventId:decision.eventId,requestId,fingerprint:record.fingerprint,
+      }};
+    }
     const trusted = registry.trustDevice({
       name:record.name,platform:record.platform,publicKeyPem:record.publicKeyPem,
-    });
+    },trustOptions);
     pending.delete(requestId);
     return trusted;
   }
@@ -117,5 +140,6 @@ export function createPairingCoordinator({
     prune();
     return pending.delete(requestId);
   }
-  return Object.freeze({startPairing,provePossession,listPending,approvePairing,rejectPairing});
+  return Object.freeze({startPairing,provePossession,listPending,inspectPairing,
+    trustRevision,approvePairing,rejectPairing});
 }

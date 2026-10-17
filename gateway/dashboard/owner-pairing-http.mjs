@@ -92,7 +92,7 @@ export function createOwnerPairingHttp({
     if(poisoned)throw Error('Owner audit unavailable');
     try{
       if(await auditWrite(Object.freeze({...details,event:'g7_owner_pairing',
-        version:1,at:new Date(now()).toISOString()}))!==true)throw Error('Audit not committed');
+        version:2,at:new Date(now()).toISOString()}))!==true)throw Error('Audit not committed');
     }catch{
       poisoned=true;
       throw Error('Owner audit unavailable');
@@ -159,29 +159,57 @@ export function createOwnerPairingHttp({
         return response(res,400,{error:'Invalid pairing decision'});
       }
     }catch{return response(res,400,{error:'Invalid JSON body'});}
-    const eventId=randomUUID();
-    const event={
-      eventId,operation:action,
-      ownerId:digest(owner.issuer+'\0'+owner.subject),
-      targetId:digest(payload.requestId),
-      // Never persist entered code, JWT, private key, nonce or Access cookie.
-    };
     const decision=decisionQueue.then(async()=>{
+      let binding;
       try{
-        await durableEvent({...event,phase:'intent'});
-      }catch{return response(res,503,{error:'Owner audit unavailable'});}
-      let result,status=200;
+        binding=await review.inspectDecision(context,{...payload,
+          requireProof:action==='approve'});
+      }catch(error){
+        if(error?.code==='PAIRING_DECISION_UNKNOWN'){
+          poisoned=true;
+          return response(res,503,{error:'Pairing outcome requires reconciliation'});
+        }
+        return response(res,403,{error:'Pairing decision denied'});
+      }
+      const event={eventId:randomUUID(),operation:action,
+        ownerId:digest(owner.issuer+'\0'+owner.subject),
+        requestId:binding.requestId,fingerprint:binding.fingerprint,
+        trustRevisionBefore:binding.trustRevisionBefore};
+      try{await durableEvent({...event,phase:'intent'});}
+      catch{return response(res,503,{error:'Owner audit unavailable'});}
+      let result,status=200,outcome='accepted',deviceId=null;
       try{
         result=action==='approve'
-          ? await review.approve(context,payload)
+          ? await review.approve(context,{...payload,decision:{eventId:event.eventId,
+            trustRevisionBefore:event.trustRevisionBefore}})
           : await review.reject(context,payload);
-      }catch{
-        status=403;
-        result={error:'Pairing decision denied'};
+      }catch(error){
+        if(error?.code!=='PAIRING_DECISION_DENIED'){
+          poisoned=true;
+          return response(res,503,{error:'Pairing outcome requires reconciliation'});
+        }
+        status=403;outcome='denied';result={error:'Pairing decision denied'};
+      }
+      let trustRevisionAfter;
+      try{trustRevisionAfter=await review.currentTrustRevision(context);}
+      catch{
+        poisoned=true;
+        return response(res,503,{error:'Pairing outcome requires reconciliation'});
+      }
+      if(trustRevisionAfter!==event.trustRevisionBefore+
+         (status===200&&action==='approve'?1:0)){
+        poisoned=true;
+        return response(res,503,{error:'Pairing outcome requires reconciliation'});
+      }
+      if(status===200&&action==='approve'){
+        if(result?.fingerprint!==event.fingerprint||!UUID.test(result?.deviceId??'')){
+          poisoned=true;
+          return response(res,503,{error:'Pairing outcome requires reconciliation'});
+        }
+        deviceId=result.deviceId;
       }
       try{
-        await durableEvent({...event,phase:'outcome',
-          outcome:status===200?'accepted':'denied'});
+        await durableEvent({...event,phase:'outcome',outcome,deviceId,trustRevisionAfter});
       }catch{
         // The operation may already have completed: never claim failure means
         // no trust mutation; lock the control plane for manual reconciliation.
