@@ -5,7 +5,7 @@ import { startLoopbackAgentPilot } from './loopback-pilot.mjs';
 // -> independent Ed25519 challenge/session/frame verification in inner pilot.
 // This DOES NOT configure Cloudflare or expose TLS/public hostname.
 const PATHS=new Set(['/agent/challenge','/agent/connect','/agent/heartbeat',
-  '/agent/poll','/agent/result']);
+  '/agent/poll','/agent/result','/agent/disconnect']);
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const BODY_MAX=16*1024;
 const RESULT_MAX=512*1024;

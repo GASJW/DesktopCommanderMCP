@@ -18,6 +18,8 @@ const HOST='devices.example.test';
 const BASE_URL='https://'+HOST+'/';
 const CLIENT='edge-agent-test.access';
 const SECRET='synthetic-test-secret-not-production-0001';
+const DEVICE='f1a2b3c4-d5e6-4a9f-8abc-1bb9b99c0001';
+const SESSION='f1a2b3c4-d5e6-4a9f-8abc-1bb9b99c0002';
 const ISSUER='https://vpsc.cloudflareaccess.com';
 const AUD='c'.repeat(64),T=1_800_000_000_000,SEC=Math.floor(T/1000);
 const MCP_FIXTURE=fileURLToPath(new URL('./fixtures-readonly-mcp.mjs',import.meta.url));
@@ -112,6 +114,16 @@ test('HTTPS agent sends Service Token headers to edge and signs device frames',a
     assert.ok(signed.headers['x-vpsc-signature']);
   }finally{await x.close();}
 });
+test('agent disconnect explicitly invalidates its signed Gateway session',async()=>{
+  const x=await harness();
+  try{
+    await x.client.connect();
+    await x.client.heartbeat();
+    assert.deepEqual(await x.client.disconnect(),{disconnected:true});
+    await assert.rejects(x.client.heartbeat(),error=>error.code==='NOT_CONNECTED');
+    assert.ok(x.observed.some(item=>item.url===BASE_URL+'agent/disconnect'));
+  }finally{await x.close();}
+});
 test('two layers authenticate an actual local MCP fixture read and return through router',async()=>{
   const x=await harness();
   const tmp=mkdtempSync(path.join(os.tmpdir(),'vpsc-https-agent-test-'));
@@ -127,7 +139,7 @@ test('two layers authenticate an actual local MCP fixture read and return throug
     const value=await executor.handle(task);
     await x.client.result(task.requestId,value);
     assert.match(JSON.stringify(await pending),/end-to-end-device-signed-read/);
-  }finally{executor.close();await x.close();rmSync(tmp,{recursive:true,force:true});}
+  }finally{await executor.close();await x.close();rmSync(tmp,{recursive:true,force:true});}
 });
 test('HTTPS client closes fail-closed and prevents further messages',async()=>{
   const x=await harness();
@@ -165,6 +177,71 @@ test('redirection, non-JSON and oversized response fail closed',async()=>{
     fetchFn:async()=>new Response('not-json',{status:200,
       headers:{'content-type':'text/plain'}}),
   }));
-  await assert.rejects(wrong.connect(),e=>e.code==='BAD_RESPONSE');
+  await assert.rejects(wrong.connect(),e=>e.code==='AMBIGUOUS_TRANSPORT');
   redirect.close();wrong.close();
+});
+test('a processed result followed by HTTP 503 is ambiguous and never replayed',async()=>{
+  const routes=[];let processed=0;
+  const client=createHttpsAgentClient(makeInvalid({fetchFn:async(input,options)=>{
+    const route=new URL(input).pathname;routes.push(route);
+    if(route==='/agent/challenge')return new Response(JSON.stringify({deviceId:DEVICE,
+      expiresInMs:30_000,nonce:'n'.repeat(43)}),{
+      status:200,headers:{'content-type':'application/json'},
+    });
+    if(route==='/agent/connect')return new Response(JSON.stringify({deviceId:DEVICE,sessionId:SESSION}),{
+      status:200,headers:{'content-type':'application/json'},
+    });
+    if(route==='/agent/result'){
+      processed++;
+      return new Response('{"error":"response lost after acceptance"}',{
+        status:503,headers:{'content-type':'application/json'},
+      });
+    }
+    return new Response('{"status":"alive"}',{status:200,
+      headers:{'content-type':'application/json'}});
+  }}));
+  try{
+    await client.connect();
+    await assert.rejects(client.result('f1a2b3c4-d5e6-4a9f-8abc-1bb9b99c0003',{
+      content:[{type:'text',text:'completed'}],
+    }),error=>error.code==='AMBIGUOUS_TRANSPORT');
+    assert.equal(processed,1);
+    assert.equal(routes.filter(route=>route==='/agent/result').length,1);
+  }finally{client.close();}
+});
+
+test('successful HTTP with malformed route acknowledgement is ambiguous and fences client',async()=>{
+  for(const route of ['/agent/heartbeat','/agent/poll','/agent/result']){
+    const client=createHttpsAgentClient(makeInvalid({fetchFn:async(input)=>{
+      const pathname=new URL(input).pathname;
+      const payload=pathname==='/agent/challenge'
+        ?{deviceId:DEVICE,expiresInMs:30_000,nonce:'n'.repeat(43)}
+        :pathname==='/agent/connect'?{deviceId:DEVICE,sessionId:SESSION}
+        :pathname===route?{}:{status:'alive',deviceId:DEVICE};
+      return new Response(JSON.stringify(payload),{status:200,
+        headers:{'content-type':'application/json'}});
+    }}));
+    try{
+      await client.connect();
+      const invoke=route==='/agent/heartbeat'?()=>client.heartbeat():
+        route==='/agent/poll'?()=>client.poll():
+        ()=>client.result('f1a2b3c4-d5e6-4a9f-8abc-1bb9b99c0003',{content:[]});
+      await assert.rejects(invoke(),error=>error.code==='AMBIGUOUS_TRANSPORT');
+      await assert.rejects(client.heartbeat(),error=>error.code==='CLOSED');
+    }finally{client.close();}
+  }
+});
+
+test('malformed connect acknowledgement fences a potentially created session',async()=>{
+  const client=createHttpsAgentClient(makeInvalid({fetchFn:async(input)=>{
+    const pathname=new URL(input).pathname;
+    const payload=pathname==='/agent/challenge'
+      ?{deviceId:DEVICE,expiresInMs:30_000,nonce:'n'.repeat(43)}
+      :{deviceId:DEVICE};
+    return new Response(JSON.stringify(payload),{status:200,
+      headers:{'content-type':'application/json'}});
+  }}));
+  await assert.rejects(client.connect(),error=>error.code==='AMBIGUOUS_TRANSPORT');
+  await assert.rejects(client.connect(),error=>error.code==='CLOSED');
+  client.close();
 });

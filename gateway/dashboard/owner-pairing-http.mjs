@@ -31,6 +31,12 @@ function validOwner(value){
     /^https:\/\/[a-z0-9-]+\.cloudflareaccess\.com$/.test(value.issuer) &&
     typeof value.subject==='string' && value.subject.length>0 && value.subject.length<=1024;
 }
+// Stable privacy-preserving identity used to bind durable approval outcomes
+// to the verified owner principal without persisting an email address.
+export function ownerPrincipalId(owner){
+  if(!validOwner(owner))throw new TypeError('Verified owner principal required');
+  return digest(owner.issuer+'\0'+owner.subject);
+}
 export function createOwnerPairingHttp({
   coordinator,accessVerifier,expectedOrigin,auditWrite,now=Date.now,
 }={}){
@@ -77,7 +83,7 @@ export function createOwnerPairingHttp({
   }
   function withinRate(owner){
     const t=now();
-    const key=digest(owner.issuer+'\0'+owner.subject);
+    const key=ownerPrincipalId(owner);
     for(const [k,v] of rate){
       if(t<v.since || t-v.since>=RATE_WINDOW_MS)rate.delete(k);
     }
@@ -172,7 +178,7 @@ export function createOwnerPairingHttp({
         return response(res,403,{error:'Pairing decision denied'});
       }
       const event={eventId:randomUUID(),operation:action,
-        ownerId:digest(owner.issuer+'\0'+owner.subject),
+        ownerId:ownerPrincipalId(owner),
         requestId:binding.requestId,fingerprint:binding.fingerprint,
         trustRevisionBefore:binding.trustRevisionBefore};
       try{await durableEvent({...event,phase:'intent'});}

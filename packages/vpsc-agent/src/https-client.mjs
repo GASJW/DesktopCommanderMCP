@@ -5,13 +5,19 @@ import { signedAgentRequest } from './frame.mjs';
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CLIENT=/^[A-Za-z0-9_.-]{8,256}$/;
 const ROUTES=new Set(['/agent/challenge','/agent/connect','/agent/heartbeat',
-  '/agent/poll','/agent/result']);
+  '/agent/poll','/agent/result','/agent/disconnect']);
 const MAX_BYTES=16*1024;
 const MAX_RESPONSE=512*1024;
+const NONCE=/^[A-Za-z0-9_-]{43}$/;
 export class HttpsAgentError extends Error{
   constructor(code,message){super(message);this.name='HttpsAgentError';this.code=code;}
 }
 const fail=(code,message)=>new HttpsAgentError(code,message);
+function exactKeys(value,keys){
+  return value&&typeof value==='object'&&!Array.isArray(value)&&
+    Object.getPrototypeOf(value)===Object.prototype&&
+    Object.keys(value).sort().join(',')===keys;
+}
 function checkedOrigin(gatewayUrl,expectedHostname){
   if(typeof gatewayUrl!=='string'||typeof expectedHostname!=='string'||
      !/^[a-z0-9.-]{6,255}$/.test(expectedHostname)||
@@ -43,6 +49,12 @@ export function createHttpsAgentClient({
     throw fail('CONFIG','Invalid agent HTTPS identity or service token');
   }
   let sessionId=null,sequence=0,closed=false;
+  function ambiguousResponse(){
+    // A route may have consumed a challenge, advanced a frame sequence, or
+    // accepted a result before the response became unusable. Fence this client.
+    closed=true;sessionId=null;sequence=0;
+    throw fail('AMBIGUOUS_TRANSPORT','Agent response invalid; request outcome unknown');
+  }
   async function request(route,data,authenticate=false){
     if(closed)throw fail('CLOSED','Agent client closed');
     if(!ROUTES.has(route))throw fail('CONFIG','Unknown agent route');
@@ -74,13 +86,19 @@ export function createHttpsAgentClient({
     }catch{
       // Once the network request started, never assume the operation was not
       // delivered. No implicit replay after an uncertain outcome.
+      closed=true;sessionId=null;sequence=0;
       throw fail('AMBIGUOUS_TRANSPORT','Agent transport failed; do not retry blindly');
     }
     if(!response||typeof response.status!=='number'||
        !response.headers?.get?.('content-type')?.toLowerCase().includes('application/json')){
-      throw fail('BAD_RESPONSE','Invalid agent ingress response');
+      return ambiguousResponse();
     }
-    if(!response.ok)throw fail('REJECTED','Agent ingress denied request: '+response.status);
+    if(!response.ok){
+      if(response.status>=400&&response.status<500){
+        throw fail('REJECTED','Agent ingress denied request: '+response.status);
+      }
+      return ambiguousResponse();
+    }
     let total=0;const chunks=[];
     try{
       for await(const chunk of response.body){
@@ -94,27 +112,58 @@ export function createHttpsAgentClient({
         throw Error('Invalid JSON response');
       }
       return parsed;
-    }catch{throw fail('BAD_RESPONSE','Invalid or oversized ingress JSON response');}
+    }catch{return ambiguousResponse();}
   }
   async function connect(){
     if(sessionId)throw fail('STATE','Already connected');
     const challenge=await request('/agent/challenge',{deviceId});
-    if(challenge.deviceId!==deviceId)throw fail('BAD_RESPONSE','Challenge bound to another device');
+    if(!exactKeys(challenge,'deviceId,expiresInMs,nonce')||challenge.deviceId!==deviceId||
+       !NONCE.test(challenge.nonce)||!Number.isSafeInteger(challenge.expiresInMs)||
+       challenge.expiresInMs<1||challenge.expiresInMs>60_000)return ambiguousResponse();
     const proof=identity.proveDeviceChallenge(challenge);
     const current=await request('/agent/connect',{deviceId,signature:proof});
-    if(current.deviceId!==deviceId||typeof current.sessionId!=='string'||
-       !UUID.test(current.sessionId))throw fail('BAD_RESPONSE','Invalid signed session');
+    if(!exactKeys(current,'deviceId,sessionId')||current.deviceId!==deviceId||
+       typeof current.sessionId!=='string'||!UUID.test(current.sessionId))return ambiguousResponse();
     sessionId=current.sessionId;sequence=0;
     return Object.freeze({deviceId,sessionId});
   }
-  const heartbeat=()=>request('/agent/heartbeat',{},true);
-  async function poll(){return (await request('/agent/poll',{},true)).frame??null;}
-  const result=(requestId,value)=>{
+  async function heartbeat(){
+    const answer=await request('/agent/heartbeat',{},true);
+    if(!exactKeys(answer,'deviceId,status')||answer.deviceId!==deviceId||answer.status!=='alive'){
+      return ambiguousResponse();
+    }
+    return answer;
+  }
+  async function poll(){
+    const answer=await request('/agent/poll',{},true);
+    if(!exactKeys(answer,'frame')||!(answer.frame===null||
+       answer.frame&&typeof answer.frame==='object'&&!Array.isArray(answer.frame))){
+      return ambiguousResponse();
+    }
+    return answer.frame;
+  }
+  async function disconnect(){
+    if(!sessionId)return Object.freeze({disconnected:false});
+    try{
+      const result=await request('/agent/disconnect',{},true);
+      if(!exactKeys(result,'disconnected')||result.disconnected!==true)return ambiguousResponse();
+      sessionId=null;sequence=0;
+      return Object.freeze({disconnected:true});
+    }catch(error){
+      // The disconnect may have reached the Gateway even if its response was
+      // lost. Do not reuse this session or retry the uncertain request.
+      sessionId=null;closed=true;
+      throw error;
+    }
+  }
+  const result=async(requestId,value)=>{
     if(typeof requestId!=='string'||!UUID.test(requestId)){
       throw fail('BAD_PAYLOAD','Invalid remote request id');
     }
-    return request('/agent/result',{requestId,result:value},true);
+    const answer=await request('/agent/result',{requestId,result:value},true);
+    if(!exactKeys(answer,'accepted')||answer.accepted!==true)return ambiguousResponse();
+    return answer;
   };
   function close(){closed=true;sessionId=null;}
-  return Object.freeze({connect,heartbeat,poll,result,close});
+  return Object.freeze({connect,heartbeat,poll,result,disconnect,close});
 }

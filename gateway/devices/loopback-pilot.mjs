@@ -1,7 +1,8 @@
 import { createServer } from 'node:http';
 import { signedAgentRequest } from '../../packages/vpsc-agent/src/frame.mjs';
 
-const ROUTES = new Set(['/agent/challenge','/agent/connect','/agent/heartbeat','/agent/poll','/agent/result']);
+const ROUTES = new Set(['/agent/challenge','/agent/connect','/agent/heartbeat',
+  '/agent/poll','/agent/result','/agent/disconnect']);
 const MAX_REQUEST = 16 * 1024;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const reject = (res,status,message) => reply(res,status,{error:message});
@@ -108,6 +109,15 @@ export async function startLoopbackAgentPilot({
         channels.set(deviceId,{sessionId,queue});
       }
       return reply(res,200,{status:'alive',deviceId});
+    }
+    if(req.url==='/agent/disconnect'){
+      if(!registry.disconnect(deviceId,sessionId))return reject(res,401,'Device session is no longer active');
+      const existing=channels.get(deviceId);
+      if(existing?.sessionId===sessionId){
+        router.detachTransport({deviceId,sessionId});
+        channels.delete(deviceId);
+      }
+      return reply(res,200,{disconnected:true});
     }
     const channel=channels.get(deviceId);
     if (!channel || channel.sessionId!==sessionId) {

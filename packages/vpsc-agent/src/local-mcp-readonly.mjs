@@ -1,15 +1,47 @@
 import path from 'node:path';
+import os from 'node:os';
 import { spawn } from 'node:child_process';
-import { realpathSync, statSync, lstatSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync,
+  statSync, lstatSync, writeFileSync } from 'node:fs';
 
 // Nonproduction, single-process read-only MCP adapter.
 // The caller must authenticate device transport and owner/tool policy separately.
 const MAX_LINE=256*1024, MAX_PENDING=1;
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const EMPTY_FLAGS_URL='data:application/json,%7B%22flags%22:%7B%7D%7D';
 export class LocalMcpError extends Error {
   constructor(code,message){ super(message); this.name='LocalMcpError'; this.code=code; }
 }
 const err=(code,message)=>new LocalMcpError(code,message);
+export function createPrivateMcpHome({allowedRoot}={}){
+  if(typeof allowedRoot!=='string'||!path.isAbsolute(allowedRoot)){
+    throw err('POLICY','Absolute allowed root required for private MCP configuration');
+  }
+  const directory=mkdtempSync(path.join(os.tmpdir(),'vpsc-agent-home-'));
+  try{
+    chmodSync(directory,0o700);
+    const configDirectory=path.join(directory,'.claude-server-commander');
+    mkdirSync(configDirectory,{mode:0o700});
+    chmodSync(configDirectory,0o700);
+    const configPath=path.join(configDirectory,'config.json');
+    writeFileSync(configPath,JSON.stringify({allowedDirectories:[allowedRoot],
+      telemetryEnabled:false,fileReadLineLimit:1000,fileWriteLineLimit:50,
+      welcomeOnboardingEligible:false,pendingWelcomeOnboarding:false})+'\n',
+      {flag:'wx',mode:0o600});
+    chmodSync(configPath,0o600);
+    return Object.freeze({directory,close(){rmSync(directory,{recursive:true,force:true});}});
+  }catch(error){
+    rmSync(directory,{recursive:true,force:true});
+    throw error;
+  }
+}
+function checkedFeatureFlagsUrl(value){
+  if(value===undefined)return EMPTY_FLAGS_URL;
+  // Desktop Commander follows redirects while loading flags. Even an
+  // explicitly loopback URL could redirect outside the host, so the isolated
+  // agent always supplies a static empty document and has no URL override.
+  throw err('POLICY','Feature flag URL overrides are disabled for the remote agent');
+}
 function checkedRoot(directory){
   if(typeof directory!=='string'||!path.isAbsolute(directory))throw err('POLICY','Absolute allowed root required');
   if(lstatSync(directory).isSymbolicLink())throw err('POLICY','Symlink root forbidden');
@@ -38,7 +70,7 @@ function checkedRead(args,root,maxBytes){
 }
 export function createLocalReadonlyMcp({
   allowedRoot,entrypoint,nodeBin=process.execPath,
-  timeoutMs=8000,startupTimeoutMs=30_000,maxFileBytes=64*1024,
+  timeoutMs=8000,startupTimeoutMs=30_000,maxFileBytes=64*1024,featureFlagsUrl,
 }={}){
   if(typeof process.getuid==='function' && process.getuid()===0){
     throw err('PRIVILEGE','Agent must run as nonroot');
@@ -51,14 +83,32 @@ export function createLocalReadonlyMcp({
     throw err('POLICY','Invalid local MCP runtime configuration');
   }
   const root=checkedRoot(allowedRoot);
-  let child=null,started=false,dead=false,serial=0;
+  const safeFeatureFlagsUrl=checkedFeatureFlagsUrl(featureFlagsUrl);
+  let child=null,started=false,dead=false,serial=0,privateHome=null,exitPromise=null;
   const pending=new Map();
+  function cleanupHome(){
+    const current=privateHome;privateHome=null;
+    try{current?.close();}catch{}
+  }
   function shutdown(error=err('UNAVAILABLE','Local MCP offline')){
     if(dead)return;
     dead=true;
     for(const [id,p] of pending){clearTimeout(p.timer);p.reject(error);}
     pending.clear();
-    child?.kill('SIGTERM');
+    if(child&&child.exitCode===null){
+      child.kill('SIGTERM');
+    }else cleanupHome();
+  }
+  function waitForChildExit(){
+    if(!child||child.exitCode!==null){cleanupHome();return Promise.resolve();}
+    if(!exitPromise)exitPromise=new Promise(resolve=>{
+      const killTimer=setTimeout(()=>{if(child?.exitCode===null)child.kill('SIGKILL');},500);
+      killTimer.unref?.();
+      const done=()=>{clearTimeout(killTimer);cleanupHome();resolve();};
+      child.once('exit',done);
+      child.once('error',done);
+    });
+    return exitPromise;
   }
   function send(method,params={},notify=false,deadlineMs=timeoutMs){
     if(dead||!child?.stdin?.writable) return Promise.reject(err('UNAVAILABLE','Local MCP unavailable'));
@@ -94,7 +144,13 @@ export function createLocalReadonlyMcp({
        'APPDATA','LOCALAPPDATA','SystemRoot','WINDIR','COMSPEC']){
       if(typeof process.env[k]==='string')env[k]=process.env[k];
     }
+    privateHome=createPrivateMcpHome({allowedRoot:root});
+    env.HOME=privateHome.directory;
+    env.USERPROFILE=privateHome.directory;
     env.DC_REMOTE_DEVICE='true';
+    // The remote child must never emit telemetry or fetch mutable flags.
+    env.DESKTOP_COMMANDER_DISABLE_TELEMETRY='true';
+    env.DC_FLAG_URL=safeFeatureFlagsUrl;
     env.VPS_COMMANDER_DISABLE_BROWSER_INIT='1';
     child=spawn(nodeBin,[entrypoint,'--no-onboarding'],{
       cwd:path.dirname(entrypoint),shell:false,stdio:['pipe','pipe','pipe'],env,
@@ -124,8 +180,8 @@ export function createLocalReadonlyMcp({
     });
     // Never forward child diagnostics to Gateway or store secret-bearing stderr.
     child.stderr.on('data',()=>{});
-    child.once('error',()=>shutdown());
-    child.once('exit',()=>shutdown());
+    child.once('error',()=>{shutdown();cleanupHome();});
+    child.once('exit',()=>{shutdown();cleanupHome();});
     try{
       const init=await send('initialize',{
         protocolVersion:'2025-03-26',capabilities:{},
@@ -133,7 +189,7 @@ export function createLocalReadonlyMcp({
       },false,startupTimeoutMs);
       if(init.error||!init.result?.capabilities)throw err('UNAVAILABLE','MCP initialization failed');
       await send('notifications/initialized',{},true);
-    }catch(e){shutdown();throw e;}
+    }catch(e){shutdown();await waitForChildExit();throw e;}
     return Object.freeze({running:true,mode:'read_file_only'});
   }
   async function handle(frame){
@@ -151,6 +207,6 @@ export function createLocalReadonlyMcp({
     if(!out.result || typeof out.result!=='object')throw err('UNAVAILABLE','Invalid MCP result');
     return out.result;
   }
-  function close(){shutdown();}
+  async function close(){shutdown();await waitForChildExit();}
   return Object.freeze({start,handle,close});
 }
