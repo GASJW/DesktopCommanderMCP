@@ -9,7 +9,7 @@ import path from 'node:path';
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash, createPublicKey, generateKeyPairSync, randomUUID } from 'node:crypto';
 import { createDurableDeviceTrustStore, inspectDurableDeviceTrust } from '../devices/durable-trust.mjs';
-import { createDurableOwnerAudit } from '../dashboard/durable-owner-audit.mjs';
+import { createDurableOwnerAudit, inspectDurableOwnerAudit } from '../dashboard/durable-owner-audit.mjs';
 import { analyzeOwnerPairingRecovery, clearStaleOwnerPairingRecoveryLocks,
   reconcileOwnerPairingRecovery } from '../dashboard/owner-pairing-reconciliation.mjs';
 
@@ -18,6 +18,17 @@ const intent=(overrides={})=>({
   eventId:'7844cd69-61f1-4a9c-9664-fce563976a14',operation:'approve',
   ownerId:'a'.repeat(24),requestId:'6093f82c-04f9-4b5a-a523-248e616fbd3f',
   fingerprint:'b'.repeat(64),trustRevisionBefore:0,phase:'intent',...overrides,
+});
+const machineBindingEvent=(phase,overrides={})=>({
+  event:'g7_owner_machine_binding',version:3,at:'2026-10-17T12:00:00.000Z',
+  eventId:'25e1ccbf-ed9b-4cb0-8292-6b43d9b7704a',operation:'bind',
+  ownerId:'a'.repeat(24),ownerDigest:'c'.repeat(64),clientId:'vpsc-test-client-0001',
+  deviceId:'f69ec00e-f225-43df-bdc7-c2cbf8f4a9f3',fingerprint:'b'.repeat(64),
+  approvalEventId:'7844cd69-61f1-4a9c-9664-fce563976a14',
+  trustRevisionBefore:0,trustRevisionAfter:1,trustRevision:1,
+  bindingRevisionBefore:0,phase,
+  ...(phase==='outcome'?{outcome:'accepted',bindingRevisionAfter:1}:{}),
+  ...overrides,
 });
 function fixture(t){
   const root=mkdtempSync(path.join(tmpdir(),'g7-pair-reconcile-'));
@@ -301,6 +312,51 @@ test('legacy v1 decision history remains explicitly unbound after restart',t=>{
   assert.equal(analyzeOwnerPairingRecovery(f).state,'LEGACY_UNBOUND');
   assert.equal(reconcileOwnerPairingRecovery({...f,operatorConfirmedNoActiveWriters:true}).state,
     'LEGACY_UNBOUND');
+});
+
+test('pending machine-binding outcome is unknown and cannot trigger I2 repair',t=>{
+  const f=fixture(t);
+  const trust=createDurableDeviceTrustStore({directory:f.trustDirectory});trust.close();
+  const audit=createDurableOwnerAudit({directory:f.auditDirectory});
+  audit.auditWrite(machineBindingEvent('intent'));
+  audit.close();
+
+  const diagnosis=analyzeOwnerPairingRecovery(f);
+  assert.equal(diagnosis.state,'MACHINE_BINDING_OUTCOME_UNKNOWN');
+  assert.throws(()=>reconcileOwnerPairingRecovery({...f,
+    operatorConfirmedNoActiveWriters:true}),/MACHINE_BINDING_OUTCOME_UNKNOWN/);
+  const evidence=inspectDurableOwnerAudit({directory:f.auditDirectory});
+  assert.equal(evidence.pending.length,1);
+  assert.equal(evidence.pending[0].event,'g7_owner_machine_binding');
+  assert.equal(inspectDurableDeviceTrust({directory:f.trustDirectory}).revision,0);
+  assert.equal(analyzeOwnerPairingRecovery(f).state,'MACHINE_BINDING_OUTCOME_UNKNOWN');
+});
+
+test('completed machine-binding events are not interpreted as I2 trust transitions',t=>{
+  const f=fixture(t);
+  const binding=approvedBinding();
+  const decision=intent({eventId:binding.eventId,requestId:binding.requestId,
+    fingerprint:binding.fingerprint,trustRevisionBefore:0});
+  const audit=createDurableOwnerAudit({directory:f.auditDirectory});
+  audit.auditWrite(decision);
+  const store=createDurableDeviceTrustStore({directory:f.trustDirectory});
+  const device=store.trustDevice({name:'I2 approval',platform:'linux',
+    publicKeyPem:binding.publicKeyPem},{expectedRevision:0,decision:{
+      eventId:binding.eventId,requestId:binding.requestId,fingerprint:binding.fingerprint}});
+  audit.auditWrite({...decision,phase:'outcome',outcome:'accepted',deviceId:device.deviceId,
+    trustRevisionAfter:1});
+  const machineId=randomUUID();
+  audit.auditWrite(machineBindingEvent('intent',{eventId:machineId,ownerId:'d'.repeat(24),
+    deviceId:device.deviceId,fingerprint:binding.fingerprint,
+    approvalEventId:binding.eventId,trustRevisionBefore:0,trustRevisionAfter:1,
+    trustRevision:1,bindingRevisionBefore:0}));
+  audit.auditWrite(machineBindingEvent('outcome',{eventId:machineId,ownerId:'d'.repeat(24),
+    deviceId:device.deviceId,fingerprint:binding.fingerprint,
+    approvalEventId:binding.eventId,trustRevisionBefore:0,trustRevisionAfter:1,
+    trustRevision:1,bindingRevisionBefore:0,bindingRevisionAfter:1}));
+  audit.close();store.close();
+
+  assert.equal(analyzeOwnerPairingRecovery(f).state,'CONSISTENT');
 });
 
 test('v2 approval receipt without a matching WAL intent is blocked',t=>{

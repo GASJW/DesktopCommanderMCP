@@ -7,7 +7,8 @@ import {
   appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync,
   rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
-import { createDurableOwnerAudit } from '../dashboard/durable-owner-audit.mjs';
+import { createDurableOwnerAudit, readDurableOwnerMachineBindingDecision,
+  readDurableOwnerMachineBindingHistory } from '../dashboard/durable-owner-audit.mjs';
 
 const now = '2026-10-12T15:00:00.000Z';
 const event = (phase, id = randomUUID(), extra = {}) => ({
@@ -23,6 +24,15 @@ const correlatedEvent = (phase, id = randomUUID(), extra = {}) => ({
   fingerprint:'b'.repeat(64),trustRevisionBefore:4,phase,
   ...(phase==='outcome'?{outcome:'accepted',deviceId:'f69ec00e-f225-43df-bdc7-c2cbf8f4a9f3',
     trustRevisionAfter:5}:{}),
+  ...extra,
+});
+const machineBindingEvent = (phase, id = randomUUID(), extra = {}) => ({
+  event:'g7_owner_machine_binding',version:3,at:now,eventId:id,operation:'bind',
+  ownerId:'a'.repeat(24),ownerDigest:'c'.repeat(64),clientId:'vpsc-test-client-0001',
+  deviceId:'f69ec00e-f225-43df-bdc7-c2cbf8f4a9f3',fingerprint:'b'.repeat(64),
+  approvalEventId:'e3d3147b-9325-4d42-a4e1-e9b219e5b02d',trustRevisionBefore:4,
+  trustRevisionAfter:5,trustRevision:5,bindingRevisionBefore:8,phase,
+  ...(phase==='outcome'?{outcome:'accepted',bindingRevisionAfter:9}:{}),
   ...extra,
 });
 function fixture() {
@@ -237,4 +247,80 @@ test('not_applied cannot certify an ephemeral rejection result',t=>{
     outcome:'not_applied',deviceId:null,trustRevisionAfter:4})),/Invalid pairing audit event/);
   assert.equal(s.inspect().sequence,1);
   s.close();
+});
+
+test('v3 machine binding intent/outcome pair is exact, append-only and survives restart',t=>{
+  const f=fixture();t.after(f.clean);
+  const s=createDurableOwnerAudit({directory:f.directory});
+  const id=randomUUID();
+  const intent=machineBindingEvent('intent',id);
+  const outcome=machineBindingEvent('outcome',id);
+  assert.equal(s.auditWrite(intent),true);
+  assert.equal(s.auditWrite(outcome),true);
+  assert.equal(s.inspect().pending,0);
+  s.close();
+  const records=readFileSync(f.log,'utf8').trimEnd().split('\n').map(JSON.parse);
+  assert.deepEqual(records.map(record=>record.version),[3,3]);
+  assert.deepEqual(records.map(record=>record.event.phase),['intent','outcome']);
+  assert.equal(records[0].event.event,'g7_owner_machine_binding');
+  assert.equal(records[1].event.eventId,id);
+  assert.equal(records[1].event.ownerDigest,'c'.repeat(64));
+  assert.equal(records[1].event.approvalEventId,'e3d3147b-9325-4d42-a4e1-e9b219e5b02d');
+  assert.equal(records[1].event.bindingRevisionBefore,8);
+  assert.equal(records[1].event.bindingRevisionAfter,9);
+  assert.equal(records[1].previous,records[0].hash);
+  const read=readDurableOwnerMachineBindingDecision({directory:f.directory,eventId:id});
+  assert.equal(read.state,'COMPLETE');
+  assert.equal(read.intent.eventId,id);
+  assert.equal(read.outcome.bindingRevisionAfter,9);
+  assert.equal(readDurableOwnerMachineBindingDecision({directory:f.directory,
+    eventId:randomUUID()}).state,'NOT_FOUND');
+  const restarted=createDurableOwnerAudit({directory:f.directory});
+  assert.equal(restarted.inspect().sequence,2);
+  restarted.close();
+});
+
+test('machine binding outcome cannot be paired with a different identity or revision',t=>{
+  const f=fixture();t.after(f.clean);
+  const s=createDurableOwnerAudit({directory:f.directory});
+  const id=randomUUID();
+  s.auditWrite(machineBindingEvent('intent',id));
+  assert.equal(readDurableOwnerMachineBindingDecision({directory:f.directory,eventId:id}).state,
+    'PENDING');
+  for(const extra of [{ownerDigest:'d'.repeat(64)},
+    {clientId:'vpsc-test-client-0002'},
+    {deviceId:'25e1ccbf-ed9b-4cb0-8292-6b43d9b7704a'},
+    {fingerprint:'e'.repeat(64)},
+    {approvalEventId:'25e1ccbf-ed9b-4cb0-8292-6b43d9b7704a'},
+    {trustRevision:6},
+    {bindingRevisionBefore:9,bindingRevisionAfter:10}]){
+    assert.throws(()=>s.auditWrite(machineBindingEvent('outcome',id,extra)),
+      /without matching intent/);
+  }
+  assert.equal(s.auditWrite(machineBindingEvent('outcome',id)),true);
+  assert.equal(s.inspect().pending,0);
+  s.close();
+});
+
+test('machine binding event accepts the existing maximum Client-ID length',t=>{
+  const f=fixture();t.after(f.clean);
+  const s=createDurableOwnerAudit({directory:f.directory});
+  const id=randomUUID();
+  const clientId='c'.repeat(256);
+  assert.equal(s.auditWrite(machineBindingEvent('intent',id,{clientId})),true);
+  assert.equal(s.auditWrite(machineBindingEvent('outcome',id,{clientId})),true);
+  s.close();
+});
+
+test('machine binding history enumerates complete and pending decisions from the validated WAL',t=>{
+  const f=fixture();t.after(f.clean);
+  const s=createDurableOwnerAudit({directory:f.directory});
+  const completeId=randomUUID(),pendingId=randomUUID();
+  s.auditWrite(machineBindingEvent('intent',completeId));
+  s.auditWrite(machineBindingEvent('outcome',completeId));
+  s.auditWrite(machineBindingEvent('intent',pendingId));
+  s.close();
+  const history=readDurableOwnerMachineBindingHistory({directory:f.directory});
+  assert.deepEqual(history.completed.map(item=>item.eventId),[completeId]);
+  assert.deepEqual(history.pending.map(item=>item.eventId),[pendingId]);
 });

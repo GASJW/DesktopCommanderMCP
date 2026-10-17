@@ -25,13 +25,13 @@ function matchesOutcome(event,receipt){
   }
   return !receipt;
 }
-function diagnose(audit,trust){
+function diagnosePairing(audit,trust){
   if(trust.temporaryFiles?.length&&!trust.lockPresent){
     return {state:'ORPHAN_TRUST_TEMP',temporaryFileCount:trust.temporaryFiles.length};
   }
   const transitions=trust.transitions;
   const receipts=transitions.filter(item=>item.operation==='approve');
-  const events=audit.events;
+  const events=audit.events.filter(event=>event.event==='g7_owner_pairing');
   const intents=new Map(events.filter(event=>event.version===2&&event.phase==='intent')
     .map(event=>[event.eventId,event]));
   const outcomes=new Map(events.filter(event=>event.version===2&&event.phase==='outcome')
@@ -55,7 +55,7 @@ function diagnose(audit,trust){
       return {state:'TRUST_HISTORY_INCOMPLETE',eventId:outcome.eventId};
     }
   }
-  const pending=audit.pending;
+  const pending=audit.pending.filter(event=>event.event==='g7_owner_pairing');
   if(pending.length>1)return {state:'CORRUPT',reason:'multiple unresolved intents'};
   if(pending.length===1){
     const intent=pending[0];
@@ -93,6 +93,14 @@ function diagnose(audit,trust){
   if(events.length===0)return {state:'NO_INTENT'};
   return {state:'CONSISTENT'};
 }
+function diagnose(audit,trust){
+  const pairing=diagnosePairing(audit,trust);
+  const machineIntent=audit.pending.find(event=>event.event==='g7_owner_machine_binding');
+  if(!machineIntent||!['NO_INTENT','CONSISTENT','LEGACY_UNBOUND'].includes(pairing.state))return pairing;
+  return {state:'MACHINE_BINDING_OUTCOME_UNKNOWN',i2State:pairing.state,
+    eventId:machineIntent.eventId,clientId:machineIntent.clientId,
+    deviceId:machineIntent.deviceId,bindingRevisionBefore:machineIntent.bindingRevisionBefore};
+}
 function loadEvidence({auditDirectory,trustDirectory}={}){
   try{
     const audit=inspectDurableOwnerAudit({directory:auditDirectory});
@@ -116,23 +124,36 @@ function withLocks(state,auditDirectory,trustDirectory){
   if(recoveryLocks.length)return {state:'RECOVERY_LOCK_PRESENT',underlyingState:state.state,
     eventId:state.eventId,reason:'An earlier reconciliation lock remains; operator review required'};
   const auditLock=state.audit?.lockPresent??false;
-  const trustLock=state.trust?.lockPresent??false;
+  const trustPermits=state.trust?.dispatchPermits??[];
+  const trustLock=Boolean(state.trust?.lockPresent||state.trust?.operationGatePresent||
+    trustPermits.length);
   const activeAudit=state.audit?.lockStatus==='active';
-  const activeTrust=state.trust?.lockStatus==='active';
+  const activeTrust=state.trust?.lockStatus==='active'||
+    state.trust?.operationGateStatus==='active'||trustPermits.some(lock=>lock.status==='active');
   if(activeAudit||activeTrust)return {state:'ACTIVE_WRITER',underlyingState:state.state,
+    consistencyState:state.i2State??state.state,
     auditWriterActive:activeAudit,trustWriterActive:activeTrust,eventId:state.eventId};
   const unknownAudit=auditLock&&state.audit?.lockStatus!=='dead';
-  const unknownTrust=trustLock&&state.trust?.lockStatus!=='dead';
+  const trustLockStatuses=[
+    ...(state.trust?.lockPresent?[state.trust.lockStatus]:[]),
+    ...(state.trust?.operationGatePresent?[state.trust.operationGateStatus]:[]),
+    ...trustPermits.map(lock=>lock.status),
+  ];
+  const unknownTrust=trustLock&&trustLockStatuses.some(status=>status!=='dead');
   if(unknownAudit||unknownTrust)return {state:'WRITER_LOCK_UNVERIFIED',
     underlyingState:state.state,auditWriterUnverified:unknownAudit,
     trustWriterUnverified:unknownTrust,eventId:state.eventId};
   if((auditLock||trustLock)&&['NO_INTENT','CONSISTENT','LEGACY_UNBOUND'].includes(state.state)){
     return {state:`${state.state}_LOCK_HELD`,
       auditLockPresent:auditLock,trustLockPresent:trustLock,
-      auditLockStatus:state.audit?.lockStatus,trustLockStatus:state.trust?.lockStatus};
+      auditLockStatus:state.audit?.lockStatus,trustLockStatus:state.trust?.lockStatus,
+      trustOperationGateStatus:state.trust?.operationGateStatus,
+      trustDispatchPermitStatuses:trustPermits.map(lock=>lock.status)};
   }
   return {...state,auditLockPresent:auditLock,trustLockPresent:trustLock,
-    auditLockStatus:state.audit?.lockStatus,trustLockStatus:state.trust?.lockStatus};
+    auditLockStatus:state.audit?.lockStatus,trustLockStatus:state.trust?.lockStatus,
+    trustOperationGateStatus:state.trust?.operationGateStatus,
+    trustDispatchPermitStatuses:trustPermits.map(lock=>lock.status)};
 }
 function analyzeInternal({auditDirectory,trustDirectory}={},ignoreRecoveryLock=false){
   const evidence=loadEvidence({auditDirectory,trustDirectory});
@@ -181,9 +202,16 @@ function assertWriterLocksAreDead(evidence){
       throw Error(`Pairing reconciliation blocked: ${name} writer is active or unverified`);
     }
   }
+  if(evidence.trust.operationGatePresent&&evidence.trust.operationGateStatus!=='dead'){
+    throw Error('Pairing reconciliation blocked: trust operation gate is active or unverified');
+  }
+  if(evidence.trust.dispatchPermits.some(lock=>lock.status!=='dead')){
+    throw Error('Pairing reconciliation blocked: trust dispatch permit is active or unverified');
+  }
 }
 function releaseWriterLocks(evidence,options){
-  if(evidence.trust.lockPresent){
+  if(evidence.trust.lockPresent||evidence.trust.operationGatePresent||
+     evidence.trust.dispatchPermits.length){
     releaseTrustWriterLockForReconciliation({directory:options.trustDirectory,
       expectedRevision:evidence.trust.revision,
       expectedSnapshotDigest:evidence.trust.snapshotDigest,
@@ -206,6 +234,7 @@ export function reconcileOwnerPairingRecovery({auditDirectory,trustDirectory,
   if(['CORRUPT','REVISION_DIVERGED','OUTCOME_CONTRADICTS_TRUST',
       'TRUST_RECEIPT_WITHOUT_AUDIT','TRUST_HISTORY_INCOMPLETE',
       'AMBIGUOUS_LEGACY_INTENT','EPHEMERAL_RESULT_UNKNOWN','ORPHAN_TRUST_TEMP',
+      'MACHINE_BINDING_OUTCOME_UNKNOWN',
       'RECOVERY_LOCK_PRESENT','RECOVERY_LOCK_ACTIVE','RECOVERY_LOCK_UNVERIFIED',
       'ACTIVE_WRITER','WRITER_LOCK_UNVERIFIED'].includes(initial.state)){
     throw Error(`Pairing reconciliation blocked: ${initial.state}`);
@@ -218,7 +247,8 @@ export function reconcileOwnerPairingRecovery({auditDirectory,trustDirectory,
     let evidence=analyzeInternal(options,true);
     if(['CORRUPT','REVISION_DIVERGED','OUTCOME_CONTRADICTS_TRUST',
         'TRUST_RECEIPT_WITHOUT_AUDIT','TRUST_HISTORY_INCOMPLETE',
-        'AMBIGUOUS_LEGACY_INTENT','EPHEMERAL_RESULT_UNKNOWN','ORPHAN_TRUST_TEMP'].includes(evidence.state)){
+        'AMBIGUOUS_LEGACY_INTENT','EPHEMERAL_RESULT_UNKNOWN','ORPHAN_TRUST_TEMP',
+        'MACHINE_BINDING_OUTCOME_UNKNOWN'].includes(evidence.state)){
       throw Error(`Pairing reconciliation blocked: ${evidence.state}`);
     }
     assertWriterLocksAreDead(evidence);

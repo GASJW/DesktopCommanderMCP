@@ -49,8 +49,17 @@ export function createLoopbackAgentClient({url,identity,deviceId,fetchFn=fetch}=
   async function poll(){
     return (await post('/agent/poll',{},true)).frame;
   }
+  async function pollControl(){
+    const answer=await post('/agent/poll',{},true);
+    if(!answer||typeof answer!=='object'||Array.isArray(answer)||
+       Object.keys(answer).sort().join(',')!=='cancel,frame')throw Error('Invalid poll control response');
+    return answer;
+  }
   async function result(requestId,result){
     return post('/agent/result',{requestId,result},true);
   }
-  return Object.freeze({connect,heartbeat,poll,result});
+  async function cancelAck({requestId,ownerDigest,status}){
+    return post('/agent/cancel-ack',{requestId,ownerDigest,status},true);
+  }
+  return Object.freeze({connect,heartbeat,poll,pollControl,result,cancelAck});
 }

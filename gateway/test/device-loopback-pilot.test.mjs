@@ -148,11 +148,11 @@ test('connection requires heartbeat before poll and cannot receive queued calls 
     assert.equal(await s.client.poll(),null);
   }finally{await s.close();}
 });
-test('reconnecting with fresh challenge invalidates old queued session and pending call',async()=>{
+test('reconnecting with fresh challenge removes old queued work before agent delivery',async()=>{
   const s=await setup();
   try{
     const old=assert.rejects(s.router.callDevice({deviceId:s.deviceId,name:'ping'}),
-      e=>e.code==='AMBIGUOUS_DISCONNECT');
+      e=>e.code==='CANCELLED');
     await pause();
     const next=await s.client.connect();
     await old;

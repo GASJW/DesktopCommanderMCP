@@ -1,7 +1,8 @@
 // Inert G7 Gateway-to-device MCP candidate. This handler is not imported by
 // gateway/server.mjs; callers must mount it only behind the owner Access
 // boundary after reviewing the deployment-specific policy.
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
+import { ownerIdentityDigest } from '../dashboard/owner-identity.mjs';
 import { signToolGrantCapability } from './tool-grant-capability.mjs';
 const MAX_REQUEST_BYTES=96*1024;
 const MAX_RESPONSE_BYTES=1024*1024;
@@ -62,10 +63,7 @@ function validId(value){
   return typeof value==='string'&&value.length>0&&value.length<=128||
     Number.isSafeInteger(value)&&value>=0;
 }
-function ownerDigest(owner){
-  return createHash('sha256').update('VPSC-I4-OWNER-v1\n')
-    .update(JSON.stringify([owner.issuer,owner.subject])).digest('hex');
-}
+const ownerDigest=ownerIdentityDigest;
 function validApprovalReceipt(value,deviceId,currentTrustRevision){
   return value&&typeof value==='object'&&!Array.isArray(value)&&
     Object.getPrototypeOf(value)===Object.prototype&&
@@ -111,11 +109,13 @@ async function readRequest(req){
   catch{throw Object.assign(Error('Invalid JSON'),{code:'BAD_JSON'});}
 }
 
-export function createRemoteDeviceMcpHandler({accessVerifier,deviceRegistry,router,
+export function createRemoteDeviceMcpHandler({accessVerifier,deviceRegistry,trustStore,router,
   authorizeDevice,grantStore,policySigningKey,getTrustRevision,getDeviceApprovalReceipt}={}){
   if(!accessVerifier||typeof accessVerifier.verifyPrincipal!=='function'||
      !deviceRegistry||typeof deviceRegistry.listDevices!=='function'||
      typeof deviceRegistry.isLiveSession!=='function'||
+     typeof trustStore?.acquireDispatchPermit!=='function'||
+     typeof trustStore?.withCurrentSession!=='function'||
      !router||typeof router.callDevice!=='function'||typeof authorizeDevice!=='function'||
      !grantStore||typeof grantStore.authorizeAndPermit!=='function'||
      typeof grantStore.withCurrentAuthorization!=='function'||!policySigningKey||
@@ -242,11 +242,28 @@ export function createRemoteDeviceMcpHandler({accessVerifier,deviceRegistry,rout
           const permit=await grantStore.authorizeAndPermit({ownerDigest:ownerDigest(owner),deviceId,
             fingerprint:approvalReceipt.fingerprint,tool:name,arguments:arguments_,requestId,
             approvalReceipt},{signCapability:claims=>signToolGrantCapability(claims,policySigningKey)});
+          let trustPermit;
+          try{
+            trustPermit=trustStore.acquireDispatchPermit({deviceId,sessionId:dispatch.sessionId,
+              expectedRevision:trustRevisionAfter});
+          }catch(error){
+            try{permit.release();}catch{}
+            throw Object.assign(Error('Trust authorization changed before transport handoff'),
+              {code:error?.code??'TRUST_UNAVAILABLE'});
+          }
           authorizationContext={grantId:permit.grantId,ownerDigest:ownerDigest(owner),deviceId,
             fingerprint:approvalReceipt.fingerprint,tool:name,policyRevision:permit.policyRevision};
           responseFenceContext={deviceId,owner,fingerprint:approvalReceipt.fingerprint,
             trustRevision:trustRevisionAfter,approvalReceipt,sessionId:dispatch.sessionId};
-          return {authorization:permit.authorization,release:permit.release};
+          let released=false;
+          return {authorization:permit.authorization,release:()=>{
+            if(released)return false;
+            let error;
+            try{trustPermit.release();}catch(value){error=value;}
+            try{permit.release();}catch(value){error??=value;}
+            if(error)throw error;
+            released=true;return true;
+          }};
         }});
       if(res.destroyed)return;
       serialized=JSON.stringify(result);
@@ -255,11 +272,13 @@ export function createRemoteDeviceMcpHandler({accessVerifier,deviceRegistry,rout
       }
       let delivered=false;
       try{
+        trustStore.withCurrentSession({deviceId:responseFenceContext.deviceId,
+          sessionId:responseFenceContext.sessionId,expectedRevision:responseFenceContext.trustRevision},trustSessionProof=>
         grantStore.withCurrentAuthorization(authorizationContext,()=>{
           if(res.destroyed)return;
           const currentTrustRevision=getTrustRevision();
           const currentApprovalReceipt=getDeviceApprovalReceipt(responseFenceContext.owner,
-            responseFenceContext.deviceId);
+            responseFenceContext.deviceId,trustSessionProof);
           const receiptMatches=validApprovalReceipt(currentApprovalReceipt,responseFenceContext.deviceId,
             currentTrustRevision)&&
             currentApprovalReceipt.eventId===responseFenceContext.approvalReceipt.eventId&&
@@ -273,7 +292,7 @@ export function createRemoteDeviceMcpHandler({accessVerifier,deviceRegistry,rout
               {code:'DEVICE_AUTHORIZATION_CHANGED'});
           }
           send(res,200,{jsonrpc:'2.0',id:message.id,result:JSON.parse(serialized)});delivered=true;
-        });
+        }));
       }catch(error){
         if(res.destroyed)return;
         const code=error?.code==='DENIED'?'AMBIGUOUS_GRANT_REVOCATION':'AMBIGUOUS_AUTHORIZATION_FENCE';

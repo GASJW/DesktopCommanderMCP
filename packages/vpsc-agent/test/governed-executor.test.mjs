@@ -355,6 +355,69 @@ test('SIGKILL in the real executor after durable write and intent leaves ambigui
   }
 });
 
+test('SIGKILL after cooperative cancellation but before outcome leaves an ambiguous non-replayable intent',{
+  skip:!available||process.platform!=='linux',
+},async()=>{
+  const directory=mkdtempSync(path.join(os.tmpdir(),'vpsc-i4-cancel-crash-'));
+  const root=path.join(directory,'approved'),state=path.join(directory,'state');
+  mkdirSync(root,{mode:0o700});mkdirSync(state,{mode:0o700});
+  const target=path.join(root,'effect.txt'),requestId=randomUUID();
+  const fixturePath=fileURLToPath(new URL('./fixtures-i4-cancel-crash.mjs',import.meta.url));
+  const child=spawn(process.execPath,[fixturePath,root,state,target,requestId,DEVICE,FIXTURE],
+    {stdio:['ignore','pipe','pipe'],detached:true,
+      env:{...process.env,NODE_TEST_CONTEXT:process.env.NODE_TEST_CONTEXT??'child-v8'}});
+  let output='',stderr='';
+  child.stdout.on('data',chunk=>output+=chunk.toString());
+  child.stderr.on('data',chunk=>stderr+=chunk.toString());
+  const waitForMarker=marker=>new Promise((resolve,reject)=>{
+    if(output.includes(marker))return resolve();
+    const timer=setTimeout(()=>reject(Error(`cancellation crash fixture missed ${marker}: ${output} ${stderr}`)),5000);
+    const onData=()=>{if(output.includes(marker)){clearTimeout(timer);child.stdout.off('data',onData);resolve();}};
+    child.stdout.on('data',onData);
+    child.once('error',error=>{clearTimeout(timer);reject(error);});
+    child.once('exit',(code,signal)=>{
+      if(!output.includes(marker)){clearTimeout(timer);reject(Error(`fixture exited before ${marker} (${code}, ${signal}): ${stderr}`));}
+    });
+  });
+  const childExit=new Promise(resolve=>child.once('exit',resolve));
+  try{
+    await waitForMarker('EFFECT_DURABLE');
+    assert.equal(readFileSync(target,'utf8'),'effect-before-cancel-crash\n');
+    const cancelSignal=new Promise((resolve,reject)=>{
+      try{process.kill(child.pid,'SIGUSR1');resolve();}catch(error){reject(error);}
+    });
+    await cancelSignal;
+    await waitForMarker('CANCELLATION_OBSERVED');
+    process.kill(-child.pid,'SIGKILL');
+    await childExit;
+    const intentOnly=readFileSync(path.join(state,'i4-execution.jsonl'),'utf8').trim().split('\n')
+      .map(line=>JSON.parse(line));
+    assert.equal(intentOnly.length,1);
+    assert.equal(intentOnly[0].type,'intent');
+    assert.equal(intentOnly[0].requestId,requestId);
+    assert.equal(readFileSync(target,'utf8'),'effect-before-cancel-crash\n');
+    let diagnosis=analyzeI4ExecutionRecovery({ledgerDirectory:state});
+    assert.equal(diagnosis.status,'stale-lock');
+    assert.equal(diagnosis.lock.status,'dead');
+    assert.equal(diagnosis.unresolved.length,1);
+    assert.equal(removeDeadDurableProcessLock({directory:state,name:'i4-execution-lock',
+      expectedDigest:diagnosis.lock.digest}),true);
+    diagnosis=analyzeI4ExecutionRecovery({ledgerDirectory:state});
+    assert.equal(diagnosis.status,'ambiguous-intent');
+    const executor=configuredExecutor({allowedRoot:root,entrypoint:FIXTURE,ledgerDirectory:state});
+    await assert.rejects(executor.start(),error=>error.code==='RECOVERY_REQUIRED');
+    assert.equal(readFileSync(target,'utf8'),'effect-before-cancel-crash\n');
+    assert.equal(readFileSync(path.join(state,'i4-execution.jsonl'),'utf8').trim().split('\n').length,1);
+    await executor.close();
+  }finally{
+    if(child.exitCode===null&&child.signalCode===null){
+      try{process.kill(-child.pid,'SIGKILL');}catch{}
+      await childExit;
+    }
+    rmSync(directory,{recursive:true,force:true});
+  }
+});
+
 test('two agent processes racing one stable request commit at most one filesystem mutation',{
   skip:!available,
 },async()=>{
