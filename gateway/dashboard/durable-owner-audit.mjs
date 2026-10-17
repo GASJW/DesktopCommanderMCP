@@ -2,8 +2,10 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import {
   constants, closeSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync,
-  readFileSync, readSync, readdirSync, rmdirSync, writeSync,
+  readFileSync, readSync, writeSync,
 } from 'node:fs';
+import { createDurableProcessLock, inspectDurableProcessLock,
+  removeDeadDurableProcessLock, removeOwnedDurableProcessLock } from '../common/durable-process-lock.mjs';
 
 // G7 candidate: inert, not imported by the production Gateway.
 // POSIX single-writer append-only WAL. Failure is fail-closed; no auto-repair.
@@ -70,17 +72,15 @@ function syncDirectory(directory) {
   try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 function auditLockEvidence(directory){
-  const lock=path.join(directory,LOCK);
-  let st;
-  try{st=lstatSync(lock);}catch(error){
-    if(error?.code==='ENOENT')return {path:lock,present:false};
-    throw error;
+  return inspectDurableProcessLock(directory,LOCK);
+}
+function requireRecoveryLock(directory){
+  const lock=inspectDurableProcessLock(directory,'.owner-pairing-reconciliation.lock');
+  if(!lock.present||lock.status!=='active'||lock.owner.kind!=='reconciliation'||
+     lock.owner.pid!==process.pid){
+    throw Error('Current process reconciliation lock required');
   }
-  if(!st.isDirectory()||st.isSymbolicLink()||st.uid!==process.getuid()||
-     (st.mode&0o7777)!==0o700||readdirSync(lock).length!==0){
-    throw Error('Unsafe owner audit writer lock');
-  }
-  return {path:lock,present:true};
+  return lock;
 }
 function assertNoReconciliationLock(directory){
   const lock=path.join(directory,'.owner-pairing-reconciliation.lock');
@@ -210,10 +210,9 @@ function replay(bytes) {
 export function createDurableOwnerAudit({ directory } = {}) {
   privateDirectory(directory);
   assertNoReconciliationLock(directory);
-  const lock = path.join(directory, LOCK);
   // Exclusive mkdir fences ALL writers, including other processes. On a
   // crash, the lock is deliberately left behind for manual reconciliation.
-  mkdirSync(lock, { mode: 0o700 });
+  const lockOwner=createDurableProcessLock(directory,LOCK,'audit-writer');
   let blocked = true;
   let closed = false;
   const file = path.join(directory, LOG);
@@ -298,13 +297,7 @@ export function createDurableOwnerAudit({ directory } = {}) {
       closed = true;
       if (fd !== undefined) { closeSync(fd); fd = undefined; }
       if (blocked) return; // preserve lock on any uncertainty
-      const st = lstatSync(lock);
-      if (!st.isDirectory() || st.isSymbolicLink() ||
-          st.uid !== process.getuid() || (st.mode & 0o7777) !== 0o700) {
-        throw new Error('Audit writer lock changed unexpectedly');
-      }
-      rmdirSync(lock);
-      syncDirectory(directory);
+      removeOwnedDurableProcessLock({directory,name:LOCK,owner:lockOwner});
     }
     return Object.freeze({ auditWrite, inspect, close });
   } catch (error) {
@@ -332,7 +325,8 @@ export function inspectDurableOwnerAudit({directory}={}){
   const lock=auditLockEvidence(directory);
   return Object.freeze({exists:logExists,sequence:state.seq,hash:state.hash,bytes:bytes.length,
     events:Object.freeze(state.events.slice()),
-    pending:Object.freeze(Array.from(state.pending.values())),lockPresent:lock.present});
+    pending:Object.freeze(Array.from(state.pending.values())),lockPresent:lock.present,
+    lockStatus:lock.status,lockReason:lock.reason,lockDigest:lock.digest});
 }
 
 // The recovery coordinator calls this only after obtaining its own exclusive
@@ -343,18 +337,11 @@ export function appendRecoveredOwnerOutcome({directory,intent,outcome,
     throw Error('Operator confirmation that no writers are active is required');
   }
   privateDirectory(directory);
-  const recoveryLock=path.join(directory,'.owner-pairing-reconciliation.lock');
-  const recoveryStat=lstatSync(recoveryLock);
-  if(!recoveryStat.isDirectory()||recoveryStat.isSymbolicLink()||
-     recoveryStat.uid!==process.getuid()||(recoveryStat.mode&0o7777)!==0o700||
-     readdirSync(recoveryLock).length!==0){
-    throw Error('Reconciliation lock required to append recovered outcome');
-  }
-  const lockPath=path.join(directory,LOCK);
-  try{mkdirSync(lockPath,{mode:0o700});syncDirectory(directory);}
-  catch(error){if(error?.code!=='EEXIST')throw error;}
+  requireRecoveryLock(directory);
   const lock=auditLockEvidence(directory);
-  if(!lock.present)throw Error('Owner audit writer lock unavailable');
+  if(lock.present&&lock.status!=='dead'){
+    throw Error('Owner audit writer process is active or cannot be verified');
+  }
   const file=path.join(directory,LOG);
   const fd=openSync(file,constants.O_RDWR|(constants.O_NOFOLLOW??0));
   try{
@@ -391,20 +378,12 @@ export function releaseOwnerAuditLockForReconciliation({directory,expectedSequen
   if(operatorConfirmedNoActiveWriters!==true){
     throw Error('Operator confirmation that no writers are active is required');
   }
-  const recoveryLock=path.join(directory,'.owner-pairing-reconciliation.lock');
-  const recoveryStat=lstatSync(recoveryLock);
-  if(!recoveryStat.isDirectory()||recoveryStat.isSymbolicLink()||
-     recoveryStat.uid!==process.getuid()||(recoveryStat.mode&0o7777)!==0o700||
-     readdirSync(recoveryLock).length!==0){
-    throw Error('Reconciliation lock required to release owner audit lock');
-  }
+  requireRecoveryLock(directory);
   const evidence=inspectDurableOwnerAudit({directory});
   if(evidence.sequence!==expectedSequence||evidence.hash!==expectedHash||evidence.pending.length){
     throw Error('Owner audit evidence changed during reconciliation');
   }
   if(!evidence.lockPresent)return false;
-  const lock=auditLockEvidence(directory);
-  rmdirSync(lock.path);
-  syncDirectory(directory);
-  return true;
+  if(evidence.lockStatus!=='dead')throw Error('Owner audit writer is active or unverified');
+  return removeDeadDurableProcessLock({directory,name:LOCK,expectedDigest:evidence.lockDigest});
 }

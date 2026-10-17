@@ -1,8 +1,10 @@
 import path from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { constants, closeSync, fstatSync, fsyncSync, lstatSync,
-  mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
+  mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createDeviceRegistry } from './registry.mjs';
+import { createDurableProcessLock, inspectDurableProcessLock,
+  removeDeadDurableProcessLock, removeOwnedDurableProcessLock } from '../common/durable-process-lock.mjs';
 
 // G7.2e candidate. Server-side trust records contain PUBLIC keys only.
 // Not wired into gateway/server.mjs, Cloudflare or any live tool endpoint.
@@ -68,12 +70,8 @@ function assertNoTrustTemps(directory){
   if(trustTempEvidence(directory).length)throw Error('Trust temporary snapshot requires reconciliation');
 }
 function assertNoWriterLock(directory){
-  const lock=path.join(directory,'.trusted-devices-writer.lock');
-  try{lstatSync(lock);}catch(e){
-    if(e?.code==='ENOENT')return;
-    throw e;
-  }
-  throw Error('Trust writer lock present; manual reconciliation required');
+  const lock=inspectDurableProcessLock(directory,'.trusted-devices-writer.lock');
+  if(lock.present)throw Error('Trust writer lock present; manual reconciliation required');
 }
 function assertNoReconciliationLock(directory){
   const lock=path.join(directory,'.owner-pairing-reconciliation.lock');
@@ -280,10 +278,11 @@ export function createDurableDeviceTrustStore({directory,maxDevices=32,now=Date.
     blocked=true; // Fail closed if ANY storage/lock failure or stale snapshot occurs.
     // mkdir is exclusive across processes on a local POSIX filesystem. Never
     // steal a pre-existing lock: after a crash, an operator must reconcile it.
-    const lock=path.join(directory,'.trusted-devices-writer.lock');
+    const lockName='.trusted-devices-writer.lock';
     let locked=false, committed=false, staleSnapshot=false;
+    let lockOwner;
     try {
-      mkdirSync(lock,{mode:0o700});
+      lockOwner=createDurableProcessLock(directory,lockName,'trust-writer');
       locked=true;
       const lockDirFd=openSync(directory,constants.O_RDONLY|(constants.O_NOFOLLOW??0));
       try{fsyncSync(lockDirFd);}finally{closeSync(lockDirFd);}
@@ -301,7 +300,7 @@ export function createDurableDeviceTrustStore({directory,maxDevices=32,now=Date.
       committed=true;
       snapshot=next;
       current=candidate; // New registry discards sessions / challenges.
-      rmdirSync(lock);
+      removeOwnedDurableProcessLock({directory,name:lockName,owner:lockOwner});
       locked=false;
       const dirFd=openSync(directory,constants.O_RDONLY|(constants.O_NOFOLLOW??0));
       try{fsyncSync(dirFd);}finally{closeSync(dirFd);}
@@ -312,7 +311,7 @@ export function createDurableDeviceTrustStore({directory,maxDevices=32,now=Date.
       // A deterministic pre-commit stale revision is safe to release.
       if(locked&&!committed){
         if(staleSnapshot){
-          rmdirSync(lock);
+          removeOwnedDurableProcessLock({directory,name:lockName,owner:lockOwner});
           locked=false;
           const dirFd=openSync(directory,constants.O_RDONLY|(constants.O_NOFOLLOW??0));
           try{fsyncSync(dirFd);}finally{closeSync(dirFd);}
@@ -374,17 +373,7 @@ export function createDurableDeviceTrustStore({directory,maxDevices=32,now=Date.
 }
 
 function trustLockEvidence(directory){
-  const lock=path.join(directory,'.trusted-devices-writer.lock');
-  let st;
-  try{st=lstatSync(lock);}catch(error){
-    if(error?.code==='ENOENT')return {present:false,path:lock};
-    throw error;
-  }
-  if(!st.isDirectory()||st.isSymbolicLink()||st.uid!==process.getuid()||
-     (st.mode&0o7777)!==0o700||readdirSync(lock).length!==0){
-    throw Error('Unsafe trust writer lock; manual reconciliation required');
-  }
-  return {present:true,path:lock};
+  return inspectDurableProcessLock(directory,'.trusted-devices-writer.lock');
 }
 
 // Read-only evidence inspection intentionally works while an old writer lock
@@ -396,6 +385,7 @@ export function inspectDurableDeviceTrust({directory}={}){
   const lock=trustLockEvidence(directory);
   const temporaryFiles=trustTempEvidence(directory);
   return Object.freeze({...snapshot,lockPresent:lock.present,
+    lockStatus:lock.status,lockReason:lock.reason,lockDigest:lock.digest,
     temporaryFiles:Object.freeze(temporaryFiles),
     snapshotDigest:createHash('sha256').update(JSON.stringify({snapshot,temporaryFiles})).digest('hex')});
 }
@@ -408,11 +398,9 @@ export function releaseTrustWriterLockForReconciliation({directory,expectedRevis
     throw Error('Operator confirmation that no writers are active is required');
   }
   checkDirectory(directory);
-  const recoveryLock=path.join(directory,'.owner-pairing-reconciliation.lock');
-  const recoveryStat=lstatSync(recoveryLock);
-  if(!recoveryStat.isDirectory()||recoveryStat.isSymbolicLink()||
-     recoveryStat.uid!==process.getuid()||(recoveryStat.mode&0o7777)!==0o700||
-     readdirSync(recoveryLock).length!==0){
+  const recoveryLock=inspectDurableProcessLock(directory,'.owner-pairing-reconciliation.lock');
+  if(!recoveryLock.present||recoveryLock.status!=='active'||
+     recoveryLock.owner.kind!=='reconciliation'||recoveryLock.owner.pid!==process.pid){
     throw Error('Reconciliation lock required to release trust writer lock');
   }
   const evidence=inspectDurableDeviceTrust({directory});
@@ -421,6 +409,7 @@ export function releaseTrustWriterLockForReconciliation({directory,expectedRevis
   }
   const lock=trustLockEvidence(directory);
   if(!lock.present)return false;
+  if(lock.status!=='dead')throw Error('Trust writer is active or unverified');
   for(const item of evidence.temporaryFiles){
     const filename=path.join(directory,item.name),current=lstatSync(filename);
     if(!current.isFile()||current.isSymbolicLink()||current.dev!==item.dev||
@@ -430,8 +419,6 @@ export function releaseTrustWriterLockForReconciliation({directory,expectedRevis
     }
     unlinkSync(filename);
   }
-  rmdirSync(lock.path);
-  const dirFd=openSync(directory,constants.O_RDONLY|(constants.O_NOFOLLOW??0));
-  try{fsyncSync(dirFd);}finally{closeSync(dirFd);}
-  return true;
+  return removeDeadDurableProcessLock({directory,name:'.trusted-devices-writer.lock',
+    expectedDigest:lock.digest});
 }

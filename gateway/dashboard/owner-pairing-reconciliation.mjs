@@ -1,5 +1,5 @@
-import path from 'node:path';
-import { closeSync, constants, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, rmdirSync } from 'node:fs';
+import { inspectDurableProcessLock, createDurableProcessLock,
+  removeDeadDurableProcessLock, removeOwnedDurableProcessLock } from '../common/durable-process-lock.mjs';
 import {
   appendRecoveredOwnerOutcome, inspectDurableOwnerAudit,
   releaseOwnerAuditLockForReconciliation,
@@ -10,23 +10,7 @@ import {
 
 const RECOVERY_LOCK='.owner-pairing-reconciliation.lock';
 
-function lockPresent(directory){
-  const filename=path.join(directory,RECOVERY_LOCK);
-  let stat;
-  try{stat=lstatSync(filename);}catch(error){
-    if(error?.code==='ENOENT')return false;
-    throw error;
-  }
-  if(!stat.isDirectory()||stat.isSymbolicLink()||stat.uid!==process.getuid()||
-     (stat.mode&0o7777)!==0o700||readdirSync(filename).length!==0){
-    throw Error('Unsafe reconciliation lock');
-  }
-  return true;
-}
-function syncDirectory(directory){
-  const fd=openSync(directory,constants.O_RDONLY|(constants.O_NOFOLLOW??0));
-  try{fsyncSync(fd);}finally{closeSync(fd);}
-}
+function recoveryLockEvidence(directory){return inspectDurableProcessLock(directory,RECOVERY_LOCK);}
 function exactReceipt(event,transition){
   return transition?.operation==='approve'&&transition.eventId===event.eventId&&
     transition.requestId===event.requestId&&transition.fingerprint===event.fingerprint&&
@@ -119,18 +103,36 @@ function loadEvidence({auditDirectory,trustDirectory}={}){
   }
 }
 function withLocks(state,auditDirectory,trustDirectory){
-  let recoveryLockPresent;
-  try{recoveryLockPresent=lockPresent(auditDirectory)||lockPresent(trustDirectory);}
+  let recoveryLocks;
+  try{recoveryLocks=[...new Set([auditDirectory,trustDirectory])]
+    .map(directory=>recoveryLockEvidence(directory)).filter(lock=>lock.present);}
   catch(error){return {state:'CORRUPT',reason:String(error?.message??error).slice(0,240)};}
-  if(recoveryLockPresent)return {state:'RECOVERY_LOCK_PRESENT',underlyingState:state.state,
+  const liveRecovery=recoveryLocks.find(lock=>lock.status==='active');
+  if(liveRecovery)return {state:'RECOVERY_LOCK_ACTIVE',underlyingState:state.state,
+    reason:'A reconciliation process is still active'};
+  if(recoveryLocks.some(lock=>lock.status==='unknown'))return {
+    state:'RECOVERY_LOCK_UNVERIFIED',underlyingState:state.state,
+    reason:'Reconciliation lock owner identity is unavailable'};
+  if(recoveryLocks.length)return {state:'RECOVERY_LOCK_PRESENT',underlyingState:state.state,
     eventId:state.eventId,reason:'An earlier reconciliation lock remains; operator review required'};
   const auditLock=state.audit?.lockPresent??false;
   const trustLock=state.trust?.lockPresent??false;
+  const activeAudit=state.audit?.lockStatus==='active';
+  const activeTrust=state.trust?.lockStatus==='active';
+  if(activeAudit||activeTrust)return {state:'ACTIVE_WRITER',underlyingState:state.state,
+    auditWriterActive:activeAudit,trustWriterActive:activeTrust,eventId:state.eventId};
+  const unknownAudit=auditLock&&state.audit?.lockStatus!=='dead';
+  const unknownTrust=trustLock&&state.trust?.lockStatus!=='dead';
+  if(unknownAudit||unknownTrust)return {state:'WRITER_LOCK_UNVERIFIED',
+    underlyingState:state.state,auditWriterUnverified:unknownAudit,
+    trustWriterUnverified:unknownTrust,eventId:state.eventId};
   if((auditLock||trustLock)&&['NO_INTENT','CONSISTENT','LEGACY_UNBOUND'].includes(state.state)){
     return {state:`${state.state}_LOCK_HELD`,
-      auditLockPresent:auditLock,trustLockPresent:trustLock};
+      auditLockPresent:auditLock,trustLockPresent:trustLock,
+      auditLockStatus:state.audit?.lockStatus,trustLockStatus:state.trust?.lockStatus};
   }
-  return {...state,auditLockPresent:auditLock,trustLockPresent:trustLock};
+  return {...state,auditLockPresent:auditLock,trustLockPresent:trustLock,
+    auditLockStatus:state.audit?.lockStatus,trustLockStatus:state.trust?.lockStatus};
 }
 function analyzeInternal({auditDirectory,trustDirectory}={},ignoreRecoveryLock=false){
   const evidence=loadEvidence({auditDirectory,trustDirectory});
@@ -152,24 +154,31 @@ function acquireRecoveryLocks(directories){
   const created=[];
   try{
     for(const directory of [...new Set(directories)].sort()){
-      const filename=path.join(directory,RECOVERY_LOCK);
-      mkdirSync(filename,{mode:0o700});
-      created.push({directory,filename});
-      syncDirectory(directory);
+      const owner=createDurableProcessLock(directory,RECOVERY_LOCK,'reconciliation');
+      created.push({directory,owner});
     }
     return created;
   }catch(error){
     for(const lock of created.reverse()){
-      try{rmdirSync(lock.filename);syncDirectory(lock.directory);}catch{}
+      try{removeOwnedDurableProcessLock({directory:lock.directory,name:RECOVERY_LOCK,
+        owner:lock.owner});}catch{}
     }
     if(error?.code==='EEXIST')throw Error('Reconciliation lock already exists; explicit stale-lock review required');
     throw error;
   }
 }
-function releaseRecoveryLocks(locks){
-  for(const lock of [...locks].reverse()){
-    if(lockPresent(lock.directory)){
-      rmdirSync(lock.filename);syncDirectory(lock.directory);
+function releaseRecoveryLocks(locks,auditDirectory){
+  const releaseOrder=[...locks].sort((a,b)=>
+    Number(a.directory===auditDirectory)-Number(b.directory===auditDirectory));
+  for(const lock of releaseOrder){
+    removeOwnedDurableProcessLock({directory:lock.directory,name:RECOVERY_LOCK,
+      owner:lock.owner});
+  }
+}
+function assertWriterLocksAreDead(evidence){
+  for(const [name,lock] of [['audit',evidence.audit],['trust',evidence.trust]]){
+    if(lock?.lockPresent&&lock.lockStatus!=='dead'){
+      throw Error(`Pairing reconciliation blocked: ${name} writer is active or unverified`);
     }
   }
 }
@@ -197,12 +206,13 @@ export function reconcileOwnerPairingRecovery({auditDirectory,trustDirectory,
   if(['CORRUPT','REVISION_DIVERGED','OUTCOME_CONTRADICTS_TRUST',
       'TRUST_RECEIPT_WITHOUT_AUDIT','TRUST_HISTORY_INCOMPLETE',
       'AMBIGUOUS_LEGACY_INTENT','EPHEMERAL_RESULT_UNKNOWN','ORPHAN_TRUST_TEMP',
-      'RECOVERY_LOCK_PRESENT'].includes(initial.state)){
+      'RECOVERY_LOCK_PRESENT','RECOVERY_LOCK_ACTIVE','RECOVERY_LOCK_UNVERIFIED',
+      'ACTIVE_WRITER','WRITER_LOCK_UNVERIFIED'].includes(initial.state)){
     throw Error(`Pairing reconciliation blocked: ${initial.state}`);
   }
   if(['NO_INTENT','CONSISTENT','LEGACY_UNBOUND'].includes(initial.state)&&
      !initial.auditLockPresent&&!initial.trustLockPresent)return Object.freeze(initial);
-  const locks=acquireRecoveryLocks([auditDirectory,trustDirectory]);
+  const locks=acquireRecoveryLocks([trustDirectory,auditDirectory]);
   let changed=false;
   try{
     let evidence=analyzeInternal(options,true);
@@ -211,6 +221,7 @@ export function reconcileOwnerPairingRecovery({auditDirectory,trustDirectory,
         'AMBIGUOUS_LEGACY_INTENT','EPHEMERAL_RESULT_UNKNOWN','ORPHAN_TRUST_TEMP'].includes(evidence.state)){
       throw Error(`Pairing reconciliation blocked: ${evidence.state}`);
     }
+    assertWriterLocksAreDead(evidence);
     let repairedState='RECONCILED_CONSISTENT';
     if(evidence.state==='COMMITTED_OUTCOME_MISSING'||evidence.state==='INTENT_NOT_APPLIED'){
       const intent=evidence.audit.pending[0];
@@ -223,15 +234,19 @@ export function reconcileOwnerPairingRecovery({auditDirectory,trustDirectory,
         deviceId:committed?evidence.deviceId:null,
         trustRevisionAfter:committed?evidence.trustRevisionAfter:evidence.trust.revision};
       if(evidence.trust.lockPresent){
+        // Lock removal can have an uncertain fsync result; keep the recovery
+        // mutex if the durable operation throws at any point.
+        changed=true;
         releaseTrustWriterLockForReconciliation({directory:trustDirectory,
           expectedRevision:evidence.trust.revision,
           expectedSnapshotDigest:evidence.trust.snapshotDigest,
           operatorConfirmedNoActiveWriters:true});
-        changed=true;
       }
+      // The append may reach disk before fsync reports an error. Treat the
+      // WAL as mutated from the start of the attempt and preserve both locks.
+      changed=true;
       appendRecoveredOwnerOutcome({directory:auditDirectory,intent,outcome,
         operatorConfirmedNoActiveWriters:true});
-      changed=true;
       repairedState=committed?'RECONCILED_ACCEPTED':'RECONCILED_NOT_APPLIED';
       evidence=analyzeInternal(options,true);
       if(!['CONSISTENT','LEGACY_UNBOUND'].includes(evidence.state)){
@@ -240,12 +255,13 @@ export function reconcileOwnerPairingRecovery({auditDirectory,trustDirectory,
     }else if(!['NO_INTENT','CONSISTENT','LEGACY_UNBOUND'].includes(evidence.state)){
       throw Error(`Pairing reconciliation blocked: ${evidence.state}`);
     }
-    releaseWriterLocks(evidence,options);
     changed=true;
-    releaseRecoveryLocks(locks);
-    const final=analyzeInternal(options);
+    releaseWriterLocks(evidence,options);
+    const final=analyzeInternal(options,true);
     if(!['NO_INTENT','CONSISTENT','LEGACY_UNBOUND'].includes(final.state))
       throw Error(`Pairing reconciliation final check failed: ${final.state}`);
+    assertWriterLocksAreDead(final);
+    releaseRecoveryLocks(locks,auditDirectory);
     const resultState=repairedState==='RECONCILED_CONSISTENT'&&final.state==='LEGACY_UNBOUND'
       ?'RECONCILED_LEGACY_UNBOUND'
       :repairedState==='RECONCILED_CONSISTENT'&&final.state==='NO_INTENT'
@@ -254,7 +270,7 @@ export function reconcileOwnerPairingRecovery({auditDirectory,trustDirectory,
       ...(initial.eventId?{eventId:initial.eventId}:{})});
   }catch(error){
     if(!changed){
-      try{releaseRecoveryLocks(locks);}catch{}
+      try{releaseRecoveryLocks(locks,auditDirectory);}catch{}
     }
     throw error;
   }
@@ -268,11 +284,17 @@ export function clearStaleOwnerPairingRecoveryLocks({auditDirectory,trustDirecto
     throw Error('Operator confirmation that no reconciliation process is active is required');
   }
   const directories=[...new Set([auditDirectory,trustDirectory])];
+  const locks=directories.map(directory=>recoveryLockEvidence(directory))
+    .filter(lock=>lock.present);
+  if(locks.some(lock=>lock.status!=='dead')){
+    throw Error('Cannot clear a reconciliation lock with an active or unverified owner');
+  }
+  const releaseOrder=locks.sort((a,b)=>
+    Number(a.directory===auditDirectory)-Number(b.directory===auditDirectory));
   let cleared=0;
-  for(const directory of directories){
-    if(!lockPresent(directory))continue;
-    const filename=path.join(directory,RECOVERY_LOCK);
-    rmdirSync(filename);syncDirectory(directory);cleared++;
+  for(const lock of releaseOrder){
+    if(removeDeadDurableProcessLock({directory:lock.directory,name:RECOVERY_LOCK,
+      expectedDigest:lock.digest}))cleared++;
   }
   return Object.freeze({cleared});
 }

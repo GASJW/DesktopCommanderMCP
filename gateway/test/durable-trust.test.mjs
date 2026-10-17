@@ -342,29 +342,32 @@ test('pre-commit stale snapshot releases its own lock for recovery',()=>{
     const store=createDurableDeviceTrustStore({directory:dir});
     store.trustDevice(metadata(generate(),'first'));
     const lock=path.join(dir,'.trusted-devices-writer.lock');
-    const originalMkdirSync=fs.mkdirSync;
-    fs.mkdirSync=(...args)=>{
-      const result=originalMkdirSync(...args);
-      if(args[0]===lock){
+    const originalFsyncSync=fs.fsyncSync;
+    let snapshotChanged=false;
+    fs.fsyncSync=(fd)=>{
+      let target='';try{target=fs.readlinkSync(`/proc/self/fd/${fd}`);}catch{}
+      if(!snapshotChanged&&target===dir&&lstatSync(lock).isDirectory()){
         const snapshot=JSON.parse(readFileSync(file(dir),'utf8'));
         snapshot.revision++;
         snapshot.historyStartRevision=snapshot.revision;
         snapshot.historyStartDevices=snapshot.devices.map(({deviceId,fingerprint})=>({deviceId,fingerprint}));
         snapshot.transitions=[];
         writeFileSync(file(dir),JSON.stringify(snapshot)+'\n');
+        snapshotChanged=true;
       }
-      return result;
+      return originalFsyncSync(fd);
     };
     syncBuiltinESMExports();
     try{
       assert.throws(()=>store.trustDevice(metadata(generate(),'second')),
         /Trust store changed by another process/);
+      assert.equal(snapshotChanged,true);
       assert.throws(()=>lstatSync(lock),{code:'ENOENT'});
       const recovered=createDurableDeviceTrustStore({directory:dir});
       assert.equal(recovered.revision(),2);
       assert.equal(recovered.registry.listDevices().length,1);
     }finally{
-      fs.mkdirSync=originalMkdirSync;
+      fs.fsyncSync=originalFsyncSync;
       syncBuiltinESMExports();
     }
   });
@@ -483,9 +486,14 @@ test('killed writer process leaves a durable lock that blocks restart',async()=>
     const source=`
       import fs from 'node:fs';
       import {syncBuiltinESMExports} from 'node:module';
-      fs.fsyncSync=()=>{
+      const originalFsyncSync=fs.fsyncSync;
+      fs.fsyncSync=(fd)=>{
+        const lock=path.join(process.argv[1],'.trusted-devices-writer.lock');
+        let target='';try{target=fs.readlinkSync('/proc/self/fd/'+fd);}catch{}
+        if(target!==process.argv[1]||!fs.existsSync(lock))return originalFsyncSync(fd);
         process.stdout.write('LOCKED\\n');
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,120000);
+        return originalFsyncSync(fd);
       };
       syncBuiltinESMExports();
       const {createDurableDeviceTrustStore}=await import('./gateway/devices/durable-trust.mjs');

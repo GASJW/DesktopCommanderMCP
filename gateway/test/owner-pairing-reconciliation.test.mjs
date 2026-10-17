@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -81,6 +84,40 @@ function approvedBinding(){
   const fingerprint=createHash('sha256').update(createPublicKey(publicKeyPem)
     .export({type:'spki',format:'der'})).digest('hex');
   return {publicKeyPem,fingerprint,eventId:randomUUID(),requestId:randomUUID()};
+}
+async function activeRecoveryChild(f){
+  const helperUrl=new URL('../common/durable-process-lock.mjs',import.meta.url).href;
+  const source=`
+    import {createDurableProcessLock} from ${JSON.stringify(helperUrl)};
+    for(const directory of process.argv.slice(1))
+      createDurableProcessLock(directory,'.owner-pairing-reconciliation.lock','reconciliation');
+    process.stdout.write('ready\\n');
+    setInterval(()=>{},1000);
+  `;
+  const child=spawn(process.execPath,['--input-type=module','-e',source,
+    f.auditDirectory,f.trustDirectory],{stdio:['ignore','pipe','pipe']});
+  let output='',stderr='';
+  await new Promise((resolve,reject)=>{
+    const timeout=setTimeout(()=>{
+      child.kill('SIGKILL');
+      reject(Error('recovery lock child did not start: '+stderr));
+    },5000);
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data',chunk=>{stderr+=chunk;});
+    child.stdout.on('data',chunk=>{
+      output+=chunk;
+      if(output.includes('ready\n')){clearTimeout(timeout);resolve();}
+    });
+    child.once('error',error=>{clearTimeout(timeout);reject(error);});
+    child.once('exit',(code,signal)=>{
+      if(!output.includes('ready\n')){
+        clearTimeout(timeout);
+        reject(Error(`recovery lock child exited early: ${code}/${signal}`));
+      }
+    });
+  });
+  return child;
 }
 
 test('empty durable stores prove no pairing approval was recorded',t=>{
@@ -180,6 +217,63 @@ test('recovery requires explicit operator quiescence confirmation',t=>{
   assert.equal(child.status,71,child.stderr);
   assert.throws(()=>reconcileOwnerPairingRecovery(f),/operator confirmation/i);
   assert.equal(analyzeOwnerPairingRecovery(f).state,'INTENT_NOT_APPLIED');
+});
+
+test('LIVE WRITER: reconciliation cannot record not_applied before a live approval commits',t=>{
+  const f=fixture(t);
+  const binding=approvedBinding();
+  const decision=intent({eventId:binding.eventId,requestId:binding.requestId,
+    fingerprint:binding.fingerprint});
+  const store=createDurableDeviceTrustStore({directory:f.trustDirectory});
+  const audit=createDurableOwnerAudit({directory:f.auditDirectory});
+  audit.auditWrite(decision);
+
+  let recoveryError;
+  try{
+    reconcileOwnerPairingRecovery({...f,operatorConfirmedNoActiveWriters:true});
+  }catch(error){recoveryError=error;}
+
+  const device=store.trustDevice({name:'Live approval',platform:'linux',
+    publicKeyPem:binding.publicKeyPem},{expectedRevision:0,decision:{
+      eventId:binding.eventId,requestId:binding.requestId,fingerprint:binding.fingerprint}});
+  let outcomeError;
+  try{
+    audit.auditWrite({...decision,phase:'outcome',outcome:'accepted',
+      deviceId:device.deviceId,trustRevisionAfter:1});
+  }catch(error){outcomeError=error;}
+  try{audit.close();}catch{}
+  store.close();
+
+  assert.ok(recoveryError,'a live audit writer must prevent reconciliation');
+  assert.equal(outcomeError,undefined,'the still-live decision must remain writable');
+  assert.equal(analyzeOwnerPairingRecovery(f).state,'CONSISTENT');
+});
+
+test('uncertain WAL outcome fsync failure preserves recovery locks',t=>{
+  const f=fixture(t);
+  const child=crashChild(f,'after-intent');
+  assert.equal(child.status,71,child.stderr);
+  const original=fs.fsyncSync;
+  let injected=false;
+  fs.fsyncSync=(fd)=>{
+    const target=fs.readlinkSync(`/proc/self/fd/${fd}`);
+    const result=original(fd);
+    if(!injected&&target===path.join(f.auditDirectory,'owner-decisions-v1.jsonl')){
+      injected=true;
+      throw Error('injected post-fsync uncertainty');
+    }
+    return result;
+  };
+  syncBuiltinESMExports();
+  try{
+    assert.throws(()=>reconcileOwnerPairingRecovery({...f,
+      operatorConfirmedNoActiveWriters:true}),/injected post-fsync uncertainty/);
+  }finally{
+    fs.fsyncSync=original;
+    syncBuiltinESMExports();
+  }
+  assert.equal(injected,true);
+  assert.equal(analyzeOwnerPairingRecovery(f).state,'RECOVERY_LOCK_ACTIVE');
 });
 
 test('corrupt trust snapshot classifies as corrupt and is not repaired',t=>{
@@ -293,12 +387,50 @@ test('abandoned reconciliation lock is reported and only explicitly cleared',t=>
   const f=fixture(t);
   createDurableDeviceTrustStore({directory:f.trustDirectory});
   const audit=createDurableOwnerAudit({directory:f.auditDirectory});audit.close();
-  mkdirSync(path.join(f.auditDirectory,'.owner-pairing-reconciliation.lock'),{mode:0o700});
+  const helperUrl=new URL('../common/durable-process-lock.mjs',import.meta.url).href;
+  const source=`
+    import {createDurableProcessLock} from ${JSON.stringify(helperUrl)};
+    createDurableProcessLock(process.argv[1],'.owner-pairing-reconciliation.lock','reconciliation');
+  `;
+  const child=spawnSync(process.execPath,['--input-type=module','-e',source,f.auditDirectory],
+    {encoding:'utf8',timeout:10000});
+  assert.equal(child.status,0,child.stderr);
   assert.equal(analyzeOwnerPairingRecovery(f).state,'RECOVERY_LOCK_PRESENT');
   assert.throws(()=>reconcileOwnerPairingRecovery({...f,
     operatorConfirmedNoActiveWriters:true}),/RECOVERY_LOCK_PRESENT/);
   assert.deepEqual(clearStaleOwnerPairingRecoveryLocks({...f,
     operatorConfirmedNoActiveRecovery:true}),{cleared:1});
+  assert.deepEqual(analyzeOwnerPairingRecovery(f),{state:'NO_INTENT'});
+});
+
+test('ownerless acquisition-crash lock remains unverified and is never auto-cleared',t=>{
+  const f=fixture(t);
+  createDurableDeviceTrustStore({directory:f.trustDirectory});
+  const audit=createDurableOwnerAudit({directory:f.auditDirectory});audit.close();
+  mkdirSync(path.join(f.auditDirectory,'.owner-pairing-reconciliation.lock'),{mode:0o700});
+  assert.equal(analyzeOwnerPairingRecovery(f).state,'RECOVERY_LOCK_UNVERIFIED');
+  assert.throws(()=>clearStaleOwnerPairingRecoveryLocks({...f,
+    operatorConfirmedNoActiveRecovery:true}),/active or unverified/);
+  assert.equal(analyzeOwnerPairingRecovery(f).state,'RECOVERY_LOCK_UNVERIFIED');
+});
+
+test('active recovery process blocks writers and can only be cleared after SIGKILL evidence',async t=>{
+  const f=fixture(t);
+  createDurableDeviceTrustStore({directory:f.trustDirectory});
+  const audit=createDurableOwnerAudit({directory:f.auditDirectory});audit.close();
+  const child=await activeRecoveryChild(f);
+  t.after(()=>{if(child.exitCode===null)child.kill('SIGKILL');});
+  assert.equal(analyzeOwnerPairingRecovery(f).state,'RECOVERY_LOCK_ACTIVE');
+  assert.throws(()=>createDurableOwnerAudit({directory:f.auditDirectory}),/reconciliation/i);
+  assert.throws(()=>createDurableDeviceTrustStore({directory:f.trustDirectory}),/reconciliation/i);
+  assert.throws(()=>clearStaleOwnerPairingRecoveryLocks({...f,
+    operatorConfirmedNoActiveRecovery:true}),/active or unverified/);
+  assert.equal(analyzeOwnerPairingRecovery(f).state,'RECOVERY_LOCK_ACTIVE');
+  child.kill('SIGKILL');
+  await once(child,'exit');
+  assert.equal(analyzeOwnerPairingRecovery(f).state,'RECOVERY_LOCK_PRESENT');
+  assert.deepEqual(clearStaleOwnerPairingRecoveryLocks({...f,
+    operatorConfirmedNoActiveRecovery:true}),{cleared:2});
   assert.deepEqual(analyzeOwnerPairingRecovery(f),{state:'NO_INTENT'});
 });
 
