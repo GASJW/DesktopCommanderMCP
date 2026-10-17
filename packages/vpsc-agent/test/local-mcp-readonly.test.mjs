@@ -2,9 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import os from 'node:os';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, statSync,
+  rmSync, symlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { createLocalReadonlyMcp } from '../src/local-mcp-readonly.mjs';
+import { createLocalReadonlyMcp, createPrivateMcpHome } from '../src/local-mcp-readonly.mjs';
 import { createDeviceRegistry } from '../../../gateway/devices/registry.mjs';
 import { createPairingCoordinator } from '../../../gateway/devices/pairing.mjs';
 import { createDeviceRouter } from '../../../gateway/devices/router.mjs';
@@ -32,7 +33,7 @@ async function sandbox(fn,{entrypoint=FIXTURE}={}){
   writeFileSync(other,'SHOULD_NOT_LEAK\n');
   const executor=createLocalReadonlyMcp({allowedRoot:approved,entrypoint,timeoutMs:7000});
   try{await executor.start();return await fn({executor,file,other,approved,d});}
-  finally{executor.close();rmSync(d,{recursive:true,force:true});}
+  finally{await executor.close();rmSync(d,{recursive:true,force:true});}
 }
 const withResult=(e,c)=>e?.code===c;
 test('actual stdio MCP read_file works under a fixed allowed directory',async()=>{
@@ -41,6 +42,38 @@ test('actual stdio MCP read_file works under a fixed allowed directory',async()=
     assert.equal(result.isError??false,false);
     assert.match(JSON.stringify(result),/vpsc-readonly-real-text/);
   });
+});
+test('remote agent rejects every feature flag URL override to prevent redirect fetches',()=>{
+  const d=mkdtempSync(path.join(os.tmpdir(),'vpsc-feature-flags-policy-'));
+  const approved=path.join(d,'approved');
+  mkdirSync(approved);
+  try{
+    for(const featureFlagsUrl of [
+      'https://desktopcommander.app/flags/v2/production.json',
+      'http://example.test/flags.json',
+      'http://127.0.0.1/flags.json',
+      'http://127.0.0.1:4444/flags.json',
+      'http://user:pass@127.0.0.1:1234/flags.json',
+      'http://127.0.0.1:1234/flags.json#fragment',
+    ]){
+      assert.throws(()=>createLocalReadonlyMcp({allowedRoot:approved,entrypoint:FIXTURE,
+        featureFlagsUrl}),e=>e.code==='POLICY');
+    }
+  }finally{rmSync(d,{recursive:true,force:true});}
+});
+test('local MCP child gets a private HOME with only the canonical approved root',()=>{
+  const d=mkdtempSync(path.join(os.tmpdir(),'vpsc-private-agent-home-test-'));
+  const approved=path.join(d,'approved');mkdirSync(approved);
+  const home=createPrivateMcpHome({allowedRoot:approved});
+  try{
+    const configPath=path.join(home.directory,'.claude-server-commander','config.json');
+    const config=JSON.parse(readFileSync(configPath,'utf8'));
+    assert.deepEqual(config.allowedDirectories,[approved]);
+    assert.equal(config.telemetryEnabled,false);
+    assert.equal((statSync(home.directory).mode&0o777),0o700);
+    assert.equal((statSync(path.dirname(configPath)).mode&0o777),0o700);
+    assert.equal((statSync(configPath).mode&0o777),0o600);
+  }finally{home.close();rmSync(d,{recursive:true,force:true});}
 });
 test('write_file, start_process, get_config and shell are rejected before MCP dispatch',async()=>{
   await sandbox(async({executor,file})=>{

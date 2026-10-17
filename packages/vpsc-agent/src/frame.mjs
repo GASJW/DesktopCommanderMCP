@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 
-const PATHS = new Set(['/agent/heartbeat', '/agent/poll', '/agent/result']);
+const PATHS = new Set(['/agent/heartbeat', '/agent/poll', '/agent/result',
+  '/agent/disconnect']);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 // Single source included in the prototype npm package and imported by its
