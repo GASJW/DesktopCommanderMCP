@@ -1,16 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, request as httpRequest } from 'node:http';
-import { generateKeyPairSync, sign } from 'node:crypto';
+import path from 'node:path';
+import os from 'node:os';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto';
 import { createAccessVerifier } from '../access-auth.mjs';
 import { createRemoteDeviceMcpHandler } from '../devices/remote-mcp-handler.mjs';
+import { createDurableToolGrantStore } from '../devices/durable-tool-grants.mjs';
 
 const ISSUER='https://i3-owner-test.cloudflareaccess.com';
 const AUD='d'.repeat(64);
 const OWNER='i3-owner@example.com';
 const DEVICE='b7e92caf-f591-44c4-8fb7-6c489ea573f4';
+const SESSION='ab000000-0000-4000-8000-000000000001';
 
-async function setup(t,{authorizeTool,onResponseClose}={}){
+async function setup(t,{authorizeDevice,onResponseClose,grant=true,grantRoot='/approved',
+  grantConstraints={maxBytes:64*1024,maxLength:1000,maxOffset:100_000}}={}){
   const {publicKey,privateKey}=generateKeyPairSync('rsa',{modulusLength:2048});
   const jwk={...publicKey.export({format:'jwk'}),kid:'i3-owner',alg:'RS256'};
   const accessVerifier=createAccessVerifier({issuer:ISSUER,audience:AUD,
@@ -30,19 +36,37 @@ async function setup(t,{authorizeTool,onResponseClose}={}){
     return header+'.'+payload+'.'+sign('RSA-SHA256',Buffer.from(header+'.'+payload),privateKey).toString('base64url');
   };
   const calls=[];
-  const router={callDevice:async frame=>{
-    calls.push(frame);
-    return {content:[{type:'text',text:'remote-read-ok'}]};
+  const directory=mkdtempSync(path.join(os.tmpdir(),'g7-owner-grant-'));
+  const policyDirectory=path.join(directory,'policy');
+  mkdirSync(policyDirectory,{mode:0o700});
+  const grantStore=createDurableToolGrantStore({directory:policyDirectory});
+  const ownerDigest=createHash('sha256').update('VPSC-I4-OWNER-v1\n')
+    .update(JSON.stringify([ISSUER,'owner-1'])).digest('hex');
+  const approvalEventId='b7e92caf-f591-44c4-8fb7-6c489ea573f5';
+  const fingerprint='b'.repeat(64);
+  if(grant)grantStore.grant({ownerDigest,deviceId:DEVICE,fingerprint,tool:'read_file',
+    scope:{root:grantRoot},constraints:grantConstraints},{expectedRevision:0,eventId:randomUUID()});
+  const policyKeys=generateKeyPairSync('ed25519');
+  const router={callDevice:async({beforeDispatch,...frame})=>{
+    const permit=await beforeDispatch({deviceId:frame.deviceId,sessionId:SESSION,
+      requestId:frame.requestId,name:frame.name,arguments:frame.arguments});
+    try{
+      calls.push({...frame,authorization:permit.authorization,signal:undefined});
+      return {content:[{type:'text',text:'remote-read-ok'}]};
+    }finally{permit.release();}
   }};
-  const deviceRegistry={listDevices:()=>[{deviceId:DEVICE}]};
+  let trusted=true;
+  const deviceRegistry={listDevices:()=>trusted?[{deviceId:DEVICE}]:[],
+    isLiveSession:(_deviceId,sessionId)=>trusted&&sessionId===SESSION,
+    revokeDevice:()=>{trusted=false;}};
   const handler=createRemoteDeviceMcpHandler({
     accessVerifier,deviceRegistry,router,
-    authorizeDevice:(owner,deviceId)=>owner.subject==='owner-1'&&deviceId===DEVICE,
-    authorizeTool:authorizeTool??((owner,deviceId,name)=>owner.subject==='owner-1'&&deviceId===DEVICE&&name==='read_file'),
+    authorizeDevice:authorizeDevice??((owner,deviceId)=>owner.subject==='owner-1'&&deviceId===DEVICE),
+    grantStore,policySigningKey:policyKeys.privateKey,
     getTrustRevision:()=>3,getDeviceApprovalReceipt:()=>({
-      eventId:'b7e92caf-f591-44c4-8fb7-6c489ea573f5',deviceId:DEVICE,fingerprint:'b'.repeat(64),
+      eventId:approvalEventId,deviceId:DEVICE,fingerprint,
       trustRevisionBefore:2,trustRevisionAfter:3,trustRevision:3,
-    }),authorizationPolicyRevision:'i4-test-policy-v1',
+    }),
   });
   const server=createServer((req,res)=>{
     if(onResponseClose)res.once('close',onResponseClose);
@@ -50,14 +74,14 @@ async function setup(t,{authorizeTool,onResponseClose}={}){
   });
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   const endpoint=`http://127.0.0.1:${server.address().port}/mcp`;
-  t.after(()=>new Promise(resolve=>server.close(resolve)));
+  t.after(async()=>{await new Promise(resolve=>server.close(resolve));rmSync(directory,{recursive:true,force:true});});
   const call=async(payload,{token=tokenFor(),headers={}}={})=>{
     const response=await fetch(endpoint,{method:'POST',headers:{
       'content-type':'application/json','cf-access-jwt-assertion':token,...headers,
     },body:JSON.stringify(payload)});
     return {status:response.status,body:await response.json()};
   };
-  return {call,calls,tokenFor,machineToken,deviceRegistry,router,endpoint};
+  return {call,calls,tokenFor,machineToken,deviceRegistry,router,endpoint,grantStore};
 }
 
 test('owner MCP read call routes only the named trusted device and read_file',async t=>{
@@ -115,14 +139,73 @@ test('valid owner Access does not authorize a device without a matching owner-de
   assert.equal(x.calls.length,0);
 });
 
-test('disconnect during tool authorization prevents dispatch to the device',async t=>{
+test('missing tool grant and out-of-scope arguments are explicit denials before dispatch',async t=>{
+  const withoutGrant=await setup(t,{grant:false});
+  const payload={jsonrpc:'2.0',id:19,method:'tools/call',params:{name:'read_file',
+    arguments:{deviceId:DEVICE,path:'/approved/readme.txt'}}};
+  const missing=await withoutGrant.call(payload);
+  assert.equal(missing.status,403);
+  assert.equal(missing.body.error.code,-32009);
+  assert.equal(withoutGrant.calls.length,0);
+
+  const scoped=await setup(t);
+  const outside=await scoped.call({...payload,id:20,params:{...payload.params,
+    arguments:{deviceId:DEVICE,path:'/outside/secret.txt'}}});
+  assert.equal(outside.status,403);
+  assert.equal(outside.body.error.code,-32009);
+  assert.equal(scoped.calls.length,0);
+});
+
+test('revocation after transport handoff suppresses the late result as ambiguous',async t=>{
+  const x=await setup(t);
+  let dispatched;
+  const didDispatch=new Promise(resolve=>{dispatched=resolve;});
+  let returnResult;
+  const resultGate=new Promise(resolve=>{returnResult=resolve;});
+  x.router.callDevice=async({beforeDispatch,...frame})=>{
+    const permit=await beforeDispatch({deviceId:frame.deviceId,sessionId:SESSION,
+      requestId:frame.requestId,name:frame.name,arguments:frame.arguments});
+    try{x.calls.push({...frame,authorization:permit.authorization,signal:undefined});}
+    finally{permit.release();}
+    dispatched();
+    await resultGate;
+    return {content:[{type:'text',text:'late-read-result'}]};
+  };
+  const pending=x.call({jsonrpc:'2.0',id:21,method:'tools/call',params:{name:'read_file',
+    arguments:{deviceId:DEVICE,path:'/approved/readme.txt'}}});
+  await didDispatch;
+  const grant=x.grantStore.list()[0];
+  x.grantStore.revoke(grant.grantId,{expectedRevision:x.grantStore.revision(),eventId:randomUUID()});
+  returnResult();
+  const response=await pending;
+  assert.equal(response.status,503);
+  assert.equal(response.body.error.data.code,'AMBIGUOUS_GRANT_REVOCATION');
+  assert.equal(x.calls.length,1,'revocation after transport handoff cannot undo receipt by the agent');
+});
+
+test('device revocation after the router accepts a result fences the final HTTP response',async t=>{
+  const x=await setup(t);
+  const routedCall=x.router.callDevice;
+  x.router.callDevice=async frame=>{
+    const result=await routedCall(frame);
+    x.deviceRegistry.revokeDevice(DEVICE);
+    return result;
+  };
+  const response=await x.call({jsonrpc:'2.0',id:22,method:'tools/call',params:{name:'read_file',
+    arguments:{deviceId:DEVICE,path:'/approved/readme.txt'}}});
+  assert.equal(response.status,503);
+  assert.equal(response.body.error.data.code,'AMBIGUOUS_AUTHORIZATION_FENCE');
+  assert.equal(x.calls.length,1,'the operation was already handed off and is not retried');
+});
+
+test('disconnect during owner authorization prevents dispatch to the device',async t=>{
   let enteredAuthorization;
   const authorizationEntered=new Promise(resolve=>{enteredAuthorization=resolve;});
   let releaseAuthorization;
   const authorizationGate=new Promise(resolve=>{releaseAuthorization=resolve;});
   let responseClosed;
   const responseDidClose=new Promise(resolve=>{responseClosed=resolve;});
-  const x=await setup(t,{onResponseClose:responseClosed,authorizeTool:async()=>{
+  const x=await setup(t,{onResponseClose:responseClosed,authorizeDevice:async()=>{
     enteredAuthorization();
     await authorizationGate;
     return true;
@@ -166,6 +249,7 @@ test('trust-store failure and ambiguous router outcome fail closed without retry
   assert.equal(unavailable.status,503);
   assert.equal(x.calls.length,0);
   x.deviceRegistry.listDevices=()=>[{deviceId:DEVICE}];
+  x.deviceRegistry.isLiveSession=()=>true;
   let dispatches=0;
   x.router.callDevice=async()=>{
     dispatches++;

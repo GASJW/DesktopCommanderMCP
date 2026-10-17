@@ -5,9 +5,7 @@ import { createAgentWorker } from '../src/worker.mjs';
 
 const DEVICE='b7e92caf-f591-44c4-8fb7-6c489ea573f4';
 const SESSION='171e4f09-bb6d-4b8a-91e8-01a9caf54023';
-const AUTHORIZATION={approvalEventId:'b7e92caf-f591-44c4-8fb7-6c489ea573f5',
-  approvalTrustRevisionBefore:0,approvalTrustRevisionAfter:1,fingerprint:'b'.repeat(64),
-  ownerDigest:'a'.repeat(64),trustRevision:1,policyRevision:'i4-test-policy-v1'};
+const AUTHORIZATION={version:1,claims:{},signature:'A'.repeat(86)};
 
 function fixture({frame,resultError,resultAck={accepted:true},heartbeatValue}={}){
   const calls=[];

@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 import path from 'node:path';
 import os from 'node:os';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { createDeviceRegistry } from '../../../gateway/devices/registry.mjs';
 import { createPairingCoordinator } from '../../../gateway/devices/pairing.mjs';
@@ -15,6 +15,7 @@ import { createAgentWorker } from '../src/worker.mjs';
 import { createGovernedAgentExecutor } from '../src/governed-executor.mjs';
 import { createLoopbackAgentClient } from '../src/loopback-client.mjs';
 import { createRemoteDeviceMcpHandler } from '../../../gateway/devices/remote-mcp-handler.mjs';
+import { createDurableToolGrantStore } from '../../../gateway/devices/durable-tool-grants.mjs';
 
 const FIXTURE=fileURLToPath(new URL('./fixtures-readonly-mcp.mjs',import.meta.url));
 const waitFor=async predicate=>{
@@ -37,23 +38,43 @@ test('I4 signed agent loopback routes common governed operations through the own
   const approvalEventId=randomUUID();
   const directory=mkdtempSync(path.join(os.tmpdir(),'vpsc-i4-loopback-'));
   const root=path.join(directory,'approved'),state=path.join(directory,'state');
-  mkdirSync(root,{mode:0o700});mkdirSync(state,{mode:0o700});
+  const policyDirectory=path.join(directory,'tool-policy');
+  mkdirSync(root,{mode:0o700});mkdirSync(state,{mode:0o700});mkdirSync(policyDirectory,{mode:0o700});
   const file=path.join(root,'readme.txt');writeFileSync(file,'alpha\nbeta\ngamma\n');
   const largeFile=path.join(root,'large.txt'),largeContent='z'.repeat(32*1024);
   writeFileSync(largeFile,largeContent);
+  const identityFingerprint=identity.fingerprint;
+  const ownerDigest=createHash('sha256').update('VPSC-I4-OWNER-v1\n')
+    .update(JSON.stringify(['https://i4-loopback-owner.invalid','owner-i4'])).digest('hex');
+  const grantStore=createDurableToolGrantStore({directory:policyDirectory});
+  const policyKeys=generateKeyPairSync('ed25519');
+  const grantIds={};let policyRevision=0;
+  const grants=[
+    ['read_file',{root},{maxBytes:64*1024,maxLength:1000,maxOffset:100_000}],
+    ['list_directory',{root},{maxDepth:2,maxEntries:200}],
+    ['write_file',{root},{maxBytes:64*1024}],
+    ['list_processes',{}, {maxJobs:32}],
+    ['run_command',{root,profile:'count_lines'},
+      {maxOutputBytes:16*1024,maxRuntimeMs:10_000,profile:'count_lines'}],
+  ];
+  for(const [tool,scope,constraints] of grants){
+    const granted=grantStore.grant({ownerDigest,deviceId,fingerprint:identityFingerprint,
+      tool,scope,constraints},{expectedRevision:policyRevision,eventId:randomUUID()});
+    policyRevision=granted.revision;grantIds[tool]=granted.grantId;
+  }
   const executor=createGovernedAgentExecutor({allowedRoot:root,
-    entrypoint:process.env.VPSC_TEST_REAL_MCP_ENTRY??FIXTURE,ledgerDirectory:state});
-  const enabledTools=new Set(['read_file','list_directory','write_file','list_processes','run_command']);
+    entrypoint:process.env.VPSC_TEST_REAL_MCP_ENTRY??FIXTURE,ledgerDirectory:state,
+    gatewayPolicyPublicKey:policyKeys.publicKey,deviceId,fingerprint:identityFingerprint});
   const ownerServer=createServer(createRemoteDeviceMcpHandler({
     accessVerifier:{verifyPrincipal:async token=>{
       if(token!=='synthetic-owner-jwt')throw Error('owner authentication failed');
       return {issuer:'https://i4-loopback-owner.invalid',subject:'owner-i4'};
     }},deviceRegistry:registry,router,
     authorizeDevice:async(owner,id)=>owner.subject==='owner-i4'&&id===deviceId,
-    authorizeTool:async(owner,id,name)=>owner.subject==='owner-i4'&&id===deviceId&&enabledTools.has(name),
+    grantStore,policySigningKey:policyKeys.privateKey,
     getDeviceApprovalReceipt:()=>({eventId:approvalEventId,deviceId,fingerprint:identity.fingerprint,
       trustRevisionBefore:0,trustRevisionAfter:1,trustRevision:1}),
-    getTrustRevision:()=>1,authorizationPolicyRevision:'i4-loopback-policy-v1',
+    getTrustRevision:()=>1,
   }));
   await new Promise(resolve=>ownerServer.listen(0,'127.0.0.1',resolve));
   const ownerEndpoint=`http://127.0.0.1:${ownerServer.address().port}/mcp`;
@@ -78,7 +99,7 @@ test('I4 signed agent loopback routes common governed operations through the own
     await running.catch(()=>{});
     ownerServer.closeAllConnections();
     await new Promise(resolve=>ownerServer.close(resolve));
-    router.close();await pilot.close();rmSync(directory,{recursive:true,force:true});
+    router.close();await pilot.close();grantStore.close?.();rmSync(directory,{recursive:true,force:true});
   });
   await waitFor(()=>sessionId!==null&&channelReady);
   const call=async(id,name,args)=>{
@@ -110,7 +131,8 @@ test('I4 signed agent loopback routes common governed operations through the own
   assert.match(command.body.result.structuredContent.stdout,/3/);
   const processes=await call('i4-processes-4','list_processes',{});
   assert.ok(processes.body.result.structuredContent.jobs.some(job=>job.profile==='count_lines'&&job.exitCode===0));
-  enabledTools.delete('write_file');
+  policyRevision=grantStore.revoke(grantIds.write_file,{expectedRevision:policyRevision,
+    eventId:randomUUID()}).revision;
   const denied=await call('i4-denied-write','write_file',{path:path.join(root,'denied.txt'),
     content:'should not dispatch',mode:'create'});
   assert.equal(denied.status,403);
@@ -118,9 +140,11 @@ test('I4 signed agent loopback routes common governed operations through the own
   const executionLedger=readFileSync(path.join(state,'i4-execution.jsonl'),'utf8');
   const firstIntent=JSON.parse(executionLedger.split('\n')[0]);
   assert.equal(firstIntent.type,'intent');
-  assert.equal(firstIntent.authorization.trustRevision,1);
-  assert.equal(firstIntent.authorization.policyRevision,'i4-loopback-policy-v1');
-  assert.match(firstIntent.authorization.ownerDigest,/^[a-f0-9]{64}$/);
+  assert.equal(firstIntent.authorization.claims.trustRevision,1);
+  assert.equal(firstIntent.authorization.claims.policyRevision,policyRevision-1);
+  assert.equal(firstIntent.authorization.claims.deviceId,deviceId);
+  assert.equal(firstIntent.authorization.claims.fingerprint,identityFingerprint);
+  assert.match(firstIntent.authorization.claims.ownerDigest,/^[a-f0-9]{64}$/);
   assert.doesNotMatch(executionLedger,/synthetic-owner-jwt|owner-i4|created by I4|alpha/);
   controller.abort();
   await running;

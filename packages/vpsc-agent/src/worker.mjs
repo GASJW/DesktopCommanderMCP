@@ -26,19 +26,12 @@ function validTask(frame,session,deviceId){
     typeof frame.requestId==='string'&&UUID.test(frame.requestId)&&
     frame.authorization&&typeof frame.authorization==='object'&&!Array.isArray(frame.authorization)&&
     Object.getPrototypeOf(frame.authorization)===Object.prototype&&
-    Object.keys(frame.authorization).sort().join(',')===
-      'approvalEventId,approvalTrustRevisionAfter,approvalTrustRevisionBefore,fingerprint,ownerDigest,policyRevision,trustRevision'&&
-    /^[a-f0-9]{64}$/.test(frame.authorization.ownerDigest??'')&&
-    UUID.test(frame.authorization.approvalEventId??'')&&
-    /^[a-f0-9]{64}$/.test(frame.authorization.fingerprint??'')&&
-    Number.isSafeInteger(frame.authorization.approvalTrustRevisionBefore)&&
-    frame.authorization.approvalTrustRevisionBefore>=0&&
-    Number.isSafeInteger(frame.authorization.approvalTrustRevisionAfter)&&
-    frame.authorization.approvalTrustRevisionAfter===frame.authorization.approvalTrustRevisionBefore+1&&
-    typeof frame.authorization.policyRevision==='string'&&frame.authorization.policyRevision.length>0&&
-    frame.authorization.policyRevision.length<=128&&!/[\u0000-\u001f\u007f]/.test(frame.authorization.policyRevision)&&
-    Number.isSafeInteger(frame.authorization.trustRevision)&&
-    frame.authorization.trustRevision>=frame.authorization.approvalTrustRevisionAfter&&
+    Object.keys(frame.authorization).sort().join(',')==='claims,signature,version'&&
+    frame.authorization.version===1&&typeof frame.authorization.signature==='string'&&
+    /^[A-Za-z0-9_-]{86}$/.test(frame.authorization.signature)&&
+    frame.authorization.claims&&typeof frame.authorization.claims==='object'&&
+    !Array.isArray(frame.authorization.claims)&&
+    Object.getPrototypeOf(frame.authorization.claims)===Object.prototype&&
     frame.params&&typeof frame.params==='object'&&!Array.isArray(frame.params)&&
     Object.keys(frame.params).sort().join(',')==='arguments,name'&&
     REMOTE_TOOLS.has(frame.params.name)&&frame.params.arguments&&

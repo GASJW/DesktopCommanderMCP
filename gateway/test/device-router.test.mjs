@@ -123,6 +123,39 @@ test('caller cancellation before dispatch prevents delivery to the device',async
   assert.equal(sent,0);
   s.router.close();
 });
+test('pre-dispatch permit is acquired before transport handoff and released immediately after send',async()=>{
+  const s=setup();let sent=0,released=0,releasePermit;
+  s.router.attachTransport({deviceId:s.deviceId,sessionId:s.sessionId,send:frame=>{
+    sent++;assert.equal(frame.authorization?.capability,'signed');
+  }});
+  const pending=s.router.callDevice({deviceId:s.deviceId,name:'read_file',requestId:
+    'a2e4d90e-17f6-481c-846d-60494812f76c',arguments:{path:'/safe.txt'},
+    beforeDispatch:async()=>{
+      await new Promise(resolve=>{releasePermit=resolve;});
+      return {authorization:{capability:'signed'},release:()=>{released++;}};
+    }});
+  await s.sleep(2);
+  assert.equal(sent,0,'transport cannot receive a frame before durable authorization completes');
+  releasePermit();
+  await s.sleep(2);
+  assert.equal(sent,1);
+  assert.equal(released,1,'policy gate is released after the synchronous transport handoff');
+  const frameRequest='a2e4d90e-17f6-481c-846d-60494812f76c';
+  assert.equal(s.router.acceptResponse({deviceId:s.deviceId,sessionId:s.sessionId,
+    requestId:frameRequest,result:{ok:true}}),true);
+  assert.deepEqual(await pending,{ok:true});
+  s.router.close();
+});
+test('pre-dispatch denial never calls transport and does not retain an authorization permit',async()=>{
+  const s=setup();let sent=0,released=0;
+  s.router.attachTransport({deviceId:s.deviceId,sessionId:s.sessionId,send:()=>{sent++;}});
+  await assert.rejects(s.router.callDevice({deviceId:s.deviceId,name:'read_file',
+    beforeDispatch:async()=>{throw Object.assign(Error('grant revoked'),{code:'GRANT_REVOKED'});}}),
+  errorCode('GRANT_REVOKED'));
+  assert.equal(sent,0);
+  assert.equal(released,0);
+  s.router.close();
+});
 test('cancellation removes a queued task but stays ambiguous after agent receipt',async()=>{
   const s=setup();const queue=[];
   s.router.attachTransport({deviceId:s.deviceId,sessionId:s.sessionId,

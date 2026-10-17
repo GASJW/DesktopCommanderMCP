@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
-import { generateKeyPairSync, sign } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto';
 import { createAccessVerifier } from '../../../gateway/access-auth.mjs';
 import { createDurableOwnerAudit, inspectDurableOwnerAudit } from '../../../gateway/dashboard/durable-owner-audit.mjs';
 import { createOwnerPairingHttp } from '../../../gateway/dashboard/owner-pairing-http.mjs';
@@ -20,6 +20,7 @@ import { createMachineAccessVerifier } from '../../../gateway/devices/machine-ac
 import { startMachineIngressLoopback } from '../../../gateway/devices/machine-ingress-loopback.mjs';
 import { createDeviceRouter } from '../../../gateway/devices/router.mjs';
 import { createRemoteDeviceMcpHandler } from '../../../gateway/devices/remote-mcp-handler.mjs';
+import { createDurableToolGrantStore } from '../../../gateway/devices/durable-tool-grants.mjs';
 import { loadOrCreateDeviceIdentity } from '../src/identity-store.mjs';
 import { createLocalReadonlyMcp } from '../src/local-mcp-readonly.mjs';
 import { createHttpsAgentClient } from '../src/https-client.mjs';
@@ -187,7 +188,7 @@ function makeTlsCertificate(directory,name){
   return {key:readFileSync(key),cert:readFileSync(cert)};
 }
 function makeGateway({trustStore,ownerAccess,machineAccess,bindings,ingressRef,
-  auditDirectory,trustDirectory}){
+  auditDirectory,trustDirectory,toolGrantStore,policySigningKey}){
   const router=createDeviceRouter({registry:trustStore.registry,timeoutMs:3000});
   const readDeviceApproval=createDurableOwnerDeviceApprovalReader({auditDirectory,trustDirectory});
   const ingressPromise=startMachineIngressLoopback({registry:trustStore.registry,router,
@@ -195,11 +196,8 @@ function makeGateway({trustStore,ownerAccess,machineAccess,bindings,ingressRef,
   const mcpServer=createHttpServer(createRemoteDeviceMcpHandler({
     accessVerifier:ownerAccess,deviceRegistry:trustStore.registry,router,
     authorizeDevice:createDurableOwnerDeviceAuthorizer({auditDirectory,trustDirectory}),
-    authorizeTool:async(_owner,_deviceId,name)=>new Set([
-      'read_file','list_directory','write_file','list_processes','run_command',
-    ]).has(name),
+    grantStore:toolGrantStore,policySigningKey,
     getTrustRevision:()=>trustStore.revision(),getDeviceApprovalReceipt:readDeviceApproval,
-    authorizationPolicyRevision:'i4-all-tools-v1',
   }));
   let ownerMcpUrl;
   const ownerMcpReady=listen(mcpServer).then(url=>{ownerMcpUrl=url+'/mcp';return ownerMcpUrl;});
@@ -253,15 +251,17 @@ function agentClient({identity,deviceId,clientSecret,fetchFn}){
   return createHttpsAgentClient({gatewayUrl:`https://${HOST}/`,expectedHostname:HOST,
     identity,deviceId,clientId:CLIENT,clientSecret,fetchFn});
 }
-function makeExecutor(root,ledgerDirectory){
+function makeExecutor(root,ledgerDirectory,{deviceId,fingerprint,gatewayPolicyPublicKey}){
   if(ledgerDirectory)return createGovernedAgentExecutor({allowedRoot:root,
-    entrypoint:LOCAL_MCP_ENTRY,ledgerDirectory});
+    entrypoint:LOCAL_MCP_ENTRY,ledgerDirectory,deviceId,fingerprint,gatewayPolicyPublicKey});
   return createLocalReadonlyMcp({allowedRoot:root,entrypoint:LOCAL_MCP_ENTRY,timeoutMs:5000,
   });
 }
-async function startWorker(client,deviceId,root,ledgerDirectory){
+async function startWorker(client,deviceId,root,ledgerDirectory,identity,policyPublicKey){
   const controller=new AbortController();
-  const worker=createAgentWorker({deviceId,client,executor:makeExecutor(root,ledgerDirectory),pollIntervalMs:25});
+  const worker=createAgentWorker({deviceId,client,executor:makeExecutor(root,ledgerDirectory,{
+    deviceId,fingerprint:identity.fingerprint,gatewayPolicyPublicKey:policyPublicKey,
+  }),pollIntervalMs:25});
   const done=worker.run({signal:controller.signal});
   return {worker,controller,done};
 }
@@ -323,25 +323,29 @@ async function approveDevice({home,pairingIdentity,provePairing,ownerAccess,owne
 
 test('I3/I4 E2E: Owner approval, durable trust, verified TLS, governed operations, restart and revoke',async t=>{
   const home=mkdtempSync(path.join(tmpdir(),'g7-i3-e2e-'));
-  let trustStore=null,audit=null,gateway=null,edge=null,active=null;
+  let trustStore=null,audit=null,toolGrantStore=null,gateway=null,edge=null,active=null;
   t.after(async()=>{
     if(active){active.controller.abort();await active.done.catch(()=>{});}
     await gateway?.close().catch(()=>{});
     await edge?.close().catch(()=>{});
     try{audit?.close();}catch{}
+    try{toolGrantStore?.close?.();}catch{}
     try{trustStore?.close();}catch{}
     rmSync(home,{recursive:true,force:true});
   });
   const trustDirectory=path.join(home,'trust'),auditDirectory=path.join(home,'audit');
+  const policyDirectory=path.join(home,'tool-policy');
   const identityDirectory=path.join(home,'agent-identity');
   const executionDirectory=path.join(home,'agent-execution');
   const allowedRoot=path.join(home,'approved-files');
   mkdirSync(allowedRoot,{mode:0o700});
+  mkdirSync(policyDirectory,{mode:0o700});
   mkdirSync(identityDirectory,{mode:0o700});
   mkdirSync(executionDirectory,{mode:0o700});
   const file=path.join(allowedRoot,'approved.txt');
   writeFileSync(file,'durable-owner-approved-real-mcp-read\n',{mode:0o600});
   const ownerKeys=keyMaterial('owner-i3'),machineKeys=keyMaterial('machine-i3');
+  const policyKeys=generateKeyPairSync('ed25519');
   const ownerAccess=createAccessVerifier({issuer:OWNER_ISSUER,audience:OWNER_AUD,
     allowedEmails:OWNER,keyProvider:async()=>({keys:[ownerKeys.jwk]})});
   const now=Date.now();
@@ -362,6 +366,25 @@ test('I3/I4 E2E: Owner approval, durable trust, verified TLS, governed operation
   const approved=await approveDevice({home,pairingIdentity:pairingAgent.identity,
     provePairing:pairingAgent.prove,ownerAccess,ownerKeys,trustStore,audit,ownerToken});
   assert.equal(trustStore.revision(),1);
+  toolGrantStore=createDurableToolGrantStore({directory:policyDirectory});
+  const ownerDigest=createHash('sha256').update('VPSC-I4-OWNER-v1\n')
+    .update(JSON.stringify([OWNER_ISSUER,'owner-subject-i3'])).digest('hex');
+  const grants={};
+  const grantDefinitions=[
+    ['read_file',{root:allowedRoot},{maxBytes:64*1024,maxLength:1000,maxOffset:100_000}],
+    ['list_directory',{root:allowedRoot},{maxDepth:2,maxEntries:200}],
+    ['write_file',{root:allowedRoot},{maxBytes:64*1024}],
+    ['list_processes',{}, {maxJobs:32}],
+    ['run_command',{root:allowedRoot,profile:'count_lines'},
+      {maxOutputBytes:16*1024,maxRuntimeMs:10_000,profile:'count_lines'}],
+  ];
+  let grantRevision=0;
+  for(const [tool,scope,constraints] of grantDefinitions){
+    const result=toolGrantStore.grant({ownerDigest,deviceId:approved.deviceId,
+      fingerprint:approved.fingerprint,tool,scope,constraints},
+      {expectedRevision:grantRevision,eventId:randomUUID()});
+    grantRevision=result.revision;grants[tool]=result.grantId;
+  }
   const recoveryWhileAuditWriterOpen=analyzeOwnerPairingRecovery({auditDirectory,trustDirectory});
   assert.equal(recoveryWhileAuditWriterOpen.state,'ACTIVE_WRITER');
   assert.equal(recoveryWhileAuditWriterOpen.underlyingState,'CONSISTENT');
@@ -400,7 +423,8 @@ test('I3/I4 E2E: Owner approval, durable trust, verified TLS, governed operation
   const tlsFetch=createTlsFetch({port:edgeInfo.port,ca:certificate.cert,observed:[]});
   const wrongTlsFetch=createTlsFetch({port:edgeInfo.port,ca:wrongCertificate.cert,observed:[]});
   const gatewayFactory=()=>makeGateway({trustStore,ownerAccess,machineAccess,
-    bindings:new Map([[CLIENT,approved.deviceId]]),ingressRef,auditDirectory,trustDirectory});
+    bindings:new Map([[CLIENT,approved.deviceId]]),ingressRef,auditDirectory,trustDirectory,
+    toolGrantStore,policySigningKey:policyKeys.privateKey});
   gateway=gatewayFactory();await gateway.ready;const mcpUrl=await gateway.ownerMcpReady;
   const invalidTls=agentClient({identity,deviceId:approved.deviceId,clientSecret:SERVICE_SECRET,
     fetchFn:wrongTlsFetch});
@@ -412,7 +436,8 @@ test('I3/I4 E2E: Owner approval, durable trust, verified TLS, governed operation
   let tlsObserved=[];
   const fetchFn=createTlsFetch({port:edgeInfo.port,ca:certificate.cert,observed:tlsObserved});
   let client=agentClient({identity,deviceId:approved.deviceId,clientSecret:SERVICE_SECRET,fetchFn});
-  active=await startWorker(client,approved.deviceId,allowedRoot);
+  active=await startWorker(client,approved.deviceId,allowedRoot,executionDirectory,identity,
+    policyKeys.publicKey);
   await waitFor(()=>trustStore.registry.listDevices()[0]?.online,'authenticated device heartbeat');
   const init=await ownerCall(mcpUrl,'initialize',1,{protocolVersion:'2025-03-26',
     capabilities:{},clientInfo:{name:'i3-loopback-client',version:'1'}},ownerToken);
@@ -442,7 +467,8 @@ test('I3/I4 E2E: Owner approval, durable trust, verified TLS, governed operation
   assert.equal(trustStore.registry.listDevices()[0]?.online,false,'explicit disconnect invalidates the device session');
   client=agentClient({identity,deviceId:approved.deviceId,clientSecret:SERVICE_SECRET,
     fetchFn:createTlsFetch({port:edgeInfo.port,ca:certificate.cert,observed:[]})});
-  active=await startWorker(client,approved.deviceId,allowedRoot,executionDirectory);
+  active=await startWorker(client,approved.deviceId,allowedRoot,executionDirectory,identity,
+    policyKeys.publicKey);
   await waitFor(()=>trustStore.registry.listDevices()[0]?.online,'governed I4 device heartbeat');
   const directoryCall=await ownerCall(mcpUrl,'tools/call',30,{name:'list_directory',arguments:{
     deviceId:approved.deviceId,path:allowedRoot,depth:1,
@@ -460,6 +486,16 @@ test('I3/I4 E2E: Owner approval, durable trust, verified TLS, governed operation
   }},ownerToken);
   assert.equal(duplicateWrite.body.result.isError,true);
   assert.equal(readFileSync(createdPath,'utf8'),'durable I4 write\n');
+  const revokeWrite=toolGrantStore.revoke(grants.write_file,{expectedRevision:grantRevision,
+    eventId:randomUUID()});
+  grantRevision=revokeWrite.revision;
+  const deniedWrite=await ownerCall(mcpUrl,'tools/call',34,{name:'write_file',arguments:{
+    deviceId:approved.deviceId,path:path.join(allowedRoot,'after-revoke.txt'),
+    content:'must not be dispatched',mode:'create',
+  }},ownerToken);
+  assert.equal(deniedWrite.status,403);
+  assert.equal(readFileSync(path.join(executionDirectory,'i4-execution.jsonl'),'utf8')
+    .includes('must not be dispatched'),false);
   const commandCall=await ownerCall(mcpUrl,'tools/call',32,{name:'run_command',arguments:{
     deviceId:approved.deviceId,path:file,profile:'count_lines',
   }},ownerToken);
@@ -475,12 +511,15 @@ test('I3/I4 E2E: Owner approval, durable trust, verified TLS, governed operation
   const executionLedger=readFileSync(path.join(executionDirectory,'i4-execution.jsonl'),'utf8');
   const executionRecords=executionLedger.trim().split('\n').map(line=>JSON.parse(line));
   const governedIntent=executionRecords.find(record=>record.type==='intent');
+  const firstCapability=governedIntent.authorization.claims;
   assert.equal(governedIntent.deviceId,approved.deviceId);
-  assert.equal(governedIntent.authorization.approvalEventId,intent.eventId);
-  assert.equal(governedIntent.authorization.fingerprint,approved.fingerprint);
-  assert.equal(governedIntent.authorization.approvalTrustRevisionBefore,0);
-  assert.equal(governedIntent.authorization.approvalTrustRevisionAfter,1);
-  assert.ok(executionRecords.every(record=>record.authorization.approvalEventId===intent.eventId));
+  assert.equal(firstCapability.approvalEventId,intent.eventId);
+  assert.equal(firstCapability.deviceId,approved.deviceId);
+  assert.equal(firstCapability.fingerprint,approved.fingerprint);
+  assert.equal(firstCapability.approvalTrustRevisionBefore,0);
+  assert.equal(firstCapability.approvalTrustRevisionAfter,1);
+  assert.equal(firstCapability.scope.root,allowedRoot);
+  assert.ok(executionRecords.every(record=>record.authorization.claims.approvalEventId===intent.eventId));
   assert.doesNotMatch(executionLedger,/created by I4|durable I4 write|durable-owner-approved-real-mcp-read|owner-i3/);
   const secondRead=await ownerCall(mcpUrl,'tools/call',4,{name:'read_file',arguments:{
     deviceId:approved.deviceId,path:file,
@@ -510,7 +549,8 @@ test('I3/I4 E2E: Owner approval, durable trust, verified TLS, governed operation
   oldClient.close();
   client=agentClient({identity,deviceId:approved.deviceId,clientSecret:SERVICE_SECRET,
     fetchFn:createTlsFetch({port:edgeInfo.port,ca:certificate.cert,observed:[]})});
-  active=await startWorker(client,approved.deviceId,allowedRoot,executionDirectory);
+  active=await startWorker(client,approved.deviceId,allowedRoot,executionDirectory,identity,
+    policyKeys.publicKey);
   await waitFor(()=>trustStore.registry.listDevices()[0]?.online,'post-restart authenticated heartbeat');
   const afterRestart=await ownerCall(restartedMcp,'tools/call',5,{name:'read_file',arguments:{
     deviceId:approved.deviceId,path:file,

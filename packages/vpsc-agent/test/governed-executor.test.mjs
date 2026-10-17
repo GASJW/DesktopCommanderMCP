@@ -3,18 +3,35 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import os from 'node:os';
 import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, renameSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { generateKeyPairSync, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { existsSync, statSync } from 'node:fs';
 import { analyzeI4ExecutionRecovery } from '../src/governed-executor.mjs';
 import { removeDeadDurableProcessLock } from '../../../gateway/common/durable-process-lock.mjs';
+import { signToolGrantCapability, toolArgumentsDigest } from '../../../gateway/devices/tool-grant-capability.mjs';
 
 const FIXTURE=fileURLToPath(new URL('./fixtures-readonly-mcp.mjs',import.meta.url));
 const DEVICE='f1a2b3c4-d5e6-4a9f-8abc-1bb9b99c0001';
-const AUTHORIZATION={approvalEventId:'b7e92caf-f591-44c4-8fb7-6c489ea573f5',
-  approvalTrustRevisionBefore:0,approvalTrustRevisionAfter:1,fingerprint:'b'.repeat(64),
-  ownerDigest:'a'.repeat(64),trustRevision:1,policyRevision:'i4-test-policy-v1'};
+const FINGERPRINT='b'.repeat(64),OWNER='a'.repeat(64);
+const APPROVAL_EVENT='b7e92caf-f591-44c4-8fb7-6c489ea573f5';
+const POLICY_KEYS=generateKeyPairSync('ed25519');
+const roots=new WeakMap();
+const configuredExecutor=options=>createGovernedAgentExecutor({...options,
+  gatewayPolicyPublicKey:POLICY_KEYS.publicKey,deviceId:DEVICE,fingerprint:FINGERPRINT});
+function authorizationFor(root,name,args,requestId){
+  const constraints=name==='read_file'?{maxBytes:64*1024,maxLength:1000,maxOffset:100_000}:
+    name==='list_directory'?{maxDepth:2,maxEntries:200}:
+    name==='write_file'?{maxBytes:64*1024}:
+    name==='list_processes'?{maxJobs:32}:{maxOutputBytes:16*1024,maxRuntimeMs:10_000,profile:'count_lines'};
+  const scope=name==='list_processes'?{}:name==='run_command'?{root,profile:'count_lines'}:{root};
+  const claims={version:1,grantId:randomUUID(),decisionId:randomUUID(),requestId,
+    ownerDigest:OWNER,deviceId:DEVICE,fingerprint:FINGERPRINT,tool:name,
+    argumentsDigest:toolArgumentsDigest(name,args),policyRevision:1,approvalEventId:APPROVAL_EVENT,
+    trustRevision:1,approvalTrustRevisionBefore:0,approvalTrustRevisionAfter:1,scope,constraints,
+    issuedAt:Date.now(),expiresAt:Date.now()+30_000};
+  return signToolGrantCapability(claims,POLICY_KEYS.privateKey);
+}
 const imported=await import('../src/governed-executor.mjs').catch(()=>null);
 const createGovernedAgentExecutor=imported?.createGovernedAgentExecutor;
 const available=typeof createGovernedAgentExecutor==='function';
@@ -29,14 +46,16 @@ async function sandbox(t,fn,{commandTimeoutMs=5000,testHooks}={}){
   const root=path.join(directory,'approved'),state=path.join(directory,'state');
   mkdirSync(root,{mode:0o700});mkdirSync(state,{mode:0o700});
   const file=path.join(root,'readme.txt');writeFileSync(file,'one\ntwo\nthree\n');
-  const executor=createGovernedAgentExecutor({allowedRoot:root,entrypoint:FIXTURE,
-    ledgerDirectory:state,commandTimeoutMs,testHooks});
+  const executor=configuredExecutor({allowedRoot:root,entrypoint:FIXTURE,
+    ledgerDirectory:state,commandTimeoutMs,testHooks,gatewayPolicyPublicKey:POLICY_KEYS.publicKey,
+    deviceId:DEVICE,fingerprint:FINGERPRINT});
+  roots.set(executor,root);
   try{await executor.start();await fn({directory,root,state,file,executor});}
   finally{await executor.close();rmSync(directory,{recursive:true,force:true});}
 }
 const call=(executor,name,args,{requestId=randomUUID(),signal}={})=>executor.handle({
   version:1,method:'tools/call',deviceId:DEVICE,sessionId:randomUUID(),requestId,
-  authorization:AUTHORIZATION,params:{name,arguments:args},
+  authorization:authorizationFor(roots.get(executor),name,args,requestId),params:{name,arguments:args},
 },{signal});
 const textOf=result=>result?.content?.find(item=>item.type==='text')?.text??'';
 
@@ -206,7 +225,7 @@ test('truncated execution ledger blocks startup without repairing or truncating 
   const root=path.join(directory,'approved'),state=path.join(directory,'state');
   mkdirSync(root,{mode:0o700});mkdirSync(state,{mode:0o700});
   const ledger=path.join(state,'i4-execution.jsonl');writeFileSync(ledger,'{"version":1',{mode:0o600});
-  const executor=createGovernedAgentExecutor({allowedRoot:root,entrypoint:FIXTURE,ledgerDirectory:state});
+  const executor=configuredExecutor({allowedRoot:root,entrypoint:FIXTURE,ledgerDirectory:state});
   try{
     await assert.rejects(executor.start(),error=>error.code==='LEDGER_CORRUPT');
     assert.equal(readFileSync(ledger,'utf8'),'{"version":1');
@@ -256,7 +275,7 @@ test('state directory paths with symlink ancestors fail closed',{
   mkdirSync(real,{mode:0o700});mkdirSync(state,{mode:0o700});mkdirSync(root,{mode:0o700});
   symlinkSync(real,alias,'dir');
   try{
-    assert.throws(()=>createGovernedAgentExecutor({allowedRoot:root,entrypoint:FIXTURE,
+    assert.throws(()=>configuredExecutor({allowedRoot:root,entrypoint:FIXTURE,
       ledgerDirectory:path.join(alias,'state')}),error=>error.code==='POLICY');
   }finally{rmSync(directory,{recursive:true,force:true});}
 });
@@ -267,7 +286,7 @@ test('group or world writable operation roots fail closed',{
   const directory=mkdtempSync(path.join(os.tmpdir(),'vpsc-i4-writable-root-'));
   const root=path.join(directory,'approved'),state=path.join(directory,'state');
   mkdirSync(root,{mode:0o700});mkdirSync(state,{mode:0o700});chmodSync(root,0o770);
-  assert.throws(()=>createGovernedAgentExecutor({allowedRoot:root,entrypoint:FIXTURE,
+  assert.throws(()=>configuredExecutor({allowedRoot:root,entrypoint:FIXTURE,
     ledgerDirectory:state}),error=>error.code==='POLICY');
   rmSync(directory,{recursive:true,force:true});
 });
@@ -283,14 +302,20 @@ test('SIGKILL in the real executor after durable write and intent leaves ambigui
   const child=spawn(process.execPath,[fixturePath,root,state,target,requestId,DEVICE,FIXTURE],
     {stdio:['ignore','pipe','pipe'],detached:true,
       env:{...process.env,NODE_TEST_CONTEXT:process.env.NODE_TEST_CONTEXT??'child-v8'}});
-  let output='';
+  let output='',stderr='';
+  child.stderr.on('data',chunk=>stderr+=chunk.toString());
   const ready=new Promise((resolve,reject)=>{
-    const timer=setTimeout(()=>reject(Error('real executor did not reach post-effect crash point')),5000);
+    const timer=setTimeout(()=>reject(Error(`real executor did not reach post-effect crash point: ${output} ${stderr}`)),5000);
     child.stdout.on('data',chunk=>{
       output+=chunk.toString();
       if(output.includes('AFTER_EFFECT_DURABLE')){clearTimeout(timer);resolve();}
     });
     child.once('error',error=>{clearTimeout(timer);reject(error);});
+    child.once('exit',(code,signal)=>{
+      if(!output.includes('AFTER_EFFECT_DURABLE')){
+        clearTimeout(timer);reject(Error(`crash fixture exited before fault point (${code}, ${signal}): ${stderr}`));
+      }
+    });
   });
   try{
     await ready;
@@ -315,7 +340,7 @@ test('SIGKILL in the real executor after durable write and intent leaves ambigui
       expectedDigest:diagnosis.lock.digest}),true);
     diagnosis=analyzeI4ExecutionRecovery({ledgerDirectory:state});
     assert.equal(diagnosis.status,'ambiguous-intent');
-    const executor=createGovernedAgentExecutor({allowedRoot:root,entrypoint:FIXTURE,ledgerDirectory:state});
+    const executor=configuredExecutor({allowedRoot:root,entrypoint:FIXTURE,ledgerDirectory:state});
     await assert.rejects(executor.start(),error=>error.code==='RECOVERY_REQUIRED');
     assert.equal(readFileSync(target,'utf8'),'committed-before-crash\n');
     const ledger=readFileSync(path.join(state,'i4-execution.jsonl'),'utf8');
@@ -353,7 +378,7 @@ test('two agent processes racing one stable request commit at most one filesyste
   });
   try{
     const outcomes=await Promise.all([run(),run()]);
-    assert.equal(outcomes.filter(item=>item.status==='success').length,1);
+    assert.equal(outcomes.filter(item=>item.status==='success').length,1,JSON.stringify(outcomes));
     assert.equal(outcomes.filter(item=>item.status==='rejected').length,1);
     assert.ok(['BUSY','RECOVERY_REQUIRED','DUPLICATE_EXECUTION'].includes(
       outcomes.find(item=>item.status==='rejected').code));

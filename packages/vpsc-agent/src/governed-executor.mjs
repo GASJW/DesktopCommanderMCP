@@ -8,6 +8,7 @@ import {
 } from 'node:fs';
 import { createDurableProcessLock, inspectDurableProcessLock,
   removeOwnedDurableProcessLock } from '../../../gateway/common/durable-process-lock.mjs';
+import { verifyToolGrantCapability } from '../../../gateway/devices/tool-grant-capability.mjs';
 import { createLocalReadonlyMcp, LocalMcpError } from './local-mcp-readonly.mjs';
 
 const LEDGER='i4-execution.jsonl';
@@ -24,7 +25,12 @@ const fail=(code,message)=>new LocalMcpError(code,message);
 const sameKeys=(value,keys)=>value&&Object.getPrototypeOf(value)===Object.prototype&&
   Object.keys(value).sort().join(',')===[...keys].sort().join(',');
 function validAuthorization(value){
-  return value&&typeof value==='object'&&!Array.isArray(value)&&
+  const envelope=value&&typeof value==='object'&&!Array.isArray(value)&&
+    sameKeys(value,['claims','signature','version'])&&value.version===1&&
+    value.claims&&typeof value.claims==='object'&&!Array.isArray(value.claims)&&
+    Object.getPrototypeOf(value.claims)===Object.prototype&&
+    typeof value.signature==='string'&&/^[A-Za-z0-9_-]{86}$/.test(value.signature);
+  const legacy=value&&typeof value==='object'&&!Array.isArray(value)&&
     sameKeys(value,['approvalEventId','approvalTrustRevisionAfter','approvalTrustRevisionBefore',
       'fingerprint','ownerDigest','policyRevision','trustRevision'])&&
     UUID.test(value.approvalEventId??'')&&/^[a-f0-9]{64}$/.test(value.fingerprint??'')&&
@@ -35,6 +41,7 @@ function validAuthorization(value){
     Number.isSafeInteger(value.trustRevision)&&value.trustRevision>=value.approvalTrustRevisionAfter&&
     typeof value.policyRevision==='string'&&value.policyRevision.length>0&&
     value.policyRevision.length<=128&&!/[\u0000-\u001f\u007f]/.test(value.policyRevision);
+  return envelope||legacy;
 }
 function syncDirectory(directory){
   const fd=openSync(directory,constants.O_RDONLY|(constants.O_DIRECTORY??0)|(constants.O_NOFOLLOW??0));
@@ -331,7 +338,7 @@ function createOnlyWrite(rootFd,root,filename,content){
   }finally{if(openedParent.owned)closeSync(openedParent.fd);}
   return jsonResult({created:true,bytes:bytes.length});
 }
-function boundedList(rootFd,root,filename,depthLimit){
+function boundedList(rootFd,root,filename,depthLimit,entryLimit=MAX_DIRECTORY_ENTRIES){
   const opened=openDirectoryBeneath(rootFd,root,path.resolve(filename),{allowRoot:true});
   const entries=[];let truncated=false;
   const queue=[{fd:opened.fd,owned:opened.owned,depth:0,relative:''}];
@@ -340,7 +347,7 @@ function boundedList(rootFd,root,filename,depthLimit){
       const current=queue[cursor];
       try{
         for(const entry of readdirSync(procFd(current.fd),{withFileTypes:true})){
-          if(entries.length>=MAX_DIRECTORY_ENTRIES){truncated=true;break;}
+          if(entries.length>=Math.min(MAX_DIRECTORY_ENTRIES,entryLimit)){truncated=true;break;}
           const relative=current.relative?path.join(current.relative,entry.name):entry.name;
           entries.push({name:entry.name,path:relative,type:entry.isDirectory()?'directory':
             entry.isFile()?'file':entry.isSymbolicLink()?'symlink':'other'});
@@ -368,7 +375,7 @@ function boundedList(rootFd,root,filename,depthLimit){
   return jsonResult({entries,truncated});
 }
 function runCountLines({rootFd,root,filename,timeoutMs,signal,jobs,activeChildren,onSpawn,
-  afterFileOpen,slowTestCommand=false,failTestCommand=false}){
+  afterFileOpen,slowTestCommand=false,failTestCommand=false,maxOutputBytes=MAX_OUTPUT_BYTES}){
   if(process.platform!=='linux')throw fail('UNSUPPORTED','count_lines profile is Linux-only');
   const opened=openFileBeneath(rootFd,root,filename,1024*1024);
   try{afterFileOpen?.({tool:'run_command',path:filename});}
@@ -412,7 +419,7 @@ function runCountLines({rootFd,root,filename,timeoutMs,signal,jobs,activeChildre
     activeChildren.add(child);job.pid=child.pid;
     const collect=(which,chunk)=>{
       total+=chunk.length;
-      if(total>MAX_OUTPUT_BYTES){overflow=true;terminate();return;}
+      if(total>Math.min(MAX_OUTPUT_BYTES,maxOutputBytes)){overflow=true;terminate();return;}
       if(which==='stdout')stdout+=chunk.toString('utf8');else stderr+=chunk.toString('utf8');
     };
     child.stdout.on('data',chunk=>collect('stdout',chunk));
@@ -423,8 +430,8 @@ function runCountLines({rootFd,root,filename,timeoutMs,signal,jobs,activeChildre
       if(timedOut)return finish(fail('AMBIGUOUS_TIMEOUT','Command timed out; do not replay'));
       if(overflow)return finish(fail('AMBIGUOUS_OUTPUT_LIMIT','Command output exceeded the limit'));
       if(signalName)return finish(fail('AMBIGUOUS_COMMAND','Command exited without a result'));
-      const output={profile:'count_lines',exitCode,stdout:stdout.slice(0,MAX_OUTPUT_BYTES),
-        stderr:stderr.slice(0,MAX_OUTPUT_BYTES)};
+      const output={profile:'count_lines',exitCode,stdout:stdout.slice(0,Math.min(MAX_OUTPUT_BYTES,maxOutputBytes)),
+        stderr:stderr.slice(0,Math.min(MAX_OUTPUT_BYTES,maxOutputBytes))};
       job.state=exitCode===0?'completed':'failed';job.exitCode=exitCode;
       finish(null,jsonResult(output));
     });
@@ -461,11 +468,14 @@ export function analyzeI4ExecutionRecovery({ledgerDirectory}={}){
 
 export function createGovernedAgentExecutor({allowedRoot,entrypoint,nodeBin=process.execPath,
   ledgerDirectory,timeoutMs=8000,startupTimeoutMs=30_000,maxFileBytes=64*1024,
-  commandTimeoutMs=10_000,testHooks}={}){
+  commandTimeoutMs=10_000,gatewayPolicyPublicKey,deviceId,fingerprint,testHooks}={}){
   if(typeof process.getuid==='function'&&process.getuid()===0)throw fail('PRIVILEGE','Agent must run as nonroot');
   if(process.platform!=='linux')throw fail('UNSUPPORTED','I4 durable execution currently requires Linux');
   if(!Number.isSafeInteger(commandTimeoutMs)||commandTimeoutMs<100||commandTimeoutMs>30_000){
     throw fail('POLICY','Invalid fixed command timeout');
+  }
+  if(!gatewayPolicyPublicKey||!UUID.test(deviceId??'')||!/^[a-f0-9]{64}$/.test(fingerprint??'')){
+    throw fail('POLICY','Pinned Gateway policy key and agent identity are required');
   }
   if(testHooks!==undefined&&(!process.env.NODE_TEST_CONTEXT||!testHooks||
      typeof testHooks!=='object'||Array.isArray(testHooks)||
@@ -522,7 +532,7 @@ export function createGovernedAgentExecutor({allowedRoot,entrypoint,nodeBin=proc
     if(!started||closed)throw fail('UNAVAILABLE','Governed executor is not running');
     assertState();
     if(signal?.aborted)throw fail('CANCELLED','Operation cancelled before dispatch');
-    if(!frame||frame.version!==1||frame.method!=='tools/call'||!UUID.test(frame.deviceId??'')||
+    if(!frame||frame.version!==1||frame.method!=='tools/call'||frame.deviceId!==deviceId||
        !UUID.test(frame.sessionId??'')||!UUID.test(frame.requestId??'')||
        !frame.params||Object.getPrototypeOf(frame.params)!==Object.prototype||
        !sameKeys(frame.params,['arguments','name'])||typeof frame.params.name!=='string'||
@@ -533,6 +543,10 @@ export function createGovernedAgentExecutor({allowedRoot,entrypoint,nodeBin=proc
     }
     const {name,arguments:args}=frame.params;
     checkedArguments(name,args);
+    let grant;
+    try{grant=verifyToolGrantCapability(authorization,gatewayPolicyPublicKey,{deviceId,
+      requestId:frame.requestId,fingerprint,tool:name,arguments:args,allowedRoot:root});}
+    catch{throw fail('DENIED','Operation lacks a valid Gateway signed tool grant');}
     const argumentHash=hash(JSON.stringify(canonical({tool:name,arguments:args})));
     let lockOwner;
     try{assertState();lockOwner=createDurableProcessLock(state,LOCK,'i4-agent-op');assertState();}
@@ -574,19 +588,26 @@ export function createGovernedAgentExecutor({allowedRoot,entrypoint,nodeBin=proc
       try{
         if(signal?.aborted)throw fail('CANCELLED','Operation cancelled after durable intent');
         if(name==='read_file'){
-          const opened=openFileBeneath(rootFd,root,args.path,maxFileBytes);
+          const opened=openFileBeneath(rootFd,root,args.path,
+            Math.min(maxFileBytes,grant.constraints.maxBytes));
           try{
             await testHooks?.afterFileOpen?.({tool:name,path:args.path});
             output=readPinnedText(opened,maxFileBytes,args.offset??0,args.length??1000);
           }finally{closeSync(opened.fd);}
         }else if(name==='list_directory'){
-          output=boundedList(rootFd,root,args.path,args.depth??0);
+          output=boundedList(rootFd,root,args.path,
+            Math.min(args.depth??0,grant.constraints.maxDepth),grant.constraints.maxEntries);
         }else if(name==='write_file'){
+          if(Buffer.byteLength(args.content,'utf8')>grant.constraints.maxBytes){
+            throw fail('DENIED','Write content exceeds the granted size');
+          }
           output=createOnlyWrite(rootFd,root,args.path,args.content);
         }else if(name==='list_processes'){
-          output=jsonResult({jobs:jobs.map(job=>({...job}))});
+          output=jsonResult({jobs:jobs.slice(-grant.constraints.maxJobs).map(job=>({...job}))});
         }else{
-          output=await runCountLines({rootFd,root,filename:args.path,timeoutMs:commandTimeoutMs,
+          output=await runCountLines({rootFd,root,filename:args.path,
+            timeoutMs:Math.min(commandTimeoutMs,grant.constraints.maxRuntimeMs),
+            maxOutputBytes:grant.constraints.maxOutputBytes,
             signal,jobs,activeChildren,onSpawn:testHooks?.onCommandSpawn,
             afterFileOpen:testHooks?.afterFileOpen,
             failTestCommand:testHooks?.failCommandForTest===true,

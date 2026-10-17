@@ -2,6 +2,7 @@
 // gateway/server.mjs; callers must mount it only behind the owner Access
 // boundary after reviewing the deployment-specific policy.
 import { createHash, randomUUID } from 'node:crypto';
+import { signToolGrantCapability } from './tool-grant-capability.mjs';
 const MAX_REQUEST_BYTES=96*1024;
 const MAX_RESPONSE_BYTES=1024*1024;
 const MCP_PROTOCOL_VERSION='2025-03-26';
@@ -111,16 +112,15 @@ async function readRequest(req){
 }
 
 export function createRemoteDeviceMcpHandler({accessVerifier,deviceRegistry,router,
-  authorizeDevice,authorizeTool,getTrustRevision,getDeviceApprovalReceipt,
-  authorizationPolicyRevision}={}){
+  authorizeDevice,grantStore,policySigningKey,getTrustRevision,getDeviceApprovalReceipt}={}){
   if(!accessVerifier||typeof accessVerifier.verifyPrincipal!=='function'||
      !deviceRegistry||typeof deviceRegistry.listDevices!=='function'||
+     typeof deviceRegistry.isLiveSession!=='function'||
      !router||typeof router.callDevice!=='function'||typeof authorizeDevice!=='function'||
-     typeof authorizeTool!=='function'||typeof getTrustRevision!=='function'||
-     typeof getDeviceApprovalReceipt!=='function'||
-     typeof authorizationPolicyRevision!=='string'||authorizationPolicyRevision.length<1||
-     authorizationPolicyRevision.length>128||/[\u0000-\u001f\u007f]/.test(authorizationPolicyRevision)){
-    throw new TypeError('Owner verifier, durable trust revision and approval receipt, router, owner-device policy and tool policy revision are required');
+     !grantStore||typeof grantStore.authorizeAndPermit!=='function'||
+     typeof grantStore.withCurrentAuthorization!=='function'||!policySigningKey||
+     typeof getTrustRevision!=='function'||typeof getDeviceApprovalReceipt!=='function'){
+    throw new TypeError('Owner verifier, durable trust and approval receipt, router, durable tool grant store and Gateway signing key are required');
   }
   return async function handleRemoteDeviceMcp(req,res){
     if(req.url!=='/mcp')return send(res,404,{error:'Not found'});
@@ -208,56 +208,92 @@ export function createRemoteDeviceMcpHandler({accessVerifier,deviceRegistry,rout
     const controller=new AbortController();
     const abortOnDisconnect=()=>{if(!res.writableEnded)controller.abort();};
     res.once('close',abortOnDisconnect);
-    let authorized=false;
-    try{authorized=await authorizeDevice(owner,deviceId)===true;}
-    catch{
-      res.removeListener('close',abortOnDisconnect);
-      if(res.destroyed)return;
-      return jsonError(res,503,message.id,-32006,'Owner-device authorization unavailable');
-    }
-    if(res.destroyed||controller.signal.aborted){res.removeListener('close',abortOnDisconnect);return;}
-    if(!authorized){
-      res.removeListener('close',abortOnDisconnect);
-      return jsonError(res,403,message.id,-32007,'Owner is not authorized for this device');
-    }
-    let toolAuthorized=false;
-    try{toolAuthorized=await authorizeTool(owner,deviceId,name)===true;}
-    catch{
-      res.removeListener('close',abortOnDisconnect);
-      if(res.destroyed)return;
-      return jsonError(res,503,message.id,-32008,'Owner-tool authorization unavailable');
-    }
-    if(res.destroyed||controller.signal.aborted){res.removeListener('close',abortOnDisconnect);return;}
-    if(!toolAuthorized){
-      res.removeListener('close',abortOnDisconnect);
-      return jsonError(res,403,message.id,-32009,'Owner is not authorized for this tool');
-    }
     let serialized;
+    const requestId=randomUUID();
+    let authorizationContext;
+    let responseFenceContext;
     try{
-      const trustRevisionAfter=getTrustRevision();
-      if(trustRevisionAfter!==trustRevisionBefore){
-        return jsonError(res,503,message.id,-32002,'Device trust changed during authorization');
-      }
-      const approvalReceipt=getDeviceApprovalReceipt(owner,deviceId);
-      if(!validApprovalReceipt(approvalReceipt,deviceId,trustRevisionAfter)){
-        return jsonError(res,503,message.id,-32002,'Durable device approval receipt unavailable');
-      }
-      const requestId=randomUUID();
-      const authorization={ownerDigest:ownerDigest(owner),trustRevision:trustRevisionAfter,
-        approvalEventId:approvalReceipt.eventId,fingerprint:approvalReceipt.fingerprint,
-        approvalTrustRevisionBefore:approvalReceipt.trustRevisionBefore,
-        approvalTrustRevisionAfter:approvalReceipt.trustRevisionAfter,
-        policyRevision:authorizationPolicyRevision};
-      const result=await router.callDevice({requestId,deviceId,name,arguments:arguments_,authorization,
-        signal:controller.signal});
+      const result=await router.callDevice({requestId,deviceId,name,arguments:arguments_,
+        signal:controller.signal,beforeDispatch:async dispatch=>{
+          if(!dispatch||dispatch.deviceId!==deviceId||dispatch.requestId!==requestId||
+             !UUID.test(dispatch.sessionId??'')){
+            throw Object.assign(Error('Device session authorization context unavailable'),
+              {code:'SESSION_UNAVAILABLE'});
+          }
+          if(res.destroyed||controller.signal.aborted){
+            throw Object.assign(Error('Owner request disconnected before authorization'),{code:'CANCELLED'});
+          }
+          let authorized;
+          try{authorized=await authorizeDevice(owner,deviceId)===true;}
+          catch{throw Object.assign(Error('Owner-device authorization unavailable'),{code:'OWNER_AUTH_UNAVAILABLE'});}
+          if(res.destroyed||controller.signal.aborted){
+            throw Object.assign(Error('Owner request disconnected before tool authorization'),{code:'CANCELLED'});
+          }
+          if(!authorized)throw Object.assign(Error('Owner is not authorized for this device'),
+            {code:'OWNER_DEVICE_DENIED'});
+          const trustRevisionAfter=getTrustRevision();
+          if(trustRevisionAfter!==trustRevisionBefore){
+            throw Object.assign(Error('Device trust changed during authorization'),{code:'TRUST_CHANGED'});
+          }
+          const approvalReceipt=getDeviceApprovalReceipt(owner,deviceId);
+          if(!validApprovalReceipt(approvalReceipt,deviceId,trustRevisionAfter)){
+            throw Object.assign(Error('Durable device approval receipt unavailable'),{code:'APPROVAL_UNAVAILABLE'});
+          }
+          const permit=await grantStore.authorizeAndPermit({ownerDigest:ownerDigest(owner),deviceId,
+            fingerprint:approvalReceipt.fingerprint,tool:name,arguments:arguments_,requestId,
+            approvalReceipt},{signCapability:claims=>signToolGrantCapability(claims,policySigningKey)});
+          authorizationContext={grantId:permit.grantId,ownerDigest:ownerDigest(owner),deviceId,
+            fingerprint:approvalReceipt.fingerprint,tool:name,policyRevision:permit.policyRevision};
+          responseFenceContext={deviceId,owner,fingerprint:approvalReceipt.fingerprint,
+            trustRevision:trustRevisionAfter,approvalReceipt,sessionId:dispatch.sessionId};
+          return {authorization:permit.authorization,release:permit.release};
+        }});
       if(res.destroyed)return;
       serialized=JSON.stringify(result);
       if(typeof serialized!=='string'||Buffer.byteLength(serialized,'utf8')>MAX_RESPONSE_BYTES){
         return jsonError(res,502,message.id,-32004,'Remote response invalid or too large');
       }
-      return send(res,200,{jsonrpc:'2.0',id:message.id,result:JSON.parse(serialized)});
+      let delivered=false;
+      try{
+        grantStore.withCurrentAuthorization(authorizationContext,()=>{
+          if(res.destroyed)return;
+          const currentTrustRevision=getTrustRevision();
+          const currentApprovalReceipt=getDeviceApprovalReceipt(responseFenceContext.owner,
+            responseFenceContext.deviceId);
+          const receiptMatches=validApprovalReceipt(currentApprovalReceipt,responseFenceContext.deviceId,
+            currentTrustRevision)&&
+            currentApprovalReceipt.eventId===responseFenceContext.approvalReceipt.eventId&&
+            currentApprovalReceipt.fingerprint===responseFenceContext.fingerprint&&
+            currentApprovalReceipt.trustRevisionBefore===responseFenceContext.approvalReceipt.trustRevisionBefore&&
+            currentApprovalReceipt.trustRevisionAfter===responseFenceContext.approvalReceipt.trustRevisionAfter;
+          if(currentTrustRevision!==responseFenceContext.trustRevision||!receiptMatches||
+             !deviceRegistry.listDevices().some(device=>device.deviceId===responseFenceContext.deviceId)||
+             !deviceRegistry.isLiveSession(responseFenceContext.deviceId,responseFenceContext.sessionId)){
+            throw Object.assign(Error('Device trust, approval or session changed after dispatch'),
+              {code:'DEVICE_AUTHORIZATION_CHANGED'});
+          }
+          send(res,200,{jsonrpc:'2.0',id:message.id,result:JSON.parse(serialized)});delivered=true;
+        });
+      }catch(error){
+        if(res.destroyed)return;
+        const code=error?.code==='DENIED'?'AMBIGUOUS_GRANT_REVOCATION':'AMBIGUOUS_AUTHORIZATION_FENCE';
+        return send(res,503,{jsonrpc:'2.0',id:message.id,error:{code:-32005,
+          message:'Remote result suppressed after dispatch; do not replay',data:{code}}});
+      }
+      if(delivered)return;
+      return;
     }catch(error){
       if(res.destroyed)return;
+      if(error?.code==='OWNER_DEVICE_DENIED'){
+        return jsonError(res,403,message.id,-32007,'Owner is not authorized for this device');
+      }
+      if(error?.code==='DENIED'||error?.code==='GRANT_DENIED'||error?.code==='GRANT_SCOPE_DENIED'){
+        return jsonError(res,403,message.id,-32009,'Owner is not authorized for this tool operation');
+      }
+      if(error?.code==='OWNER_AUTH_UNAVAILABLE'||error?.code==='TRUST_CHANGED'||
+         error?.code==='APPROVAL_UNAVAILABLE'){
+        return jsonError(res,503,message.id,-32002,'Device authorization evidence unavailable');
+      }
       const code=typeof error?.code==='string'&&/^[A-Z_]{1,48}$/.test(error.code)
         ?error.code:'UNAVAILABLE';
       return send(res,503,{jsonrpc:'2.0',id:message.id,error:{
