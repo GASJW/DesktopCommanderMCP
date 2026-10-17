@@ -176,7 +176,7 @@ test('oversized malformed and wrong media requests do not pass pilot',async()=>{
     assert.equal((await rawPost(s.pilot.url,'/agent/challenge','"string"')).status,400);
     assert.equal((await rawPost(s.pilot.url,'/agent/challenge',JSON.stringify({deviceId:s.deviceId}),
       {'content-type':'text/plain'})).status,415);
-    assert.equal((await rawPost(s.pilot.url,'/agent/challenge',JSON.stringify({deviceId:s.deviceId,pad:'x'.repeat(18_000)}))).status,413);
+    assert.equal((await rawPost(s.pilot.url,'/agent/challenge',JSON.stringify({deviceId:s.deviceId,pad:'x'.repeat(270_000)}))).status,413);
   }finally{await s.close();}
 });
 test('cross-device session and signed payload cannot access another device',async()=>{

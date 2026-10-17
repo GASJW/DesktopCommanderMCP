@@ -13,7 +13,7 @@ import { createAccessVerifier } from '../../../gateway/access-auth.mjs';
 import { createDurableOwnerAudit, inspectDurableOwnerAudit } from '../../../gateway/dashboard/durable-owner-audit.mjs';
 import { createOwnerPairingHttp } from '../../../gateway/dashboard/owner-pairing-http.mjs';
 import { analyzeOwnerPairingRecovery } from '../../../gateway/dashboard/owner-pairing-reconciliation.mjs';
-import { createDurableOwnerDeviceAuthorizer } from '../../../gateway/dashboard/durable-owner-device-authorization.mjs';
+import { createDurableOwnerDeviceApprovalReader, createDurableOwnerDeviceAuthorizer } from '../../../gateway/dashboard/durable-owner-device-authorization.mjs';
 import { createDurableDeviceTrustStore, inspectDurableDeviceTrust } from '../../../gateway/devices/durable-trust.mjs';
 import { createPairingCoordinator } from '../../../gateway/devices/pairing.mjs';
 import { createMachineAccessVerifier } from '../../../gateway/devices/machine-access.mjs';
@@ -24,6 +24,7 @@ import { loadOrCreateDeviceIdentity } from '../src/identity-store.mjs';
 import { createLocalReadonlyMcp } from '../src/local-mcp-readonly.mjs';
 import { createHttpsAgentClient } from '../src/https-client.mjs';
 import { createAgentWorker } from '../src/worker.mjs';
+import { createGovernedAgentExecutor } from '../src/governed-executor.mjs';
 
 const HOST='devices.example.test';
 const CLIENT='i3-agent-test.access';
@@ -188,11 +189,17 @@ function makeTlsCertificate(directory,name){
 function makeGateway({trustStore,ownerAccess,machineAccess,bindings,ingressRef,
   auditDirectory,trustDirectory}){
   const router=createDeviceRouter({registry:trustStore.registry,timeoutMs:3000});
+  const readDeviceApproval=createDurableOwnerDeviceApprovalReader({auditDirectory,trustDirectory});
   const ingressPromise=startMachineIngressLoopback({registry:trustStore.registry,router,
     verifyMachineToken:machineAccess,machineBindings:bindings,enableTestIngress:true});
   const mcpServer=createHttpServer(createRemoteDeviceMcpHandler({
     accessVerifier:ownerAccess,deviceRegistry:trustStore.registry,router,
     authorizeDevice:createDurableOwnerDeviceAuthorizer({auditDirectory,trustDirectory}),
+    authorizeTool:async(_owner,_deviceId,name)=>new Set([
+      'read_file','list_directory','write_file','list_processes','run_command',
+    ]).has(name),
+    getTrustRevision:()=>trustStore.revision(),getDeviceApprovalReceipt:readDeviceApproval,
+    authorizationPolicyRevision:'i4-all-tools-v1',
   }));
   let ownerMcpUrl;
   const ownerMcpReady=listen(mcpServer).then(url=>{ownerMcpUrl=url+'/mcp';return ownerMcpUrl;});
@@ -220,7 +227,7 @@ function createTlsEdge({certificate,ingressRef,expectedClientId,expectedSecret,m
       res.writeHead(403,{'content-type':'application/json'});res.end('{"error":"identity boundary denied"}');return;
     }
     const chunks=[];let size=0;
-    for await(const chunk of req){size+=chunk.length;if(size>16*1024){
+    for await(const chunk of req){size+=chunk.length;if(size>256*1024){
       res.writeHead(413);res.end();return;
     }chunks.push(chunk);}
     const forward={'content-type':'application/json','cf-access-jwt-assertion':machineJwt};
@@ -246,13 +253,15 @@ function agentClient({identity,deviceId,clientSecret,fetchFn}){
   return createHttpsAgentClient({gatewayUrl:`https://${HOST}/`,expectedHostname:HOST,
     identity,deviceId,clientId:CLIENT,clientSecret,fetchFn});
 }
-function makeExecutor(root){
+function makeExecutor(root,ledgerDirectory){
+  if(ledgerDirectory)return createGovernedAgentExecutor({allowedRoot:root,
+    entrypoint:LOCAL_MCP_ENTRY,ledgerDirectory});
   return createLocalReadonlyMcp({allowedRoot:root,entrypoint:LOCAL_MCP_ENTRY,timeoutMs:5000,
   });
 }
-async function startWorker(client,deviceId,root){
+async function startWorker(client,deviceId,root,ledgerDirectory){
   const controller=new AbortController();
-  const worker=createAgentWorker({deviceId,client,executor:makeExecutor(root),pollIntervalMs:25});
+  const worker=createAgentWorker({deviceId,client,executor:makeExecutor(root,ledgerDirectory),pollIntervalMs:25});
   const done=worker.run({signal:controller.signal});
   return {worker,controller,done};
 }
@@ -312,7 +321,7 @@ async function approveDevice({home,pairingIdentity,provePairing,ownerAccess,owne
   }finally{await closeServer(ownerServer);}
 }
 
-test('I3 E2E: Owner approval, durable trust, verified TLS, device route, local MCP read, restart and revoke',async t=>{
+test('I3/I4 E2E: Owner approval, durable trust, verified TLS, governed operations, restart and revoke',async t=>{
   const home=mkdtempSync(path.join(tmpdir(),'g7-i3-e2e-'));
   let trustStore=null,audit=null,gateway=null,edge=null,active=null;
   t.after(async()=>{
@@ -325,9 +334,11 @@ test('I3 E2E: Owner approval, durable trust, verified TLS, device route, local M
   });
   const trustDirectory=path.join(home,'trust'),auditDirectory=path.join(home,'audit');
   const identityDirectory=path.join(home,'agent-identity');
+  const executionDirectory=path.join(home,'agent-execution');
   const allowedRoot=path.join(home,'approved-files');
   mkdirSync(allowedRoot,{mode:0o700});
   mkdirSync(identityDirectory,{mode:0o700});
+  mkdirSync(executionDirectory,{mode:0o700});
   const file=path.join(allowedRoot,'approved.txt');
   writeFileSync(file,'durable-owner-approved-real-mcp-read\n',{mode:0o600});
   const ownerKeys=keyMaterial('owner-i3'),machineKeys=keyMaterial('machine-i3');
@@ -411,7 +422,9 @@ test('I3 E2E: Owner approval, durable trust, verified TLS, device route, local M
   }},machineJwt);
   assert.equal(machineAsOwner.status,401,'machine Access cannot impersonate the owner');
   const tools=await ownerCall(mcpUrl,'tools/list',2,{},ownerToken);
-  assert.equal(tools.status,200);assert.deepEqual(tools.body.result.tools.map(tool=>tool.name),['read_file']);
+  assert.equal(tools.status,200);assert.deepEqual(tools.body.result.tools.map(tool=>tool.name),[
+    'read_file','list_directory','write_file','list_processes','run_command',
+  ]);
   const read=await ownerCall(mcpUrl,'tools/call',3,{name:'read_file',arguments:{
     deviceId:approved.deviceId,path:file,
   }},ownerToken);
@@ -429,8 +442,46 @@ test('I3 E2E: Owner approval, durable trust, verified TLS, device route, local M
   assert.equal(trustStore.registry.listDevices()[0]?.online,false,'explicit disconnect invalidates the device session');
   client=agentClient({identity,deviceId:approved.deviceId,clientSecret:SERVICE_SECRET,
     fetchFn:createTlsFetch({port:edgeInfo.port,ca:certificate.cert,observed:[]})});
-  active=await startWorker(client,approved.deviceId,allowedRoot);
-  await waitFor(()=>trustStore.registry.listDevices()[0]?.online,'reconnected device heartbeat');
+  active=await startWorker(client,approved.deviceId,allowedRoot,executionDirectory);
+  await waitFor(()=>trustStore.registry.listDevices()[0]?.online,'governed I4 device heartbeat');
+  const directoryCall=await ownerCall(mcpUrl,'tools/call',30,{name:'list_directory',arguments:{
+    deviceId:approved.deviceId,path:allowedRoot,depth:1,
+  }},ownerToken);
+  assert.equal(directoryCall.status,200,JSON.stringify(directoryCall.body));
+  assert.match(directoryCall.body.result.content[0].text,/approved\.txt/);
+  const createdPath=path.join(allowedRoot,'i4-created.txt');
+  const writeCall=await ownerCall(mcpUrl,'tools/call',31,{name:'write_file',arguments:{
+    deviceId:approved.deviceId,path:createdPath,content:'durable I4 write\n',mode:'create',
+  }},ownerToken);
+  assert.equal(writeCall.status,200,JSON.stringify(writeCall.body));
+  assert.equal(readFileSync(createdPath,'utf8'),'durable I4 write\n');
+  const duplicateWrite=await ownerCall(mcpUrl,'tools/call',31,{name:'write_file',arguments:{
+    deviceId:approved.deviceId,path:createdPath,content:'durable I4 write\n',mode:'create',
+  }},ownerToken);
+  assert.equal(duplicateWrite.body.result.isError,true);
+  assert.equal(readFileSync(createdPath,'utf8'),'durable I4 write\n');
+  const commandCall=await ownerCall(mcpUrl,'tools/call',32,{name:'run_command',arguments:{
+    deviceId:approved.deviceId,path:file,profile:'count_lines',
+  }},ownerToken);
+  assert.equal(commandCall.status,200,JSON.stringify(commandCall.body));
+  assert.equal(commandCall.body.result.structuredContent.exitCode,0);
+  assert.match(commandCall.body.result.structuredContent.stdout,/1/);
+  const processesCall=await ownerCall(mcpUrl,'tools/call',33,{name:'list_processes',arguments:{
+    deviceId:approved.deviceId,
+  }},ownerToken);
+  assert.equal(processesCall.status,200);
+  assert.ok(processesCall.body.result.structuredContent.jobs.some(job=>job.profile==='count_lines'&&
+    job.exitCode===0));
+  const executionLedger=readFileSync(path.join(executionDirectory,'i4-execution.jsonl'),'utf8');
+  const executionRecords=executionLedger.trim().split('\n').map(line=>JSON.parse(line));
+  const governedIntent=executionRecords.find(record=>record.type==='intent');
+  assert.equal(governedIntent.deviceId,approved.deviceId);
+  assert.equal(governedIntent.authorization.approvalEventId,intent.eventId);
+  assert.equal(governedIntent.authorization.fingerprint,approved.fingerprint);
+  assert.equal(governedIntent.authorization.approvalTrustRevisionBefore,0);
+  assert.equal(governedIntent.authorization.approvalTrustRevisionAfter,1);
+  assert.ok(executionRecords.every(record=>record.authorization.approvalEventId===intent.eventId));
+  assert.doesNotMatch(executionLedger,/created by I4|durable I4 write|durable-owner-approved-real-mcp-read|owner-i3/);
   const secondRead=await ownerCall(mcpUrl,'tools/call',4,{name:'read_file',arguments:{
     deviceId:approved.deviceId,path:file,
   }},ownerToken);
@@ -459,7 +510,7 @@ test('I3 E2E: Owner approval, durable trust, verified TLS, device route, local M
   oldClient.close();
   client=agentClient({identity,deviceId:approved.deviceId,clientSecret:SERVICE_SECRET,
     fetchFn:createTlsFetch({port:edgeInfo.port,ca:certificate.cert,observed:[]})});
-  active=await startWorker(client,approved.deviceId,allowedRoot);
+  active=await startWorker(client,approved.deviceId,allowedRoot,executionDirectory);
   await waitFor(()=>trustStore.registry.listDevices()[0]?.online,'post-restart authenticated heartbeat');
   const afterRestart=await ownerCall(restartedMcp,'tools/call',5,{name:'read_file',arguments:{
     deviceId:approved.deviceId,path:file,

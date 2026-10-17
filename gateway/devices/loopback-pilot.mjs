@@ -3,7 +3,7 @@ import { signedAgentRequest } from '../../packages/vpsc-agent/src/frame.mjs';
 
 const ROUTES = new Set(['/agent/challenge','/agent/connect','/agent/heartbeat',
   '/agent/poll','/agent/result','/agent/disconnect']);
-const MAX_REQUEST = 16 * 1024;
+const MAX_REQUEST = 256 * 1024;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const reject = (res,status,message) => reply(res,status,{error:message});
 function reply(res,status,body) {
@@ -104,6 +104,10 @@ export async function startLoopbackAgentPilot({
           router.attachTransport({deviceId,sessionId,send:frame=>{
             if (queue.length>=4) throw Error('Pilot queue full');
             queue.push(frame);
+          },cancel:requestId=>{
+            const index=queue.findIndex(frame=>frame.requestId===requestId);
+            if(index<0)return false;
+            queue.splice(index,1);return true;
           }});
         }catch{return reject(res,409,'Device channel conflict');}
         channels.set(deviceId,{sessionId,queue});

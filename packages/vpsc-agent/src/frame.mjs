@@ -11,7 +11,7 @@ export function signedAgentRequest({method='POST',pathname,deviceId,sessionId,se
       typeof deviceId !== 'string' || !UUID.test(deviceId) ||
       typeof sessionId !== 'string' || !UUID.test(sessionId) ||
       !Number.isSafeInteger(sequence) || sequence < 1 ||
-      typeof bodyText !== 'string' || Buffer.byteLength(bodyText,'utf8') > 16 * 1024) {
+      typeof bodyText !== 'string' || Buffer.byteLength(bodyText,'utf8') > 256 * 1024) {
     throw new TypeError('Invalid agent request envelope');
   }
   const digest=createHash('sha256').update(bodyText,'utf8').digest('hex');
