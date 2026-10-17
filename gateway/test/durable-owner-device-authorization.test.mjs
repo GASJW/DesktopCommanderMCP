@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ownerPrincipalId } from '../dashboard/owner-pairing-http.mjs';
-import { ownerDeviceApprovalIsConsistent } from '../dashboard/durable-owner-device-authorization.mjs';
+import { ownerDeviceApprovalIsConsistent, ownerDeviceApprovalReceipt } from '../dashboard/durable-owner-device-authorization.mjs';
 
 const OWNER=Object.freeze({issuer:'https://identity.cloudflareaccess.com',subject:'owner-123'});
 const DEVICE='f1a2b3c4-d5e6-4a9f-8abc-1bb9b99c0001';
@@ -20,12 +20,14 @@ function evidence(){
   return {owner:OWNER,deviceId:DEVICE,recoveryState:{state:'CONSISTENT'},
     audit:{events:[intent,outcome]},trust:{transitions:[transition],devices:[{
       deviceId:DEVICE,fingerprint:FINGERPRINT,
-    }]}};
+    }],revision:4}};
 }
 
 test('owner-device access requires a consistent exact WAL and trust receipt join',()=>{
   const input=evidence();
   assert.equal(ownerDeviceApprovalIsConsistent(input),true);
+  assert.deepEqual(ownerDeviceApprovalReceipt(input),{eventId:EVENT,deviceId:DEVICE,fingerprint:FINGERPRINT,
+    trustRevisionBefore:3,trustRevisionAfter:4,trustRevision:4});
   for(const change of [
     x=>{x.recoveryState={state:'REVISION_DIVERGED'};},
     x=>{x.recoveryState={state:'ACTIVE_WRITER',underlyingState:'CONSISTENT',

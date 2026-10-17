@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 // Transport must authenticate agents and owner/tool policy before invoking this.
 const TOOL = /^[A-Za-z][A-Za-z0-9_-]{0,79}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const DIGEST=/^[a-f0-9]{64}$/;
 
 export class DeviceRouteError extends Error {
   constructor(code, message) {
@@ -41,12 +42,14 @@ export function createDeviceRouter({
     for (const [id, item] of channel.pending) {
       channel.pending.delete(id);
       clearTimeout(item.timer);
+      item.signal?.removeEventListener('abort',item.onAbort);
       item.reject(error);
     }
   };
-  function attachTransport({deviceId, sessionId, send} = {}) {
+  function attachTransport({deviceId, sessionId, send, cancel} = {}) {
     if (stopped) throw fail('CLOSED', 'Router closed');
-    if (typeof send !== 'function' || !registry.isLiveSession(deviceId, sessionId)) {
+    if (typeof send !== 'function'||cancel!==undefined&&typeof cancel!=='function'||
+        !registry.isLiveSession(deviceId, sessionId)) {
       throw fail('UNAUTHORIZED_DEVICE', 'Device session is not authenticated and live');
     }
     const previous = active.get(deviceId);
@@ -54,16 +57,42 @@ export function createDeviceRouter({
       throw fail('SESSION_IN_USE', 'Session already attached');
     }
     if (previous) endPending(previous, fail('AMBIGUOUS_DISCONNECT', 'Session superseded; no replay'));
-    active.set(deviceId, {sessionId, send, pending:new Map()});
+    active.set(deviceId, {sessionId, send,cancel,pending:new Map()});
     return Object.freeze({deviceId,sessionId});
   }
-  async function callDevice({deviceId, name, arguments:args = {}} = {}) {
+  async function callDevice({deviceId, name, arguments:args = {}, requestId:requestedId,
+    authorization,signal} = {}) {
     if (stopped) throw fail('CLOSED', 'Router closed');
     if (typeof deviceId !== 'string' || !UUID.test(deviceId)) {
       throw fail('BAD_DEVICE', 'Explicit deviceId required');
     }
     if (typeof name !== 'string' || !TOOL.test(name)) {
       throw fail('BAD_TOOL', 'Invalid tool name');
+    }
+    const requestId=requestedId??randomUUID();
+    if(typeof requestId!=='string'||!UUID.test(requestId)){
+      throw fail('BAD_REQUEST_ID','Invalid device execution request id');
+    }
+    if(signal!==undefined&&(!signal||typeof signal.aborted!=='boolean'||
+       typeof signal.addEventListener!=='function'||typeof signal.removeEventListener!=='function')){
+      throw fail('BAD_SIGNAL','Invalid operation cancellation signal');
+    }
+    if(signal?.aborted)throw fail('CANCELLED','Operation cancelled before device dispatch');
+    if(authorization!==undefined&&(!authorization||typeof authorization!=='object'||
+       Array.isArray(authorization)||Object.getPrototypeOf(authorization)!==Object.prototype||
+       Object.keys(authorization).sort().join(',')!==
+         'approvalEventId,approvalTrustRevisionAfter,approvalTrustRevisionBefore,fingerprint,ownerDigest,policyRevision,trustRevision'||
+       !DIGEST.test(authorization.ownerDigest??'')||!Number.isSafeInteger(authorization.trustRevision)||
+       authorization.trustRevision<0||!UUID.test(authorization.approvalEventId??'')||
+       !DIGEST.test(authorization.fingerprint??'')||
+       !Number.isSafeInteger(authorization.approvalTrustRevisionBefore)||authorization.approvalTrustRevisionBefore<0||
+       !Number.isSafeInteger(authorization.approvalTrustRevisionAfter)||
+       authorization.approvalTrustRevisionAfter!==authorization.approvalTrustRevisionBefore+1||
+       authorization.approvalTrustRevisionAfter>authorization.trustRevision||
+       typeof authorization.policyRevision!=='string'||
+       authorization.policyRevision.length<1||authorization.policyRevision.length>128||
+       /[\u0000-\u001f\u007f]/.test(authorization.policyRevision))){
+      throw fail('BAD_AUTHORIZATION','Invalid owner authorization receipt');
     }
     if (!args || typeof args !== 'object' || Array.isArray(args) ||
         (Object.getPrototypeOf(args) !== Object.prototype && Object.getPrototypeOf(args) !== null)) {
@@ -79,29 +108,46 @@ export function createDeviceRouter({
       throw fail('OFFLINE', 'Device offline');
     }
     if (channel.pending.size >= maxPendingPerDevice) throw fail('BUSY', 'Device busy');
-    const requestId = randomUUID();
+    if(channel.pending.has(requestId))throw fail('DUPLICATE_REQUEST','Execution request is already pending');
     const frame = Object.freeze({version:1,deviceId,sessionId:channel.sessionId,requestId,
-      method:'tools/call',params});
+      method:'tools/call',params,...(authorization?{authorization:Object.freeze({...authorization})}:{})});
     return new Promise((resolve,reject) => {
-      const timer = setTimeout(() => {
-        if (channel.pending.delete(requestId)) {
-          reject(fail('AMBIGUOUS_TIMEOUT', 'Outcome unknown; do not replay'));
-        }
-      }, timeoutMs);
-      channel.pending.set(requestId,{timer,resolve,reject});
+      const item={timer:null,resolve,reject,signal,dispatched:false,onAbort:null};
+      const finish=(error)=>{
+        if(!channel.pending.delete(requestId))return false;
+        clearTimeout(item.timer);signal?.removeEventListener('abort',item.onAbort);
+        reject(error);return true;
+      };
+      item.onAbort=()=>{
+        if(!channel.pending.delete(requestId))return;
+        clearTimeout(item.timer);signal?.removeEventListener('abort',item.onAbort);
+        let removed=false;
+        try{removed=channel.cancel?.(requestId)===true;}catch{}
+        reject(item.dispatched&&!removed
+          ?fail('AMBIGUOUS_CANCELLED','Cancellation arrived after dispatch; outcome unknown; do not replay')
+          :fail('CANCELLED','Operation was cancelled before the agent received it'));
+      };
+      item.timer=setTimeout(()=>{
+        if(!channel.pending.delete(requestId))return;
+        signal?.removeEventListener('abort',item.onAbort);
+        let removed=false;
+        try{removed=channel.cancel?.(requestId)===true;}catch{}
+        reject(item.dispatched&&!removed
+          ?fail('AMBIGUOUS_TIMEOUT','Outcome unknown; do not replay')
+          :fail('CANCELLED','Request expired before the agent received it'));
+      },timeoutMs);
+      channel.pending.set(requestId,item);
+      signal?.addEventListener('abort',item.onAbort,{once:true});
+      if(signal?.aborted){item.onAbort();return;}
       Promise.resolve().then(() => {
         if (stopped || active.get(deviceId) !== channel || !channel.pending.has(requestId) ||
             !registry.isLiveSession(deviceId, channel.sessionId)) {
           throw fail('AMBIGUOUS_DISCONNECT','Device unavailable; no replay');
         }
+        item.dispatched=true;
         return channel.send(frame);
       }).catch(() => {
-        const item = channel.pending.get(requestId);
-        if (item) {
-          clearTimeout(item.timer);
-          channel.pending.delete(requestId);
-          item.reject(fail('AMBIGUOUS_DISPATCH','Transport failed; outcome unknown'));
-        }
+        finish(fail('AMBIGUOUS_DISPATCH','Transport failed; outcome unknown'));
       });
     });
   }
@@ -122,6 +168,7 @@ export function createDeviceRouter({
     const item=channel.pending.get(requestId);
     channel.pending.delete(requestId);
     clearTimeout(item.timer);
+    item.signal?.removeEventListener('abort',item.onAbort);
     item.resolve(payload);
     return true;
   }

@@ -43,6 +43,23 @@ test('authenticated and live device dispatches to the exact device with an opaqu
     requestId:frame.requestId,result:{content:'duplicate'}}),false);
   s.router.close();
 });
+test('stable request ids are preserved and duplicates cannot be in flight twice',async()=>{
+  const s=setup();let sent=0;
+  s.router.attachTransport({deviceId:s.deviceId,sessionId:s.sessionId,send:()=>{sent++;}});
+  const requestId='d3911c43-4fc9-4cb8-a3d0-1bef1f04748a';
+  const pending=s.router.callDevice({deviceId:s.deviceId,name:'write_file',requestId,
+    arguments:{path:'/safe/new.txt',mode:'create'}});
+  await assert.rejects(s.router.callDevice({deviceId:s.deviceId,name:'write_file',requestId,
+    arguments:{path:'/safe/new.txt',mode:'create'}}),errorCode('DUPLICATE_REQUEST'));
+  await s.sleep(2);
+  assert.equal(sent,1);
+  assert.equal(s.router.acceptResponse({deviceId:s.deviceId,sessionId:s.sessionId,requestId,
+    result:{created:true}}),true);
+  assert.deepEqual(await pending,{created:true});
+  await assert.rejects(s.router.callDevice({deviceId:s.deviceId,name:'write_file',
+    requestId:'not-a-uuid',arguments:{path:'/safe/new.txt'}}),errorCode('BAD_REQUEST_ID'));
+  s.router.close();
+});
 test('unknown, offline or empty deviceId cannot route to local implicit default',async()=>{
   const s=setup();
   await assert.rejects(s.router.callDevice({name:'read_file'}),errorCode('BAD_DEVICE'));
@@ -93,6 +110,39 @@ test('timeout is ambiguous: never redispatch tool calls',async()=>{
   s.router.attachTransport({deviceId:s.deviceId,sessionId:s.sessionId,send:()=>{sent++;}});
   await assert.rejects(s.router.callDevice({deviceId:s.deviceId,name:'write_file',arguments:{path:'/tmp/x'}}),errorCode('AMBIGUOUS_TIMEOUT'));
   assert.equal(sent,1);
+  s.router.close();
+});
+test('caller cancellation before dispatch prevents delivery to the device',async()=>{
+  const s=setup();let sent=0;
+  s.router.attachTransport({deviceId:s.deviceId,sessionId:s.sessionId,send:()=>{sent++;}});
+  const controller=new AbortController();
+  const pending=s.router.callDevice({deviceId:s.deviceId,name:'write_file',signal:controller.signal});
+  controller.abort();
+  await assert.rejects(pending,errorCode('CANCELLED'));
+  await s.sleep(2);
+  assert.equal(sent,0);
+  s.router.close();
+});
+test('cancellation removes a queued task but stays ambiguous after agent receipt',async()=>{
+  const s=setup();const queue=[];
+  s.router.attachTransport({deviceId:s.deviceId,sessionId:s.sessionId,
+    send:frame=>queue.push(frame),cancel:requestId=>{
+      const index=queue.findIndex(frame=>frame.requestId===requestId);
+      if(index<0)return false;
+      queue.splice(index,1);return true;
+    }});
+  const beforePoll=new AbortController();
+  const queued=s.router.callDevice({deviceId:s.deviceId,name:'write_file',signal:beforePoll.signal});
+  await s.sleep(2);assert.equal(queue.length,1);beforePoll.abort();
+  await assert.rejects(queued,errorCode('CANCELLED'));
+  assert.equal(queue.length,0);
+  const afterPoll=new AbortController();
+  const dispatched=s.router.callDevice({deviceId:s.deviceId,name:'write_file',signal:afterPoll.signal});
+  await s.sleep(2);const received=queue.shift();assert.ok(received);
+  afterPoll.abort();
+  await assert.rejects(dispatched,errorCode('AMBIGUOUS_CANCELLED'));
+  assert.equal(s.router.acceptResponse({deviceId:s.deviceId,sessionId:s.sessionId,
+    requestId:received.requestId,result:{ok:true}}),false);
   s.router.close();
 });
 test('send transport failure reports ambiguous outcome and does not retry',async()=>{

@@ -2,6 +2,7 @@
 // not reconnect or replay after transport ambiguity; callers must start a new
 // worker session after independently reviewing its state.
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const REMOTE_TOOLS=new Set(['read_file','list_directory','write_file','list_processes','run_command']);
 const fail=(code,message)=>Object.assign(new Error(message),{code});
 
 function wait(ms,signal){
@@ -19,13 +20,28 @@ function wait(ms,signal){
 }
 function validTask(frame,session,deviceId){
   return frame&&typeof frame==='object'&&!Array.isArray(frame)&&
-    Object.keys(frame).sort().join(',')==='deviceId,method,params,requestId,sessionId,version'&&
+    Object.keys(frame).sort().join(',')==='authorization,deviceId,method,params,requestId,sessionId,version'&&
     frame.version===1&&frame.method==='tools/call'&&frame.deviceId===deviceId&&
     frame.deviceId===session.deviceId&&frame.sessionId===session.sessionId&&
     typeof frame.requestId==='string'&&UUID.test(frame.requestId)&&
+    frame.authorization&&typeof frame.authorization==='object'&&!Array.isArray(frame.authorization)&&
+    Object.getPrototypeOf(frame.authorization)===Object.prototype&&
+    Object.keys(frame.authorization).sort().join(',')===
+      'approvalEventId,approvalTrustRevisionAfter,approvalTrustRevisionBefore,fingerprint,ownerDigest,policyRevision,trustRevision'&&
+    /^[a-f0-9]{64}$/.test(frame.authorization.ownerDigest??'')&&
+    UUID.test(frame.authorization.approvalEventId??'')&&
+    /^[a-f0-9]{64}$/.test(frame.authorization.fingerprint??'')&&
+    Number.isSafeInteger(frame.authorization.approvalTrustRevisionBefore)&&
+    frame.authorization.approvalTrustRevisionBefore>=0&&
+    Number.isSafeInteger(frame.authorization.approvalTrustRevisionAfter)&&
+    frame.authorization.approvalTrustRevisionAfter===frame.authorization.approvalTrustRevisionBefore+1&&
+    typeof frame.authorization.policyRevision==='string'&&frame.authorization.policyRevision.length>0&&
+    frame.authorization.policyRevision.length<=128&&!/[\u0000-\u001f\u007f]/.test(frame.authorization.policyRevision)&&
+    Number.isSafeInteger(frame.authorization.trustRevision)&&
+    frame.authorization.trustRevision>=frame.authorization.approvalTrustRevisionAfter&&
     frame.params&&typeof frame.params==='object'&&!Array.isArray(frame.params)&&
     Object.keys(frame.params).sort().join(',')==='arguments,name'&&
-    frame.params.name==='read_file'&&frame.params.arguments&&
+    REMOTE_TOOLS.has(frame.params.name)&&frame.params.arguments&&
     typeof frame.params.arguments==='object'&&!Array.isArray(frame.params.arguments);
 }
 
@@ -70,7 +86,21 @@ export function createAgentWorker({deviceId,client,executor,pollIntervalMs=250}=
         if(!validTask(frame,session,deviceId))throw fail('PROTOCOL','Gateway sent a task outside the authenticated device session');
         // The request is executed once. If result delivery is ambiguous, the
         // loop exits and deliberately does not poll or execute the task again.
-        const result=await executor.handle(frame);
+        let result;
+        try{result=await executor.handle(frame,{signal:controller.signal});}
+        catch(error){
+          const code=typeof error?.code==='string'&&/^[A-Z_]{1,48}$/.test(error.code)
+            ?error.code:'OPERATION_FAILED';
+          if(code.startsWith('AMBIGUOUS_')||['LEDGER_WRITE_FAILED','LEDGER_CORRUPT',
+              'RECOVERY_REQUIRED','LOCK_UNAVAILABLE','UNAVAILABLE'].includes(code)){
+            throw fail(code,'Remote operation state requires session recovery');
+          }
+          result={isError:true,content:[{type:'text',text:`Remote operation rejected (${code})`}],
+            structuredContent:{code}};
+        }
+        if(controller.signal.aborted){
+          throw fail('AMBIGUOUS_CANCELLED','Operation was cancelled; do not replay');
+        }
         const acknowledgement=await client.result(frame.requestId,result);
         if(!acknowledgement||acknowledgement.accepted!==true){
           throw fail('AMBIGUOUS_ACK','Result acknowledgement missing; do not replay the task');
@@ -84,8 +114,8 @@ export function createAgentWorker({deviceId,client,executor,pollIntervalMs=250}=
       if(connected&&typeof client.disconnect==='function'){
         try{await client.disconnect();}catch{}
       }
-      try{client.close();}catch{}
-      try{executor.close();}catch{}
+      try{await client.close();}catch{}
+      try{await executor.close();}catch{}
     }
   }
   function stop(){

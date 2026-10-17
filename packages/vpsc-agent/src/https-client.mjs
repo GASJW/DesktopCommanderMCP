@@ -6,7 +6,7 @@ const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}
 const CLIENT=/^[A-Za-z0-9_.-]{8,256}$/;
 const ROUTES=new Set(['/agent/challenge','/agent/connect','/agent/heartbeat',
   '/agent/poll','/agent/result','/agent/disconnect']);
-const MAX_BYTES=16*1024;
+const MAX_BYTES=256*1024;
 const MAX_RESPONSE=512*1024;
 const NONCE=/^[A-Za-z0-9_-]{43}$/;
 export class HttpsAgentError extends Error{
