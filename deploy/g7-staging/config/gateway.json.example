@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "hostname": "g7-staging.test",
+  "listen": { "host": "127.0.0.1", "port": 18443 },
+  "tls": {
+    "keyPath": "/etc/vpsc-g7-staging-gateway/tls.key",
+    "certificatePath": "/etc/vpsc-g7-staging-gateway/tls.crt"
+  },
+  "owner": {
+    "issuer": "https://owner.g7-staging.test",
+    "audience": "REPLACE_WITH_64_LOWERCASE_HEX_OWNER_AUDIENCE",
+    "email": "g7-staging-owner@example.test",
+    "subject": "REPLACE_WITH_SYNTHETIC_OWNER_SUBJECT",
+    "origin": "https://g7-staging.test",
+    "controlToken": "REPLACE_WITH_64_HEX_SYNTHETIC_OWNER_CONTROL_TOKEN",
+    "jwks": [{
+      "kty": "RSA",
+      "alg": "RS256",
+      "kid": "REPLACE_WITH_SYNTHETIC_OWNER_KEY_ID",
+      "n": "REPLACE_WITH_SYNTHETIC_OWNER_RSA_PUBLIC_MODULUS",
+      "e": "AQAB"
+    }]
+  },
+  "machine": {
+    "issuer": "https://agent.g7-staging.test",
+    "audience": "REPLACE_WITH_DIFFERENT_64_LOWERCASE_HEX_MACHINE_AUDIENCE",
+    "clientId": "g7-staging-agent.synthetic",
+    "serviceSecret": "REPLACE_WITH_SYNTHETIC_MACHINE_SERVICE_SECRET",
+    "signingKeyPath": "/etc/vpsc-g7-staging-gateway/machine-jwt.key",
+    "jwks": [{
+      "kty": "RSA",
+      "alg": "RS256",
+      "kid": "REPLACE_WITH_SYNTHETIC_MACHINE_KEY_ID",
+      "n": "REPLACE_WITH_SYNTHETIC_MACHINE_RSA_PUBLIC_MODULUS",
+      "e": "AQAB"
+    }]
+  },
+  "policy": {
+    "directory": "/var/lib/vpsc-g7-staging-gateway/policy",
+    "privateKeyPem": "REPLACE_WITH_SYNTHETIC_ED25519_PKCS8_PEM",
+    "publicKeyPem": "REPLACE_WITH_MATCHING_SYNTHETIC_ED25519_SPKI_PEM"
+  },
+  "storage": {
+    "auditDirectory": "/var/lib/vpsc-g7-staging-gateway/audit",
+    "trustDirectory": "/var/lib/vpsc-g7-staging-gateway/trust",
+    "bindingDirectory": "/var/lib/vpsc-g7-staging-gateway/bindings",
+    "grantDirectory": "/var/lib/vpsc-g7-staging-gateway/grants"
+  }
+}
