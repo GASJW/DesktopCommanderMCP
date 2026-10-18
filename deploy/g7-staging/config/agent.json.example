@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "hostname": "g7-staging.test",
+  "port": 18443,
+  "deviceId": "REPLACE_WITH_OWNER_APPROVED_SYNTHETIC_DEVICE_UUID",
+  "clientId": "g7-staging-agent.synthetic",
+  "clientSecret": "REPLACE_WITH_SYNTHETIC_MACHINE_SERVICE_SECRET",
+  "identityDirectory": "/var/lib/vpsc-g7-staging-agent/identity",
+  "allowedRoot": "/var/lib/vpsc-g7-staging-agent/approved-root",
+  "ledgerDirectory": "/var/lib/vpsc-g7-staging-agent/ledger",
+  "mcpEntrypoint": "/opt/vps-commander/g7-staging/current/dist/index.js",
+  "policyPublicKeyPem": "REPLACE_WITH_MATCHING_SYNTHETIC_ED25519_SPKI_PEM",
+  "caPath": "/etc/vpsc-g7-staging-agent/ca.crt",
+  "pollIntervalMs": 250
+}

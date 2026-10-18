@@ -6,6 +6,7 @@ import { loadOrCreateDeviceIdentity } from '../src/identity-store.mjs';
 import { createGovernedAgentExecutor } from '../src/governed-executor.mjs';
 import { createAgentWorker } from '../src/worker.mjs';
 import { readPrivateStagingFile } from '../../../gateway/staging/private-file.mjs';
+import { parseStagingCommandLine } from '../../../gateway/staging/runtime-mode.mjs';
 
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TEST_SCENARIOS=new Set(['owner-cancel','grant-revoke','device-revoke']);
@@ -78,7 +79,7 @@ async function stop(signal){
     code:/^[A-Z_]{1,48}$/.test(error?.code??'')?error.code:'WORKER_ERROR'})+'\n');}
 }
 try{
-  if(process.argv.length!==4||process.argv[2]!=='--config')throw Error();
+  const invocation=parseStagingCommandLine(process.argv.slice(2));
   const fixtureRequested=process.env.VPSC_STAGING_TEST_ACTIVE_JOB==='1';
   const fixtureScenario=process.env.VPSC_STAGING_TEST_SCENARIO;
   if(fixtureRequested&&(!process.env.NODE_TEST_CONTEXT||!TEST_SCENARIOS.has(fixtureScenario)))throw Error();
@@ -97,7 +98,7 @@ try{
       throw error;
     }
   };
-  const config=parseConfig(process.argv[3]);
+  const config=parseConfig(invocation.configPath);
   const identity=loadOrCreateDeviceIdentity({directory:config.identityDirectory,platform:process.platform});
   if(!identity.deviceBinding||identity.deviceBinding.deviceId!==config.deviceId||
      identity.deviceBinding.clientId!==config.clientId||identity.deviceBinding.fingerprint!==identity.fingerprint)
@@ -163,7 +164,8 @@ try{
   });
   process.once('SIGTERM',()=>void stop('SIGTERM'));
   process.once('SIGINT',()=>void stop('SIGINT'));
-}catch{
-  process.stderr.write(JSON.stringify({event:'STARTUP_FAILED',code:'CONFIG_OR_IDENTITY'})+'\n');
+}catch(error){
+  process.stderr.write(JSON.stringify({event:'STARTUP_FAILED',code:
+    error?.code==='TEST_FIXTURE_ENVIRONMENT'?'TEST_FIXTURE_ENVIRONMENT':'CONFIG_OR_IDENTITY'})+'\n');
   process.exitCode=1;
 }

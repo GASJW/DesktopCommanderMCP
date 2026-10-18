@@ -21,6 +21,14 @@ import { readPrivateStagingFile } from './private-file.mjs';
 
 const HOST='127.0.0.1';
 const OWNER_ORIGIN=/^https:\/\/[a-z0-9.-]+$/;
+const OWNER_TEST_ISSUER='https://owner.g7-staging.test';
+const MACHINE_TEST_ISSUER='https://agent.g7-staging.test';
+const CLOUD_ACCESS_ISSUER=/^https:\/\/[a-z0-9-]+\.cloudflareaccess\.com$/;
+export function isValidStagingIssuer(value,role){
+  if(role==='owner')return value===OWNER_TEST_ISSUER||CLOUD_ACCESS_ISSUER.test(value);
+  if(role==='machine')return value===MACHINE_TEST_ISSUER||CLOUD_ACCESS_ISSUER.test(value);
+  return false;
+}
 const CLIENT=/^[A-Za-z0-9_.-]{8,256}$/;
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const HEX64=/^[a-f0-9]{64}$/;
@@ -55,8 +63,8 @@ function validateConfig(c){
        c.policy.directory].every(p=>typeof p==='string'&&path.isAbsolute(p)&&path.normalize(p)===p)||
      new Set([paths.auditDirectory,paths.bindingDirectory,paths.grantDirectory,
        paths.trustDirectory,c.policy.directory]).size!==5||
-     !/^https:\/\/[a-z0-9-]+\.cloudflareaccess\.com$/.test(c.owner.issuer)||
-     !/^https:\/\/[a-z0-9-]+\.cloudflareaccess\.com$/.test(c.machine.issuer)||
+     !isValidStagingIssuer(c.owner.issuer,'owner')||
+     !isValidStagingIssuer(c.machine.issuer,'machine')||
      c.owner.issuer===c.machine.issuer||!HEX64.test(c.owner.audience)||!HEX64.test(c.machine.audience)||
      c.owner.audience===c.machine.audience||!OWNER_ORIGIN.test(c.owner.origin)||
      c.owner.origin!==`https://${c.hostname}`||
