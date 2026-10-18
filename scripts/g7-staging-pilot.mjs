@@ -43,7 +43,7 @@ function makeJwt(privateKey,kid,claims){
 }
 function ownerToken(owner){
   const now=Math.floor(Date.now()/1000);
-  return makeJwt(owner.privateKey,'g7-staging-owner',{iss:OWNER_ISSUER,aud:OWNER_AUD,
+  return makeJwt(owner.privateKey,owner.jwk.kid,{iss:OWNER_ISSUER,aud:OWNER_AUD,
     email:OWNER_EMAIL,sub:OWNER_SUBJECT,iat:now-1,exp:now+3600});
 }
 function machineConfig(machine,privateKeyPath,secret){
@@ -246,8 +246,10 @@ async function runPilot(){
   chmodSync(scratch,0o700);
   trace('private scratch created');
   const gatewayHome=path.join(scratch,'gateway-home'),agentHome=path.join(scratch,'agent-home');
+  const ownerClientHome=path.join(scratch,'owner-client-home');
   const gatewayTmp=path.join(scratch,'gateway-tmp'),agentTmp=path.join(scratch,'agent-tmp');
-  for(const dir of [gatewayHome,agentHome,gatewayTmp,agentTmp])modeDir(dir);
+  const ownerClientTmp=path.join(scratch,'owner-client-tmp');
+  for(const dir of [gatewayHome,agentHome,ownerClientHome,gatewayTmp,agentTmp,ownerClientTmp])modeDir(dir);
   let gatewayProc,agentProc,agentRestartProc,gatewayRestartProc;
   const allProcesses=[];
   const launchProcess=(script,args,options)=>{
@@ -256,12 +258,13 @@ async function runPilot(){
   let gatewayPort=null,report;
   try{
     const dirs={};
-    for(const name of ['audit','trust','bindings','grants','policy','identity','ledger','allowed-root']){
+    for(const name of ['audit','trust','bindings','grants','policy','identity','ledger']){
       dirs[name]=path.join(scratch,name);modeDir(dirs[name]);
     }
+    dirs['allowed-root']=path.join(scratch,'g7-staging-approved-root');modeDir(dirs['allowed-root']);
     const inputFile=path.join(dirs['allowed-root'],'approved.txt');
     writeFileSync(inputFile,DISPLAYED_READ,{mode:0o600,flag:'wx'});
-    const owner=rsa('g7-staging-owner'),machine=rsa('g7-staging-machine');
+    const owner=rsa('g7-staging-owner-i5d-pilot'),machine=rsa('g7-staging-machine');
     const policy=generateKeyPairSync('ed25519');
     const tlsDir=path.join(scratch,'tls');modeDir(tlsDir);
     const tlsKey=path.join(tlsDir,'staging.key'),tlsCert=path.join(tlsDir,'staging.crt');
@@ -275,6 +278,10 @@ async function runPilot(){
     const serviceSecret=randomUUID().replaceAll('-','')+randomUUID().replaceAll('-','');
     const gatewayConfigPath=path.join(scratch,'gateway.json');
     const agentConfigPath=path.join(scratch,'agent.json');
+    const ownerSigningKeyPath=path.join(ownerClientHome,'owner-signing.key');
+    writeFileSync(ownerSigningKeyPath,owner.privateKey.export({format:'pem',type:'pkcs8'}),
+      {mode:0o600,flag:'wx'});
+    const ownerClientConfigPath=path.join(ownerClientHome,'owner-client.json');
     const ownerPrincipal={issuer:OWNER_ISSUER,subject:OWNER_SUBJECT};
     const ownerDigest=createHash('sha256').update('VPSC-I4-OWNER-v1\n')
       .update(JSON.stringify([OWNER_ISSUER,OWNER_SUBJECT])).digest('hex');
@@ -325,36 +332,43 @@ async function runPilot(){
       requestId:pairing.requestId,proof,
     });
     ensure(proved.status===200&&proved.json.proved===true,'Ed25519 pairing proof failed');
-    const pending=await tlsRequest({port:gatewayPort,ca:readFileSync(tlsCert),
-      pathname:'/dashboard/api/g7/pairing/pending',headers:authHeaders});
-    ensure(pending.status===200&&pending.json.pending.length===1,'Owner did not receive pending pairing');
-    ensure(!JSON.stringify(pending.json).includes(pairing.displayCode)&&
-      !JSON.stringify(pending.json).includes(pairing.nonce),'pairing secret leaked into Owner listing');
-    const approved=await post(gatewayPort,readFileSync(tlsCert),'/dashboard/api/g7/pairing/approve',{
-      requestId:pairing.requestId,code:pairing.displayCode,expectedFingerprint:pairing.fingerprint,
-    },{headers:{...controlHeaders,'x-vpsc-csrf':pending.json.csrf}});
-    ensure(approved.status===200&&approved.json.status==='approved_offline','Owner pairing approval failed');
-    trace('Owner approved durable pairing');
-    const deviceId=approved.json.deviceId;
+    const ownerClientConfig={version:1,origin:`https://${HOST}`,connectAddress:'127.0.0.1',
+      connectPort:gatewayPort,tlsServerName:HOST,caPath:tlsCert,stageControlToken:controlToken,
+      owner:{issuer:OWNER_ISSUER,audience:OWNER_AUD,email:OWNER_EMAIL,subject:OWNER_SUBJECT,
+        kid:owner.jwk.kid,publicJwk:owner.jwk,privateKeyPath:ownerSigningKeyPath},
+      machineClientId:CLIENT,allowedRoot:dirs['allowed-root']};
+    privateJson(ownerClientConfigPath,ownerClientConfig);
+    const ownerProvisioning=JSON.parse(execFileSync(process.execPath,
+      [path.join(ROOT,'scripts/g7-staging-owner-provision.mjs'),'--config',ownerClientConfigPath],{
+        cwd:ROOT,encoding:'utf8',maxBuffer:64*1024,timeout:20_000,
+        input:JSON.stringify({requestId:pairing.requestId,code:pairing.displayCode,
+          fingerprint:pairing.fingerprint})+'\n',
+        env:{PATH:'/usr/bin:/bin',HOME:ownerClientHome,TMPDIR:ownerClientTmp,LANG:'C.UTF-8'},
+      }));
+    ensure(ownerProvisioning.status==='provisioned'&&ownerProvisioning.clientId===CLIENT&&
+      ownerProvisioning.fingerprint===pairing.fingerprint&&
+      ownerProvisioning.binding?.deviceId===ownerProvisioning.deviceId&&
+      ownerProvisioning.grant?.deviceId===ownerProvisioning.deviceId,
+      'separate Owner provisioning client did not return the approved durable records');
+    trace('separate synthetic Owner CLI completed durable approval, binding, and grant');
+    const deviceId=ownerProvisioning.deviceId;
     ensure(identity.fingerprint===pairing.fingerprint,'pairing fingerprint differs from persistent identity');
 
     const wrongClientBinding=await post(gatewayPort,readFileSync(tlsCert),'/stage/bind',{
-      clientId:'g7-staging-other.synthetic',deviceId,expectedRevision:0,
+      clientId:'g7-staging-other.synthetic',deviceId,expectedRevision:ownerProvisioning.bindingRevision,
     },{headers:controlHeaders});
     ensure(wrongClientBinding.status===400,'staging allowed a binding for another machine client');
     const wrongDeviceChallenge=await post(gatewayPort,readFileSync(tlsCert),'/agent/challenge',{
       deviceId:randomUUID(),
     },{headers:{'cf-access-client-id':CLIENT,'cf-access-client-secret':serviceSecret}});
     ensure(wrongDeviceChallenge.status===403,'M2M identity reached a different device challenge');
-    const bound=await post(gatewayPort,readFileSync(tlsCert),'/stage/bind',{
-      clientId:CLIENT,deviceId,expectedRevision:0,
-    },{headers:controlHeaders});
-    ensure(bound.status===200&&bound.json.binding.fingerprint===identity.fingerprint,'durable M2M binding failed');
-    const boundIdentity=bindApprovedDeviceIdentity({directory:dirs.identity,machineBinding:bound.json.binding});
-    ensure(boundIdentity.deviceBinding.bindingEventId===bound.json.binding.bindingEventId,'identity binding was not persisted');
+    const boundIdentity=bindApprovedDeviceIdentity({directory:dirs.identity,
+      machineBinding:ownerProvisioning.binding});
+    ensure(boundIdentity.deviceBinding.bindingEventId===ownerProvisioning.binding.bindingEventId,
+      'identity binding was not persisted');
     trace('durable M2M binding persisted');
 
-    let policyRevision=0;
+    let policyRevision=ownerProvisioning.grantRevision;
     const grant=async(tool,scope,constraints)=>{
       const response=await post(gatewayPort,readFileSync(tlsCert),'/stage/grant',{
         deviceId,expectedRevision:policyRevision,tool,scope,constraints,
@@ -363,8 +377,7 @@ async function runPilot(){
       policyRevision=response.json.revision;
       return response.json.grant;
     };
-    const readGrant=await grant('read_file',{root:dirs['allowed-root']},
-      {maxBytes:65_536,maxLength:1000,maxOffset:100_000});
+    const readGrant=ownerProvisioning.grant;
     const writeGrant=await grant('write_file',{root:dirs['allowed-root']},{maxBytes:65_536});
     const commandGrant=await grant('run_command',{root:dirs['allowed-root'],profile:'count_lines'},
       {maxOutputBytes:4096,maxRuntimeMs:FIXTURE_COMMAND_TIMEOUT_MS,profile:'count_lines'});
@@ -435,7 +448,7 @@ async function runPilot(){
     await new Promise(resolve=>setTimeout(resolve,150));
     const identityAfterAgentCrash=loadOrCreateDeviceIdentity({directory:dirs.identity,platform:process.platform});
     ensure(identityAfterAgentCrash.fingerprint===firstIdentityFingerprint&&
-      identityAfterAgentCrash.deviceBinding.bindingEventId===bound.json.binding.bindingEventId,
+      identityAfterAgentCrash.deviceBinding.bindingEventId===ownerProvisioning.binding.bindingEventId,
       'agent identity or binding did not survive SIGKILL');
     agentRestartProc=startAgent();
     const agentRestartReady=await waitForEvent(agentRestartProc,'READY');
@@ -646,7 +659,8 @@ async function runPilot(){
     report={status:'pass_with_limitations',gateway:{processIndependent:true,pid:gatewayReady.pid},
       agent:{processIndependent:true,pid:agentReady.pid,deviceId},
       https:{tlsValidated:true,hostname:HOST,loopbackOnly:true},
-      ownerAuthentication:{verified:true,separateFromMachine:true},
+      ownerAuthentication:{verified:true,separateFromMachine:true,
+        provisioningClientProcess:true,durableApproval:true,durableBinding:true,durableGrant:true},
       machineAuthentication:{clientIdBinding:true,ed25519Fingerprint:identity.fingerprint},
       operations:{realMcpRead:true,governedWrite:true,revokedGrantDenied:true},
       restart:{agent:true,gateway:true,identityPersistent:true,newGatewaySession:true,

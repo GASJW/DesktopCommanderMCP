@@ -7,7 +7,7 @@
     "certificatePath": "/etc/vpsc-g7-staging-gateway/tls.crt"
   },
   "owner": {
-    "issuer": "https://owner.g7-staging.test",
+    "issuer": "https://g7-owner-staging.cloudflareaccess.com",
     "audience": "REPLACE_WITH_64_LOWERCASE_HEX_OWNER_AUDIENCE",
     "email": "g7-staging-owner@example.test",
     "subject": "REPLACE_WITH_SYNTHETIC_OWNER_SUBJECT",
@@ -22,7 +22,7 @@
     }]
   },
   "machine": {
-    "issuer": "https://agent.g7-staging.test",
+    "issuer": "https://g7-machine-staging.cloudflareaccess.com",
     "audience": "REPLACE_WITH_DIFFERENT_64_LOWERCASE_HEX_MACHINE_AUDIENCE",
     "clientId": "g7-staging-agent.synthetic",
     "serviceSecret": "REPLACE_WITH_SYNTHETIC_MACHINE_SERVICE_SECRET",

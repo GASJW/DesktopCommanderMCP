@@ -16,6 +16,8 @@ Run as a nonroot user with Node 22. If `/tmp` is inaccessible, the script uses `
 
 The script starts `gateway/staging/server.mjs` and `packages/vpsc-agent/bin/g7-staging-worker.mjs` as separate processes. It pairs and approves a synthetic device, writes a durable machine binding and restricted grants, reads a temporary file through the built Desktop Commander MCP server, performs a create-only governed write, tests agent `SIGKILL` recovery and graceful Gateway restart, then kills the idle Gateway with `SIGKILL`. After verifying every captured Gateway and agent process group is gone, it analyzes the WAL/trust evidence and invokes the existing I2 reconciler with explicit no-active-writers confirmation on this private disposable state. It confirms `RECONCILED_CONSISTENT`, restarts the Gateway and agent with fresh sessions, revokes a grant and device, checks separate Owner/M2M failures and rejects a cross-device challenge, then verifies all process groups are gone before deleting state.
 
+The I5D pilot runs `scripts/g7-staging-owner-provision.mjs` as a separate non-root child process for initial approval, durable machine binding, and the restricted `read_file` grant. It passes synthetic confirmation input only over stdin. The Owner private key remains in the temporary owner-client directory and never enters Gateway configuration or agent state. The normal pilot uses this same Owner API path before starting the isolated agent.
+
 ## Individual process entrypoints
 
 The Gateway accepts only `node gateway/staging/server.mjs --config /private/path/gateway.json`. The worker accepts only `node packages/vpsc-agent/bin/g7-staging-worker.mjs --config /private/path/agent.json`. Both reject root execution. Configuration files must be regular owner-owned mode `0600` files; state and identity directories must be separate owner-only directories. Gateway storage paths are validated by the existing durable stores. The Gateway listener is pinned to `127.0.0.1`; its health endpoint is `GET /healthz`.
@@ -29,21 +31,21 @@ Gateway configuration is version 1 and has these exact top-level fields:
   "listen": { "host": "127.0.0.1", "port": 0 },
   "tls": { "keyPath": "/private/tls.key", "certificatePath": "/private/tls.crt" },
   "owner": {
-    "issuer": "https://synthetic-owner.cloudflareaccess.com",
+    "issuer": "https://g7-owner-staging.cloudflareaccess.com",
     "audience": "64 lowercase hex characters",
-    "email": "staging-owner@example.test",
-    "subject": "synthetic-owner-subject",
+    "email": "g7-staging-owner@example.test",
+    "subject": "synthetic-staging-owner",
     "origin": "https://g7-staging.test",
     "controlToken": "64 lowercase hex characters",
-    "jwks": [{ "kty": "RSA", "alg": "RS256", "kid": "owner-key-id", "n": "...", "e": "AQAB" }]
+    "jwks": [{ "kty": "RSA", "alg": "RS256", "kid": "g7-staging-owner-1", "n": "...", "e": "AQAB" }]
   },
   "machine": {
-    "issuer": "https://synthetic-agent.cloudflareaccess.com",
+    "issuer": "https://g7-machine-staging.cloudflareaccess.com",
     "audience": "a different 64 lowercase hex string",
-    "clientId": "synthetic-client-id",
+    "clientId": "g7-staging-agent.synthetic",
     "serviceSecret": "synthetic secret, at least 24 characters",
     "signingKeyPath": "/private/machine-jwt.key",
-    "jwks": [{ "kty": "RSA", "alg": "RS256", "kid": "machine-key-id", "n": "...", "e": "AQAB" }]
+    "jwks": [{ "kty": "RSA", "alg": "RS256", "kid": "g7-staging-machine-1", "n": "...", "e": "AQAB" }]
   },
   "policy": {
     "directory": "/private/policy",

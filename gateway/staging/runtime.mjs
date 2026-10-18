@@ -1,4 +1,5 @@
 import { createServer as createHttpsServer } from 'node:https';
+import { Readable } from 'node:stream';
 import { createPrivateKey, createPublicKey, randomUUID, sign, timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
 import { createAccessVerifier } from '../access-auth.mjs';
@@ -12,7 +13,7 @@ import { ownerIdentityDigest, ownerPrincipalId, isOwnerPrincipal } from '../dash
 import { createDurableDeviceTrustStore } from '../devices/durable-trust.mjs';
 import { createPairingCoordinator } from '../devices/pairing.mjs';
 import { createMachineAccessVerifier } from '../devices/machine-access.mjs';
-import { startMachineIngressLoopback } from '../devices/machine-ingress-loopback.mjs';
+import { createAuthenticatedMachineIngress } from '../devices/persistent-machine-ingress.mjs';
 import { createDeviceRouter } from '../devices/router.mjs';
 import { createRemoteDeviceMcpHandler } from '../devices/remote-mcp-handler.mjs';
 import { createDurableToolGrantStore } from '../devices/durable-tool-grants.mjs';
@@ -21,12 +22,11 @@ import { readPrivateStagingFile } from './private-file.mjs';
 
 const HOST='127.0.0.1';
 const OWNER_ORIGIN=/^https:\/\/[a-z0-9.-]+$/;
-const OWNER_TEST_ISSUER='https://owner.g7-staging.test';
-const MACHINE_TEST_ISSUER='https://agent.g7-staging.test';
-const CLOUD_ACCESS_ISSUER=/^https:\/\/[a-z0-9-]+\.cloudflareaccess\.com$/;
+const OWNER_TEST_ISSUER='https://g7-owner-staging.cloudflareaccess.com';
+const MACHINE_TEST_ISSUER='https://g7-machine-staging.cloudflareaccess.com';
 export function isValidStagingIssuer(value,role){
-  if(role==='owner')return value===OWNER_TEST_ISSUER||CLOUD_ACCESS_ISSUER.test(value);
-  if(role==='machine')return value===MACHINE_TEST_ISSUER||CLOUD_ACCESS_ISSUER.test(value);
+  if(role==='owner')return value===OWNER_TEST_ISSUER;
+  if(role==='machine')return value===MACHINE_TEST_ISSUER;
   return false;
 }
 const CLIENT=/^[A-Za-z0-9_.-]{8,256}$/;
@@ -101,6 +101,9 @@ async function readJson(req,maxBytes=32*1024){
   return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(Buffer.concat(chunks,size)));
 }
 function mintMachineJwt(config,privateKey){
+  // This short-lived assertion is internal to the TLS Gateway composition;
+  // the external edge rejects client-supplied assertions. Replay defense for
+  // agent operations is the one-use challenge plus signed monotonic frame sequence.
   const now=Math.floor(Date.now()/1000),head=Buffer.from(JSON.stringify({alg:'RS256',kid:config.machine.jwks[0].kid})).toString('base64url');
   const body=Buffer.from(JSON.stringify({type:'app',sub:'',common_name:config.machine.clientId,
     iss:config.machine.issuer,aud:config.machine.audience,iat:now,exp:now+60})).toString('base64url');
@@ -159,9 +162,9 @@ export async function startG7StagingGateway(config){
         tool:claims.tool,policyRevision:claims.policyRevision},()=>
           trustStore.registry.isLiveSession(frame.deviceId,frame.sessionId))===true;}catch{return false;}
     };
-    ingress=await startMachineIngressLoopback({registry:trustStore.registry,router,
+    ingress=createAuthenticatedMachineIngress({registry:trustStore.registry,router,
       verifyMachineToken:machineAccess,machineBindingStore,
-      getTrustRevision:()=>trustStore.revision(),shouldCancelOperation,enableTestIngress:true});
+      getTrustRevision:()=>trustStore.revision(),shouldCancelOperation});
     const pairingHandler=createOwnerPairingHttp({coordinator,accessVerifier:ownerAccess,
       expectedOrigin:config.owner.origin,auditWrite:audit.auditWrite});
     const mcpHandler=createRemoteDeviceMcpHandler({accessVerifier:ownerAccess,
@@ -204,14 +207,9 @@ export async function startG7StagingGateway(config){
           for(const name of ['x-vpsc-device-id','x-vpsc-session-id','x-vpsc-sequence','x-vpsc-signature']){
             if(typeof req.headers[name]==='string')headers[name]=req.headers[name];
           }
-          try{
-            const upstream=await fetch(ingress.url+url.pathname,{method:'POST',headers,body,
-              redirect:'error',signal:AbortSignal.timeout(10_000)});
-            const responseBody=Buffer.from(await upstream.arrayBuffer());
-            if(responseBody.length>512*1024)return reply(res,502,{error:'Machine response too large'});
-            res.writeHead(upstream.status,{'content-type':'application/json','cache-control':'no-store',
-              'x-content-type-options':'nosniff'});res.end(responseBody);return;
-          }catch{return reply(res,502,{error:'Machine ingress unavailable'});}
+          const machineRequest=Readable.from([body]);
+          machineRequest.url=url.pathname;machineRequest.method=req.method;machineRequest.headers=headers;
+          return await ingress.handle(machineRequest,res);
         }
         if(url.pathname.startsWith('/stage/')){
           if(req.method!=='POST'||req.headers.origin!==config.owner.origin||

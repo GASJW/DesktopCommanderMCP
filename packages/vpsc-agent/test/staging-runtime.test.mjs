@@ -61,6 +61,10 @@ function assertBasePilot(report){
   assert.equal(report.agent.processIndependent,true);
   assert.equal(report.https.tlsValidated,true);
   assert.equal(report.ownerAuthentication.separateFromMachine,true);
+  assert.equal(report.ownerAuthentication.provisioningClientProcess,true);
+  assert.equal(report.ownerAuthentication.durableApproval,true);
+  assert.equal(report.ownerAuthentication.durableBinding,true);
+  assert.equal(report.ownerAuthentication.durableGrant,true);
   assert.equal(report.operations.realMcpRead,true);
   assert.equal(report.operations.governedWrite,true);
   assert.equal(report.restart.gateway,true);
