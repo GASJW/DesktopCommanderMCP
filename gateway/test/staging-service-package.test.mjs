@@ -45,18 +45,28 @@ test('inert config examples are loopback-only and contain no usable credentials'
   assert.equal(gateway.listen.port,18443);
   assert.equal(agent.port,18443);
   assert.equal(gateway.machine.clientId,agent.clientId);
-  assert.equal(gateway.owner.issuer,'https://owner.g7-staging.test');
-  assert.equal(gateway.machine.issuer,'https://agent.g7-staging.test');
+  assert.equal(gateway.owner.issuer,'https://g7-owner-staging.cloudflareaccess.com');
+  assert.equal(gateway.machine.issuer,'https://g7-machine-staging.cloudflareaccess.com');
   assert.equal(isValidStagingIssuer(gateway.owner.issuer,'owner'),true);
   assert.equal(isValidStagingIssuer(gateway.machine.issuer,'machine'),true);
   assert.equal(isValidStagingIssuer(gateway.owner.issuer,'machine'),false);
-  assert.doesNotMatch(JSON.stringify(gateway),/cloudflareaccess|cloudflare\.com/i);
+  assert.equal(isValidStagingIssuer('https://unrelated.cloudflareaccess.com','owner'),false);
+  assert.equal(isValidStagingIssuer('https://unrelated.cloudflareaccess.com','machine'),false);
   assert.match(gateway.owner.controlToken,/^REPLACE_/);
   assert.match(gateway.machine.serviceSecret,/^REPLACE_/);
   assert.match(agent.deviceId,/^REPLACE_/);
   assert.match(gateway.policy.privateKeyPem,/^REPLACE_/);
   assert.match(gateway.owner.jwks[0].n,/^REPLACE_/);
   assert.match(gateway.machine.jwks[0].n,/^REPLACE_/);
+});
+
+test('persistent Gateway uses direct authenticated ingress, never the harness listener',()=>{
+  const runtime=read('gateway/staging/runtime.mjs');
+  assert.match(runtime,/createAuthenticatedMachineIngress/);
+  assert.doesNotMatch(runtime,/startMachineIngressLoopback|enableTestIngress|fetch\(ingress\.url/);
+  assert.match(runtime,/req\.headers\['cf-access-jwt-assertion'\]\s*\|\|/);
+  assert.match(runtime,/cf-access-jwt-assertion':\s*mintMachineJwt\(/);
+  assert.match(runtime,/one-use challenge plus signed monotonic frame sequence/);
 });
 
 test('persistent mode rejects future fixture selectors by namespace',()=>{
