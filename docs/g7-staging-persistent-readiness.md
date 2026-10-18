@@ -249,3 +249,86 @@ The rollback never changes, stops, restarts, or reads G6 configuration/state. Th
 - This is synthetic same-host loopback staging with a staging-only machine-ingress boundary, not the final production transport or a remote-device enrollment.
 - No persistent Owner provisioning client or automatic recovery CLI is added. The existing Owner Only client and explicit operator review are activation prerequisites.
 - User/group creation, `/opt`, `/etc`, `/var/lib`, and systemd writes; provisioning any secret/certificate/key; starting or stopping persistent G7 services; Owner pairing/binding/grant; recovery lock handling; and any public/network/Cloudflare exposure require separate explicit Owner approval. Main merge, production deploy, G6 changes, and real-device enrollment remain out of scope.
+
+## I5F release freeze evidence (2026-10-18)
+
+This addendum supersedes the earlier capacity and native-systemd blockers for this reviewed template revision. It records a local release candidate only; it does not authorize installation, credential provisioning, or startup.
+
+### Reproducible runtime artifact
+
+- Artifact source commit: `a1649167ff08bc383bb0ed64f8a3b0f8ca866de8` (parent: I5D `c515a23e60b8ff5163184b1dded5459dff469df4`). The only runtime-source change in this commit aligns the two root `package-lock.json` version fields from `0.2.39` to the `package.json` version `0.2.51`; dependency declarations and integrity entries were not updated.
+- Artifact: deterministic gzip-compressed tar of the archived source, generated `dist`, and pruned production dependency tree. It contains 25,651 entries.
+- SHA-256: `8cb8a826c40ab358d0f4058e9a24b47c5a4e75ae380cc6ac0f7b0d702e2829de`.
+- Compressed size: `109421631` bytes. The post-prune runtime tree measured `350638080` allocated bytes (`273828898` apparent bytes); `dist/index.js` is 6,975 bytes.
+- The local artifact is retained at `/home/itagil/g7-i5f-build-a164916.zfPi8C/artifacts/g7-staging-runtime-a164916.tar.gz`. It has mode `0600`; it was not copied to any staging or release directory and was not uploaded.
+- Build runtime: Node `v22.23.2`, npm `9.2.0`, GNU tar `1.35`, gzip `1.12`. The lockfile SHA-256 after the version correction is `589efdecd4e726e15f2f83795f8f2af183f36bdb7dd281f43d84d95bbc1a53c7`.
+- Two independent private extractions of the same source commit each passed `npm ci --ignore-scripts --no-audit --no-fund`, `npm run build`, `npm prune --omit=dev --ignore-scripts --no-audit --no-fund`, and `npm ls --omit=dev --depth=0`. The lockfile hash remained identical before and after each install, build, and prune. Both deterministic archives had the exact SHA-256 and byte size above.
+- The production tree has 34 required direct dependencies and one optional direct dependency; `npm ls --omit=dev --depth=0` verified 35 direct entries. The full `npm ci` reported 1,083 installed packages before pruning development dependencies.
+- Two independent extractions on this host and toolchain produced identical archives. This demonstrates same-host reproducibility for the recorded versions; it does not claim byte identity across arbitrary operating systems or toolchains.
+
+Use this recipe from a clean checkout containing the recorded source commit. It retains the private build directory and does not install the package or copy it into staging:
+
+```bash
+set -euo pipefail
+SOURCE_COMMIT=a1649167ff08bc383bb0ed64f8a3b0f8ca866de8
+PATH=/opt/vps-commander/bin:/usr/bin:/bin
+export PATH
+test "$(node --version)" = v22.23.2
+test "$(df -Pm "$HOME" | awk 'NR==2 {print $4}')" -ge 2048
+umask 077
+ARTIFACT_ROOT=$(mktemp -d "$HOME/g7-i5f-build-$SOURCE_COMMIT.XXXXXX")
+mkdir -m 0700 "$ARTIFACT_ROOT/runtime" "$ARTIFACT_ROOT/npm-cache"
+git archive "$SOURCE_COMMIT" | tar -x -C "$ARTIFACT_ROOT/runtime"
+SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$SOURCE_COMMIT")
+cd "$ARTIFACT_ROOT/runtime"
+LOCK_SHA=$(sha256sum package-lock.json | cut -d' ' -f1)
+npm ci --ignore-scripts --no-audit --no-fund --cache "$ARTIFACT_ROOT/npm-cache"
+test "$(sha256sum package-lock.json | cut -d' ' -f1)" = "$LOCK_SHA"
+npm run build
+test "$(sha256sum package-lock.json | cut -d' ' -f1)" = "$LOCK_SHA"
+npm prune --omit=dev --ignore-scripts --no-audit --no-fund --cache "$ARTIFACT_ROOT/npm-cache"
+test "$(sha256sum package-lock.json | cut -d' ' -f1)" = "$LOCK_SHA"
+npm ls --omit=dev --depth=0
+test -s dist/index.js
+mkdir -m 0700 "$ARTIFACT_ROOT/output"
+tar --sort=name --format=posix --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner --pax-option=delete=atime,delete=ctime -C "$ARTIFACT_ROOT/runtime" -cf - . | gzip -n -6 > "$ARTIFACT_ROOT/output/g7-staging-runtime-$SOURCE_COMMIT.tar.gz"
+sha256sum "$ARTIFACT_ROOT/output/g7-staging-runtime-$SOURCE_COMMIT.tar.gz"
+stat -c '%s bytes' "$ARTIFACT_ROOT/output/g7-staging-runtime-$SOURCE_COMMIT.tar.gz"
+```
+
+The artifact is intentionally tied to the source commit above. This addendum is a later documentation-only commit so its measurement can record the artifact hash without creating a self-referential build hash; rebuild the artifact from the recorded source commit, not from the documentation commit.
+
+### Native systemd and operational measurements
+
+The Owner-authorized command below was run against the two unchanged templates from I5D with `--generators=no`; it exited `0` and did not install or start units:
+
+```sh
+sudo systemd-analyze verify --generators=no \
+  /home/itagil/work/g7-i5d-persistent-staging-blocker-closure-20261018/deploy/g7-staging/systemd/vpsc-g7-staging-gateway.service \
+  /home/itagil/work/g7-i5d-persistent-staging-blocker-closure-20261018/deploy/g7-staging/systemd/vpsc-g7-staging-agent.service
+```
+
+systemd emitted one unrelated host warning: `/etc/systemd/system/rea-cdp.service:7: Special user nobody configured, this is not safe!` Neither G7 template produced a verification error. The earlier non-root `Failed to setup working directory: Permission denied` result remains historical; the authorized native verification subsequently completed.
+
+At the final read-only snapshot, `/home`, `/opt`, and `/var/lib` shared `/dev/sda2` with `8,094 MiB` available. The minimum sampled free space during the two builds was `7,715 MiB`, above the required `2,048 MiB` floor. `MemAvailable` was `2,924,304 KiB`; swap was `4,008,952 / 4,008,956 KiB` used. The short `vmstat` interval samples showed no continuing swap-in or swap-out, and current memory PSI was low. Swap remains effectively full, so recheck it immediately before any later activation.
+
+The G6 Gateway, executor, and tunnel units were all `active/running` with `ExecMainStatus=0`. Their observed loopback listeners remained `127.0.0.1:8787` and `127.0.0.1:20242`; candidate staging port `18443` had no listener. The planned G7 install, config, and state paths were absent. No application-level G6 HTTP health endpoint was queried.
+
+`RELEASE_PACKAGE=REPRODUCIBLE_LOCAL_CANDIDATE`
+`DISK_FLOOR=PASS`
+`SYSTEMD_NATIVE_VERIFY=PASS_WITH_UNRELATED_HOST_WARNING`
+`ACTIVATION_READINESS=GREEN_FOR_SEPARATE_OWNER_REVIEW`
+`PERSISTENT_STAGING_ACTIVE=NO`
+`G6_MUTATIONS=NONE`
+`HOSTED_CI=BLOCKED_EXTERNAL_GITHUB_ACTIONS`
+
+### Checklist before a separately authorized activation
+
+- [ ] Review and accept the dependency PR chain, including this release-freeze PR; hosted CI remains externally unavailable.
+- [ ] Obtain a separate explicit Owner authorization for account creation, synthetic credential provisioning, unit installation, and service startup. This release-freeze work does not grant that authorization.
+- [ ] Recheck that the artifact SHA-256 matches this record, the target filesystem has at least 2 GiB free after planned copies, and memory/swap have adequate live headroom.
+- [ ] Recheck port `18443`, G6 health and listener isolation, target path ownership, and exact template verification immediately before installation.
+- [ ] Provision synthetic-only credentials through the documented protected channel; keep the Owner signing key outside Gateway and agent roots.
+- [ ] Install only under the planned G7 paths, verify Gateway health first, perform the explicit synthetic Owner pairing/grant, then start the agent and verify its fresh authenticated session.
+- [ ] Keep both services disabled from public access and do not enable persistent restart across host boots without a separate explicit Owner decision.
+- [ ] Preserve the rollback and recovery evidence; do not clear WAL, trust, grant, identity, ledger, or locks to make startup succeed.
