@@ -13,8 +13,13 @@ const PILOT=path.join(ROOT,'scripts/g7-staging-pilot.mjs');
 const NODE=process.env.VPSC_STAGING_NODE??
   (typeof process.getuid==='function'&&process.getuid()===0?'/usr/bin/node':process.execPath);
 const MCP_ENTRYPOINT=process.env.VPSC_STAGING_MCP_ENTRYPOINT??path.join(ROOT,'dist/index.js');
+const linuxPilotOnly={skip:process.platform==='linux'?false:
+  'Staging pilot validates Linux uid/gid, POSIX modes and nonroot process isolation'};
 
-test('staging configuration reader rejects symlinks and writable parent directories',async t=>{
+test('staging configuration reader rejects symlinks and writable parent directories',{
+  skip:process.platform==='linux'?false:
+    'Requires POSIX symlinks and mode bits; Windows ACL/reparse protections run in windows-security.test.mjs',
+},async t=>{
   const readStagingConfig=stagingRuntime.readStagingConfig;
   assert.equal(typeof readStagingConfig,'function','runtime must expose the same config reader used by its entrypoint');
   const parent=mkdtempSync(path.join(tmpdir(),'g7-staging-config-'));
@@ -98,7 +103,7 @@ function assertBasePilot(report){
   assert.equal(report.cleanup.temporaryStateRemoved,true);
 }
 
-test('ordinary standalone staging pilot remains available without a test fixture',async t=>{
+test('ordinary standalone staging pilot remains available without a test fixture',linuxPilotOnly,async t=>{
   const report=await runPilot();
   t.diagnostic(JSON.stringify(report.cancellation));
   assertBasePilot(report);
@@ -106,7 +111,7 @@ test('ordinary standalone staging pilot remains available without a test fixture
   assert.equal(report.cancellation.activeExecution.startProven,false);
 });
 
-test('standalone Owner cancellation is acknowledged before execution and during a live job',async t=>{
+test('standalone Owner cancellation is acknowledged before execution and during a live job',linuxPilotOnly,async t=>{
   const report=await runPilot('owner-cancel');
   t.diagnostic(JSON.stringify(report.cancellation));
   assertBasePilot(report);
@@ -126,7 +131,7 @@ test('standalone Owner cancellation is acknowledged before execution and during 
   assert.equal(report.cancellation.activeExecution.automaticReplay,false);
 });
 
-test('standalone Gateway grant revocation fences a live job and its result',async t=>{
+test('standalone Gateway grant revocation fences a live job and its result',linuxPilotOnly,async t=>{
   const report=await runPilot('grant-revoke');
   t.diagnostic(JSON.stringify(report.cancellation));
   assertBasePilot(report);
@@ -149,7 +154,7 @@ test('standalone Gateway grant revocation fences a live job and its result',asyn
   assert.ok(report.cancellation.activeExecution.ownerResponseStatus>=400);
 });
 
-test('standalone device trust revocation fences a live job and its result',async t=>{
+test('standalone device trust revocation fences a live job and its result',linuxPilotOnly,async t=>{
   const report=await runPilot('device-revoke');
   t.diagnostic(JSON.stringify(report.cancellation));
   assertBasePilot(report);

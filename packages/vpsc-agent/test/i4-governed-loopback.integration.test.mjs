@@ -23,12 +23,29 @@ const waitFor=async predicate=>{
   while(Date.now()<end){if(predicate())return;await new Promise(resolve=>setTimeout(resolve,5));}
   throw Error('Timed out waiting for loopback agent operation');
 };
+const i4PlatformSkip=process.platform!=='linux'
+  ?'Gateway durable grants require Linux /proc identity and POSIX file modes'
+  :typeof process.getuid==='function'&&process.getuid()===0
+    ?'Gateway durable grants require a nonroot Linux process identity':false;
 test('I4 signed agent loopback routes common governed operations through the owner MCP endpoint',{
-  skip:typeof process.getuid==='function'&&process.getuid()===0,
+  skip:i4PlatformSkip,
 },async t=>{
   const registry=createDeviceRegistry();
   const pairing=createPairingCoordinator({registry});
-  const router=createDeviceRouter({registry,timeoutMs:10_000});
+  const router=createDeviceRouter({registry});
+  const routerOperations=[];
+  const observedRouter={...router,callDevice:async options=>{
+    const operation={requestId:options.requestId,tool:options.name,startedAt:Date.now()};
+    routerOperations.push(operation);
+    try{
+      const result=await router.callDevice(options);
+      operation.finishedAt=Date.now();
+      return result;
+    }catch(error){
+      operation.finishedAt=Date.now();operation.errorCode=error?.code??'UNKNOWN';
+      throw error;
+    }
+  }};
   const pilot=await startLoopbackAgentPilot({registry,router,enableLoopbackPilot:true});
   const identity=createEphemeralPairingIdentity();
   const request=pairing.startPairing({name:'i4-loopback-agent',platform:'linux',
@@ -62,9 +79,19 @@ test('I4 signed agent loopback routes common governed operations through the own
       tool,scope,constraints},{expectedRevision:policyRevision,eventId:randomUUID()});
     policyRevision=granted.revision;grantIds[tool]=granted.grantId;
   }
-  const executor=createGovernedAgentExecutor({allowedRoot:root,
+  const workerTrace=[];
+  const observe=async(component,name,operation)=>{
+    try{const value=await operation();workerTrace.push({component,name,status:'ok'});return value;}
+    catch(error){workerTrace.push({component,name,status:'error',code:error?.code??'UNKNOWN'});throw error;}
+  };
+  const rawExecutor=createGovernedAgentExecutor({allowedRoot:root,
     entrypoint:process.env.VPSC_TEST_REAL_MCP_ENTRY??FIXTURE,ledgerDirectory:state,
     gatewayPolicyPublicKey:policyKeys.publicKey,deviceId,fingerprint:identityFingerprint});
+  const executor={
+    start:()=>observe('executor','start',()=>rawExecutor.start()),
+    handle:(...args)=>observe('executor','handle',()=>rawExecutor.handle(...args)),
+    close:()=>observe('executor','close',()=>rawExecutor.close()),
+  };
   const trustStore={
     acquireDispatchPermit:({deviceId:target,sessionId,expectedRevision})=>{
       if(expectedRevision!==1||!registry.isLiveSession(target,sessionId)){
@@ -83,7 +110,7 @@ test('I4 signed agent loopback routes common governed operations through the own
     accessVerifier:{verifyPrincipal:async token=>{
       if(token!=='synthetic-owner-jwt')throw Error('owner authentication failed');
       return {issuer:'https://i4-loopback-owner.cloudflareaccess.com',subject:'owner-i4'};
-    }},deviceRegistry:registry,trustStore,router,
+    }},deviceRegistry:registry,trustStore,router:observedRouter,
     authorizeDevice:async(owner,id)=>owner.subject==='owner-i4'&&id===deviceId,
     grantStore,policySigningKey:policyKeys.privateKey,
     getDeviceApprovalReceipt:()=>({eventId:approvalEventId,deviceId,fingerprint:identity.fingerprint,
@@ -95,19 +122,27 @@ test('I4 signed agent loopback routes common governed operations through the own
   let clientClosed=false,sessionId=null,channelReady=false;
   const signedClient=createLoopbackAgentClient({url:pilot.url,identity,deviceId});
   const client={
-    connect:async()=>{const session=await signedClient.connect();sessionId=session.sessionId;return session;},
-    heartbeat:async()=>{const status=await signedClient.heartbeat();channelReady=status.status==='alive';return status;},
-    poll:()=>signedClient.poll(),
-    result:(requestId,result)=>signedClient.result(requestId,result),
-    disconnect:async()=>{
+    connect:()=>observe('transport','connect',async()=>{
+      const session=await signedClient.connect();sessionId=session.sessionId;return session;
+    }),
+    heartbeat:()=>observe('transport','heartbeat',async()=>{
+      const status=await signedClient.heartbeat();channelReady=status.status==='alive';return status;
+    }),
+    poll:()=>observe('transport','poll',()=>signedClient.poll()),
+    result:(requestId,result)=>observe('transport','result',()=>signedClient.result(requestId,result)),
+    disconnect:()=>observe('transport','disconnect',async()=>{
       if(sessionId){registry.disconnect(deviceId,sessionId);router.detachTransport({deviceId,sessionId});}
       return {disconnected:true};
-    },
-    close:()=>{clientClosed=true;},
+    }),
+    close:()=>{clientClosed=true;workerTrace.push({component:'transport',name:'close',status:'ok'});},
   };
   const controller=new AbortController();
   const worker=createAgentWorker({deviceId,client,executor,pollIntervalMs:25});
   const running=worker.run({signal:controller.signal});
+  const workerState={settled:false,errorCode:null};
+  running.then(()=>{workerState.settled=true;},error=>{
+    workerState.settled=true;workerState.errorCode=error?.code??'UNKNOWN';
+  });
   t.after(async()=>{
     controller.abort();
     await running.catch(()=>{});
@@ -121,21 +156,56 @@ test('I4 signed agent loopback routes common governed operations through the own
       'content-type':'application/json','cf-access-jwt-assertion':'synthetic-owner-jwt',
     },body:JSON.stringify({jsonrpc:'2.0',id,method:'tools/call',params:{name,
       arguments:{deviceId,...args}}})});
-    return {status:response.status,body:await response.json()};
+    const result={status:response.status,body:await response.json()};
+    if(result.status>=400){
+      const operation=routerOperations.at(-1);
+      let ledger=[];
+      try{ledger=readFileSync(path.join(state,'i4-execution.jsonl'),'utf8').trim()
+        .split('\n').filter(Boolean).map(line=>JSON.parse(line)).slice(-10).map(record=>({
+          type:record.type,status:record.status,tool:record.tool,requestId:record.requestId,
+        }));}catch{}
+      result.diagnostic={operation:operation&&{requestId:operation.requestId,
+        tool:operation.tool,errorCode:operation.errorCode??null,
+        elapsedMs:operation.finishedAt-operation.startedAt},
+        operationState:operation?.requestId?pilot.operationState(operation.requestId):null,
+        recentOperations:routerOperations.slice(-5).map(item=>({requestId:item.requestId,
+          tool:item.tool,errorCode:item.errorCode??null,
+          elapsedMs:item.finishedAt-item.startedAt,
+          state:pilot.operationState(item.requestId)?.state??null})),
+        ledger,worker:workerState,workerTrace:workerTrace.slice(-24),
+        sessionLive:sessionId?registry.isLiveSession(deviceId,sessionId):false};
+    }
+    return result;
   };
   const read=await call('i4-read-1','read_file',{path:file,offset:0,length:20});
-  assert.equal(read.status,200,JSON.stringify(read.body));
+  assert.equal(read.status,200,JSON.stringify(read));
   assert.match(JSON.stringify(read.body.result),/alpha/);
   const largeRead=await call('i4-large-read','read_file',{path:largeFile,length:1000});
-  assert.equal(largeRead.status,200,JSON.stringify(largeRead.body));
+  const largeReadOperation=routerOperations.at(-1);
+  const largeReadLedger=(()=>{
+    try{return readFileSync(path.join(state,'i4-execution.jsonl'),'utf8').trim().split('\n')
+      .filter(Boolean).map(line=>JSON.parse(line)).filter(record=>
+        record.requestId===largeReadOperation?.requestId).map(record=>({
+          type:record.type,status:record.status,tool:record.tool,requestId:record.requestId,
+        }));}catch{return [];}
+  })();
+  const largeReadOperationState=largeReadOperation?.requestId
+    ?pilot.operationState(largeReadOperation.requestId):null;
+  assert.equal(largeRead.status,200,JSON.stringify({response:largeRead.body,
+    operation:largeReadOperation&&{requestId:largeReadOperation.requestId,
+      tool:largeReadOperation.tool,errorCode:largeReadOperation.errorCode??null,
+      elapsedMs:largeReadOperation.finishedAt-largeReadOperation.startedAt},
+    operationState:largeReadOperationState,ledger:largeReadLedger,
+    worker:workerState,workerTrace:workerTrace.slice(-24),
+    sessionLive:sessionId?registry.isLiveSession(deviceId,sessionId):false}));
   assert.ok(JSON.stringify(largeRead.body.result).includes(largeContent));
   const listingResponse=await call('i4-list-2','list_directory',{path:root,depth:1});
-  assert.equal(listingResponse.status,200);
+  assert.equal(listingResponse.status,200,JSON.stringify(listingResponse));
   const listing=JSON.parse(listingResponse.body.result.content?.[0]?.text??'{}');
   assert.ok(listing.entries?.some(entry=>entry.name==='readme.txt'));
   const target=path.join(root,'created.txt'),writeRequestId=randomUUID();
   const written=await call(writeRequestId,'write_file',{path:target,content:'created by I4\n',mode:'create'});
-  assert.equal(written.status,200);
+  assert.equal(written.status,200,JSON.stringify(written));
   assert.equal(written.body.result.structuredContent.created,true);
   assert.equal(readFileSync(target,'utf8'),'created by I4\n');
   const duplicate=await call(writeRequestId,'write_file',{path:target,content:'created by I4\n',mode:'create'});

@@ -133,20 +133,38 @@ async function startPairingAgentProcess(directory){
   }};
 }
 async function jsonPost(url,payload,{headers={},method='POST',signal}={}){
-  const response=await fetch(url,{method,headers:{'content-type':'application/json',...headers},
-    ...(payload===undefined?{}:{body:JSON.stringify(payload)}),...(signal?{signal}:{})});
+  let response;
+  try{response=await fetch(url,{method,headers:{'content-type':'application/json',...headers},
+    ...(payload===undefined?{}:{body:JSON.stringify(payload)}),...(signal?{signal}:{})});}
+  catch(error){
+    const cause=error?.cause;
+    error.message+='; diagnostic='+JSON.stringify({path:new URL(url).pathname,
+      causeName:cause?.name??null,causeCode:cause?.code??null,
+      causeErrno:cause?.errno??null,causeSyscall:cause?.syscall??null});
+    throw error;
+  }
   const text=await response.text();
   return {status:response.status,headers:response.headers,
     body:text?JSON.parse(text):null};
 }
-async function waitFor(predicate,label){
-  const deadline=Date.now()+5000;
+let ownerCallTrace=null;
+async function waitFor(predicate,label,timeoutMs=5000){
+  const deadline=Date.now()+timeoutMs;
   while(Date.now()<deadline){
     const value=await predicate();
     if(value)return value;
     await new Promise(resolve=>setTimeout(resolve,10));
   }
   throw Error('Timed out waiting for '+label);
+}
+async function waitForStableAttachedAgentSession(trace,startIndex,transportEvents,timeoutMs=10_000){
+  return waitFor(()=>{
+    const polls=trace.slice(startIndex).filter(item=>item.path==='/agent/poll'&&
+      item.status===200&&item.sessionKey).slice(-3);
+    const attachedSession=transportEvents.at(-1)?.activeSessionKey;
+    return polls.length===3&&new Set(polls.map(item=>item.sessionKey)).size===1&&
+      polls[0].sessionKey===attachedSession?polls:false;
+  },'three successful polls on the router-attached agent session',timeoutMs);
 }
 function createOwnerJwt(identity,overrides={}){
   const now=Math.floor(Date.now()/1000);
@@ -199,6 +217,51 @@ function makeTlsCertificate(directory,name){
 function makeGateway({trustStore,ownerAccess,machineAccess,bindings,ingressRef,
   auditDirectory,trustDirectory,toolGrantStore,policySigningKey,machineBindingStore}){
   const router=createDeviceRouter({registry:trustStore.registry,timeoutMs:15_000});
+  const routedCalls=[];
+  const transportEvents=[];
+  let activeRouterSessionKey=null;
+  const ownerAuthEvents=[];
+  const trustRevisionReads=[];
+  const deviceRegistryReads=[];
+  const getTrustRevision=()=>{
+    try{const revision=trustStore.revision();trustRevisionReads.push({at:Date.now(),result:'ok',revision});return revision;}
+    catch(error){trustRevisionReads.push({at:Date.now(),result:'error',code:error?.code??'UNKNOWN'});throw error;}
+  };
+  const observedDeviceRegistry={...trustStore.registry,listDevices:()=>{
+    const devices=trustStore.registry.listDevices();
+    deviceRegistryReads.push({at:Date.now(),devices:devices.map(({deviceId,online})=>({deviceId,online}))});
+    return devices;
+  }};
+  const observedOwnerAccess={verifyPrincipal:async token=>{
+    const event={startedAt:Date.now()};ownerAuthEvents.push(event);
+    try{
+      const principal=await ownerAccess.verifyPrincipal(token);
+      event.finishedAt=Date.now();event.result=principal?'accepted':'denied';return principal;
+    }catch(error){event.finishedAt=Date.now();event.result='error';event.errorCode=error?.code??'UNKNOWN';throw error;}
+  }};
+  const observedRouter={...router,
+    attachTransport:options=>{
+      const result=router.attachTransport(options);
+      activeRouterSessionKey=createHash('sha256').update(options.sessionId).digest('hex');
+      transportEvents.push({event:'attach',at:Date.now(),activeSessionKey:activeRouterSessionKey});
+      return result;
+    },
+    detachTransport:options=>{
+      const detached=router.detachTransport(options);
+      if(detached&&activeRouterSessionKey===createHash('sha256').update(options.sessionId).digest('hex'))
+        activeRouterSessionKey=null;
+      transportEvents.push({event:'detach',at:Date.now(),detached,activeSessionKey:activeRouterSessionKey});
+      return detached;
+    },
+    callDevice:async options=>{
+    const call={requestId:options.requestId,tool:options.name,startedAt:Date.now(),
+      activeSessionKey:activeRouterSessionKey};
+    call.signalAborted=options.signal?.aborted===true;
+    options.signal?.addEventListener('abort',()=>{call.signalAborted=true;call.signalAbortedAt=Date.now();},{once:true});
+    routedCalls.push(call);
+    try{const result=await router.callDevice(options);call.finishedAt=Date.now();return result;}
+    catch(error){call.finishedAt=Date.now();call.errorCode=error?.code??'UNKNOWN';throw error;}
+  }};
   const approvalReceiptReads=[];
   const dispatchAuthorizationChecks=[];
   const durableReadDeviceApproval=createDurableOwnerDeviceApprovalReader({auditDirectory,trustDirectory});
@@ -223,27 +286,30 @@ function makeGateway({trustStore,ownerAccess,machineAccess,bindings,ingressRef,
       return allowed;
     }catch(error){dispatchAuthorizationChecks.push({allowed:false,reason:error?.code??'authorization-error'});return false;}
   };
-  const ingressPromise=startMachineIngressLoopback({registry:trustStore.registry,router,
+  const ingressPromise=startMachineIngressLoopback({registry:trustStore.registry,router:observedRouter,
     verifyMachineToken:machineAccess,machineBindingStore,getTrustRevision:()=>trustStore.revision(),
     shouldCancelOperation,
     ...(bindings?{machineBindings:bindings}:{}),enableTestIngress:true});
   const mcpServer=createHttpServer(createRemoteDeviceMcpHandler({
-    accessVerifier:ownerAccess,deviceRegistry:trustStore.registry,trustStore,router,
+    accessVerifier:observedOwnerAccess,deviceRegistry:observedDeviceRegistry,trustStore,router:observedRouter,
     authorizeDevice:createDurableOwnerDeviceAuthorizer({auditDirectory,trustDirectory}),
     grantStore:toolGrantStore,policySigningKey,
-    getTrustRevision:()=>trustStore.revision(),getDeviceApprovalReceipt:readDeviceApproval,
+    getTrustRevision,getDeviceApprovalReceipt:readDeviceApproval,
   }));
   const ownerTransportEvents=[];
   mcpServer.on('request',(req,res)=>{
-    req.once('aborted',()=>ownerTransportEvents.push({event:'request-aborted',url:req.url}));
-    res.once('close',()=>ownerTransportEvents.push({event:'response-close',url:req.url,
+    const testId=req.headers['x-i3-test-id']??null;
+    ownerTransportEvents.push({event:'request',testId,at:Date.now(),url:req.url});
+    req.once('aborted',()=>ownerTransportEvents.push({event:'request-aborted',testId,url:req.url,at:Date.now()}));
+    res.once('close',()=>ownerTransportEvents.push({event:'response-close',testId,url:req.url,at:Date.now(),
       writableEnded:res.writableEnded,destroyed:res.destroyed,requestComplete:req.complete,
-      requestAborted:req.aborted}));
+      requestAborted:req.aborted,statusCode:res.statusCode}));
   });
   let ownerMcpUrl;
   const ownerMcpReady=listen(mcpServer).then(url=>{ownerMcpUrl=url+'/mcp';return ownerMcpUrl;});
   return {
-    router,mcpServer,ownerMcpReady,approvalReceiptReads,dispatchAuthorizationChecks,ownerTransportEvents,
+    router,mcpServer,ownerMcpReady,approvalReceiptReads,dispatchAuthorizationChecks,routedCalls,
+    ownerAuthEvents,trustRevisionReads,deviceRegistryReads,ownerTransportEvents,transportEvents,
     ready:ingressPromise.then(ingress=>{ingressRef.current=ingress;return ingress;}),
     close:async()=>{
       await closeServer(mcpServer);
@@ -257,7 +323,7 @@ function createTlsEdge({certificate,ingressRef,expectedClientId,expectedSecret,m
   let requestCount=0;
   const server=createHttpsServer({key:certificate.key,cert:certificate.cert},async(req,res)=>{
     requestCount++;
-    const edgeRequest={path:req.url,status:null,denial:null};
+    const edgeRequest={path:req.url,startedAt:Date.now(),status:null,denial:null};
     observed.edgeRequests??=[];observed.edgeRequests.push(edgeRequest);
     const seen={...req.headers};observed.edge.push(seen);
     if(seen['cf-access-client-id']!==expectedClientId||
@@ -278,16 +344,25 @@ function createTlsEdge({certificate,ingressRef,expectedClientId,expectedSecret,m
       if(typeof seen[name]==='string')forward[name]=seen[name];
     }
     observed.forwarded.push({...forward});
+    observed.agentSessionTrace??=[];
+    const sessionEvent={path:req.url,at:Date.now(),
+      sessionKey:typeof forward['x-vpsc-session-id']==='string'
+        ?createHash('sha256').update(forward['x-vpsc-session-id']).digest('hex'):null,status:null};
+    observed.agentSessionTrace.push(sessionEvent);
     try{
       const upstream=await fetch(ingressRef.current.url+req.url,{method:'POST',headers:forward,
         body:Buffer.concat(chunks,size),redirect:'error',signal:AbortSignal.timeout(8000)});
       const body=Buffer.from(await upstream.arrayBuffer());
-      edgeRequest.status=upstream.status;edgeRequest.denial=upstream.status>=400?'machine-ingress':null;
+      edgeRequest.status=upstream.status;edgeRequest.finishedAt=Date.now();
+      sessionEvent.status=upstream.status;sessionEvent.finishedAt=Date.now();
+      edgeRequest.denial=upstream.status>=400?'machine-ingress':null;
       if(upstream.status>=400){try{edgeRequest.upstreamError=JSON.parse(body.toString('utf8')).error;}catch{}}
       res.writeHead(upstream.status,{'content-type':'application/json',
         'cache-control':'no-store','x-content-type-options':'nosniff'});
       res.end(body);
     }catch{
+      edgeRequest.status=502;edgeRequest.finishedAt=Date.now();
+      sessionEvent.status=502;sessionEvent.finishedAt=Date.now();
       res.writeHead(502,{'content-type':'application/json'});res.end('{"error":"upstream unavailable"}');
     }
   });
@@ -308,7 +383,7 @@ async function startWorker(client,deviceId,root,ledgerDirectory,identity,policyP
   const controller=new AbortController();
   const worker=createAgentWorker({deviceId,client,executor:makeExecutor(root,ledgerDirectory,{
     deviceId,fingerprint:identity.fingerprint,gatewayPolicyPublicKey:policyPublicKey,testHooks,
-  }),pollIntervalMs:25});
+  })});
   const done=worker.run({signal:controller.signal});
   // A later authorization revocation intentionally makes the worker reject on
   // its next heartbeat. Observe that promise immediately so teardown/assertion
@@ -322,9 +397,13 @@ async function stopWorker(active){
   await active.done;
 }
 async function ownerCall(url,method,id,params,token,signal){
-  return jsonPost(url,{jsonrpc:'2.0',id,method,params},{headers:{
-    'cf-access-jwt-assertion':token,
-  },...(signal?{signal}:{})});
+  try{return await jsonPost(url,{jsonrpc:'2.0',id,method,params},{headers:{
+    'cf-access-jwt-assertion':token,'x-i3-test-id':String(id),'connection':'close',
+  },...(signal?{signal}:{})});}
+  catch(error){
+    if(ownerCallTrace)error.message+='; ownerDiagnostic='+JSON.stringify({id,...ownerCallTrace()});
+    throw error;
+  }
 }
 async function approveDevice({home,pairingIdentity,provePairing,ownerAccess,ownerKeys,
   trustStore,audit,ownerToken}){
@@ -373,7 +452,11 @@ async function approveDevice({home,pairingIdentity,provePairing,ownerAccess,owne
   }finally{await closeServer(ownerServer);}
 }
 
-test('I3/I4 E2E: Owner approval, durable trust, verified TLS, governed operations, restart and revoke',async t=>{
+test('I3/I4 E2E: Owner approval, durable trust, verified TLS, governed operations, restart and revoke',{
+  skip:process.platform!=='linux'
+    ?'End-to-end Gateway uses Linux-only durable trust/grant stores and POSIX fsync; Windows identity and pairing coverage runs in identity-store, pairing and windows-security tests'
+    :false,
+},async t=>{
   const home=mkdtempSync(path.join(tmpdir(),'g7-i3-e2e-'));
   let trustStore=null,audit=null,toolGrantStore=null,machineBindingStore=null,gateway=null,edge=null,active=null;
   t.after(async()=>{
@@ -385,6 +468,7 @@ test('I3/I4 E2E: Owner approval, durable trust, verified TLS, governed operation
     try{machineBindingStore?.close?.();}catch{}
     try{trustStore?.close();}catch{}
     rmSync(home,{recursive:true,force:true});
+    ownerCallTrace=null;
   });
   const trustDirectory=path.join(home,'trust'),auditDirectory=path.join(home,'audit');
   const policyDirectory=path.join(home,'tool-policy');
@@ -521,6 +605,20 @@ test('I3/I4 E2E: Owner approval, durable trust, verified TLS, governed operation
     machineBindingStore,ingressRef,auditDirectory,trustDirectory,
     toolGrantStore,policySigningKey:policyKeys.privateKey});
   gateway=gatewayFactory();await gateway.ready;const mcpUrl=await gateway.ownerMcpReady;
+  ownerCallTrace=()=>({
+    ownerTransport:gateway?.ownerTransportEvents.slice(-8),
+    ownerAuth:gateway?.ownerAuthEvents.slice(-5).map(({result,errorCode,startedAt,finishedAt})=>({
+      result:result??'pending',errorCode:errorCode??null,
+      elapsedMs:finishedAt===undefined?Date.now()-startedAt:finishedAt-startedAt})),
+    trustRevisionReads:gateway?.trustRevisionReads.slice(-8),
+    registryReads:gateway?.deviceRegistryReads.slice(-8),
+    routedCalls:gateway?.routedCalls.slice(-8).map(call=>({requestId:call.requestId,tool:call.tool,
+      errorCode:call.errorCode??null,signalAborted:call.signalAborted,
+      elapsedMs:call.finishedAt===undefined?Date.now()-call.startedAt:call.finishedAt-call.startedAt,
+      state:ingressRef.current?.operationState?.(call.requestId)?.state??null})),
+    edgeRequests:forwarded.edgeRequests?.slice(-10).map(({path,status,denial,upstreamError})=>
+      ({path,status,denial,upstreamError})),
+  });
   const invalidTls=agentClient({identity,deviceId:approved.deviceId,clientSecret:SERVICE_SECRET,
     fetchFn:wrongTlsFetch});
   const requestsBefore=edge.requestCount;
@@ -653,7 +751,7 @@ test('I3/I4 E2E: Owner approval, durable trust, verified TLS, governed operation
   const canceledResponse=ownerCall(mcpUrl,'tools/call',70,{name:'run_command',arguments:{
     deviceId:approved.deviceId,path:file,profile:'count_lines',
   }},ownerToken,cancelOwner.signal).then(value=>({value}),error=>({error}));
-  await waitFor(()=>Number.isSafeInteger(commandPid),'cancellable command process spawn');
+  await waitFor(()=>Number.isSafeInteger(commandPid),'cancellable command process spawn',20_000);
   assert.ok(Number.isSafeInteger(commandPid));
   const cancelledIntent=await waitFor(()=>{
     try{
@@ -680,17 +778,105 @@ test('I3/I4 E2E: Owner approval, durable trust, verified TLS, governed operation
   // Gateway poll fence to request cooperative cancellation; no success crosses
   // the now-revoked authorization boundary.
   commandPid=undefined;
+  const revokeTlsObserved=[];
   client=agentClient({identity,deviceId:approved.deviceId,clientSecret:SERVICE_SECRET,
-    fetchFn:createTlsFetch({port:edgeInfo.port,ca:certificate.cert,observed:[]})});
+    fetchFn:createTlsFetch({port:edgeInfo.port,ca:certificate.cert,observed:revokeTlsObserved})});
   active=await startWorker(client,approved.deviceId,allowedRoot,revokeExecutionDirectory,
     identity,policyKeys.publicKey,{sleepCommandForTimeout:true,onCommandSpawn:pid=>{
       commandPid=pid;
     }});
   await waitFor(()=>trustStore.registry.listDevices()[0]?.online,'grant-revocation device session');
-  const revokedCall=ownerCall(mcpUrl,'tools/call',71,{name:'run_command',arguments:{
+  const revokeDiagnosticStart={routes:gateway.routedCalls.length,auth:gateway.ownerAuthEvents.length,
+    revisions:gateway.trustRevisionReads.length,
+    transport:gateway.ownerTransportEvents.length,sessions:forwarded.agentSessionTrace?.length??0};
+  const readRevokeRecords=()=>{
+    try{return readFileSync(path.join(revokeExecutionDirectory,'i4-execution.jsonl'),'utf8')
+      .trim().split('\n').filter(Boolean).map(line=>JSON.parse(line));}
+    catch(error){return error?.code==='ENOENT'?[]:null;}
+  };
+  let revokedCallState=null;
+  const startRevokedCall=id=>ownerCall(mcpUrl,'tools/call',id,{name:'run_command',arguments:{
     deviceId:approved.deviceId,path:file,profile:'count_lines',
-  }},ownerToken);
-  await waitFor(()=>Number.isSafeInteger(commandPid),'grant-revocation command process spawn');
+  }},ownerToken).then(response=>{revokedCallState={status:response.status,
+    jsonRpcError:response.body?.error?.data?.code??response.body?.error?.code??null};return {response};},error=>{
+    revokedCallState={errorName:error?.name??'Error',errorCode:error?.cause?.code??error?.code??null};
+    return {error};
+  });
+  const waitForRevocationSpawn=()=>waitFor(()=>Number.isSafeInteger(commandPid)||revokedCallState!==null,
+    'grant-revocation command start or a known Owner response',20_000);
+  await waitForStableAttachedAgentSession(forwarded.agentSessionTrace,
+    revokeDiagnosticStart.sessions,gateway.transportEvents);
+  let revokedCall=startRevokedCall(71);
+  try{
+    await waitForRevocationSpawn();
+  }catch(error){
+    const records=readRevokeRecords();
+    error.message+='; diagnostic='+JSON.stringify({commandPid:commandPid??null,
+      workerError:active.terminalError,grantRevision,
+      deviceOnline:trustStore.registry.listDevices()[0]?.online===true,
+      ledger:records?.map(({type,requestId,tool,status})=>({type,requestId,tool,status}))??null,
+      dispatchChecks:gateway.dispatchAuthorizationChecks.slice(-12),
+      edgeRequests:forwarded.edgeRequests?.slice(-12).map(({path,status,denial,upstreamError})=>
+        ({path,status,denial,upstreamError})),
+      routedCalls:gateway.routedCalls.slice(revokeDiagnosticStart.routes).map(call=>{
+        const state=ingressRef.current?.operationState?.(call.requestId);
+        const latestSessionKey=forwarded.agentSessionTrace.at(-1)?.sessionKey;
+        return {requestId:call.requestId,tool:call.tool,errorCode:call.errorCode??null,
+          elapsedMs:call.finishedAt===undefined?Date.now()-call.startedAt:call.finishedAt-call.startedAt,
+          signalAborted:call.signalAborted,signalAbortedAt:call.signalAbortedAt??null,
+          ingressState:state?.state??null,
+          routeSessionMatchesLatestAgentSession:state?.sessionId
+            ?createHash('sha256').update(state.sessionId).digest('hex')===latestSessionKey:false,
+          uniqueRecentAgentSessions:new Set(forwarded.agentSessionTrace.slice(-32)
+            .map(event=>event.sessionKey).filter(Boolean)).size};
+      }),
+      ownerAuthEvents:gateway.ownerAuthEvents.slice(revokeDiagnosticStart.auth).map(({startedAt,finishedAt,result,errorCode})=>({
+        result:result??'pending',errorCode:errorCode??null,
+        elapsedMs:finishedAt===undefined?Date.now()-startedAt:finishedAt-startedAt})),
+      trustRevisionReadCount:gateway.trustRevisionReads.length-revokeDiagnosticStart.revisions,
+      trustRevisionReads:gateway.trustRevisionReads.slice(-12),
+      revokedCall:revokedCallState,
+      agentRequests:revokeTlsObserved.slice(-12).map(item=>({path:new URL(item.url).pathname,
+        status:item.status,sequence:item.headers['x-vpsc-sequence']})),
+      ownerTransport:gateway.ownerTransportEvents.slice(revokeDiagnosticStart.transport)
+        .filter(event=>['71','73'].includes(event.testId))});
+    throw error;
+  }
+  if(!Number.isSafeInteger(commandPid)){
+    const firstRoute=gateway.routedCalls.at(-1);
+    const firstState=firstRoute&&ingressRef.current?.operationState?.(firstRoute.requestId);
+    const firstRecords=readRevokeRecords();
+    const noDelivery=revokedCallState?.status===503&&revokedCallState.jsonRpcError==='CANCELLED'&&
+      firstState?.state==='cancelled_before_delivery'&&!commandPid&&firstRecords?.length===0;
+    assert.equal(noDelivery,true,JSON.stringify({response:revokedCallState,
+      routeState:firstState?.state??null,ledgerCount:firstRecords?.length??null}));
+    const oldRequestId=firstRoute.requestId;
+    const firstSessionKey=firstState.sessionId
+      ?createHash('sha256').update(firstState.sessionId).digest('hex'):null;
+    const recoveryTraceStart=forwarded.agentSessionTrace.length;
+    const recoveredPolls=await waitForStableAttachedAgentSession(forwarded.agentSessionTrace,
+      recoveryTraceStart,gateway.transportEvents);
+    t.diagnostic(JSON.stringify({grantRevocationRecovery:'new Owner request after proven pre-delivery cancellation',
+      oldRequestId,routeSessionChanged:recoveredPolls[0].sessionKey!==firstSessionKey,
+      stablePolls:recoveredPolls.length,ledgerIntents:0,automaticReplay:false}));
+    revokedCallState=null;
+    revokedCall=startRevokedCall(73);
+    await waitForRevocationSpawn();
+    assert.ok(Number.isSafeInteger(commandPid),JSON.stringify({
+      error:'A new call was cancelled again after three successful polls on the recovered session',
+      response:revokedCallState,route:gateway.routedCalls.at(-1)?.errorCode??null,
+      routeState:ingressRef.current?.operationState?.(gateway.routedCalls.at(-1)?.requestId)?.state??null,
+      routeSessionKey:gateway.routedCalls.at(-1)?.requestId
+        ?createHash('sha256').update(ingressRef.current?.operationState?.(
+          gateway.routedCalls.at(-1).requestId)?.sessionId??'').digest('hex'):null,
+      attachedSessionKey:gateway.routedCalls.at(-1)?.activeSessionKey??null,
+      latestAgentSessionKey:forwarded.agentSessionTrace.at(-1)?.sessionKey??null,
+      transportEvents:gateway.transportEvents.slice(-8),
+      ledgerCount:readRevokeRecords()?.length??null,
+    }));
+    assert.notEqual(gateway.routedCalls.at(-1)?.requestId,oldRequestId,
+      'a proven pre-delivery cancellation gets a fresh request ID');
+  }
   const revokeIntent=await waitFor(()=>{
     try{
       return readFileSync(path.join(revokeExecutionDirectory,'i4-execution.jsonl'),'utf8')
@@ -701,7 +887,9 @@ test('I3/I4 E2E: Owner approval, durable trust, verified TLS, governed operation
   assert.ok(Number.isSafeInteger(commandPid));
   grantRevision=toolGrantStore.revoke(grants.run_command,{expectedRevision:grantRevision,
     eventId:randomUUID()}).revision;
-  const revokedResponse=await revokedCall;
+  const revokedOutcome=await revokedCall;
+  if(revokedOutcome.error)throw revokedOutcome.error;
+  const revokedResponse=revokedOutcome.response;
   assert.equal(revokedResponse.status,503);
   await waitFor(()=>ingressRef.current.operationState(revokeIntent.requestId)?.state==='ambiguous',
     'grant revocation cancellation acknowledgement');
@@ -768,7 +956,7 @@ test('I3/I4 E2E: Owner approval, durable trust, verified TLS, governed operation
   const trustRevokedCall=ownerCall(restartedMcp,'tools/call',72,{name:'run_command',arguments:{
     deviceId:approved.deviceId,path:file,profile:'count_lines',
   }},ownerToken);
-  await waitFor(()=>Number.isSafeInteger(trustRevokePid),'trust-revocation command process spawn');
+  await waitFor(()=>Number.isSafeInteger(trustRevokePid),'trust-revocation command process spawn',20_000);
   const trustRevokeIntent=await waitFor(()=>{
     try{return readFileSync(path.join(trustRevokeExecutionDirectory,'i4-execution.jsonl'),'utf8')
       .trim().split('\n').map(line=>JSON.parse(line))
