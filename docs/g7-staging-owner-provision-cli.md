@@ -18,7 +18,26 @@ The client then performs, once and in order:
 
 The Gateway persists the I2 decision and verifies its receipt before accepting the machine binding. The client does not persist the Owner JWT, comparison code, CSRF token, or private key and never prints them. The Owner signing key remains on the client host and must not be copied into the Gateway configuration directory.
 
-This is a bootstrap client: it refuses to operate unless all three revisions are zero. It does not create a pairing request, perform device proof, provision the agent's private key or machine service secret, revoke an existing device, or retry a mutation.
+Without `--add-device`, this remains a bootstrap client and refuses to operate unless trust, binding, and policy revisions are zero. It does not create a pairing request, perform device proof, provision the agent's private key or machine service secret, revoke an existing device, or retry a mutation.
+
+## Add a device to an existing staging Gateway
+
+The I7 candidate adds a separate additive invocation for a second synthetic device. The Gateway must run a v2 machine configuration containing the existing Linux Client-ID/secret and a distinct Windows Client-ID/secret. The command accepts only the two staging Client-IDs defined by the candidate and refuses the first Client-ID in `--add-device` mode.
+
+After the new device has persisted its Ed25519 identity, submitted `/pairing/start`, and proved possession, compare its request ID, display code, and fingerprint with the pending Owner request. Then run:
+
+```sh
+node scripts/g7-staging-owner-provision.mjs --add-device \
+  --config /etc/vpsc-g7-staging-owner/windows-client.json
+```
+
+Standard input must contain the pairing confirmation and the current revision numbers observed from `/healthz`:
+
+```json
+{"requestId":"<UUID>","code":"<10-character comparison code>","fingerprint":"<64 lowercase hex characters>","expectedTrustRevision":1,"expectedBindingRevision":1,"expectedPolicyRevision":1}
+```
+
+The CLI checks all three revisions before its first mutation, then performs one Owner approval, binding, and `read_file` grant for that device. The expected values are compare-and-swap guards; they must match the current Gateway state and are not reset to zero. The result includes the exact machine-binding receipt for `scripts/g7-staging-device-pair.mjs --binding-receipt <private-file>`. Keep that receipt private and integrity-protected. If any mutation has an ambiguous result, inspect durable state before retrying.
 
 ## Client configuration
 

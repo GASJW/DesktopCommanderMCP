@@ -60,6 +60,31 @@ test('worker starts local MCP, authenticates, and dispatches one signed device t
   assert.ok(f.calls.includes('executor-close'));
 });
 
+test('idle transport ambiguity reconnects with a fresh session without replaying a delivered operation',async()=>{
+  const f=fixture(),sessionId=randomUUID();
+  let firstPoll=true,taskDelivered=false,reconnects=0;
+  const frame={version:1,method:'tools/call',deviceId:DEVICE,sessionId,
+    requestId:f.requestId,authorization:AUTHORIZATION,
+    params:{name:'read_file',arguments:{path:'/approved/test.txt'}}};
+  f.client.poll=async()=>{
+    f.calls.push('poll');
+    if(firstPoll){firstPoll=false;throw Object.assign(Error('lost idle poll response'),{code:'AMBIGUOUS_TRANSPORT'});}
+    if(!taskDelivered){taskDelivered=true;return frame;}
+    return null;
+  };
+  f.client.reconnect=async()=>{reconnects++;f.calls.push('reconnect');
+    return {deviceId:DEVICE,sessionId};};
+  const worker=createAgentWorker({deviceId:DEVICE,client:f.client,executor:f.executor,pollIntervalMs:25});
+  const running=worker.run();
+  await waitFor(()=>f.calls.some(item=>item?.type==='result'));
+  worker.stop();
+  await running;
+  assert.equal(reconnects,1);
+  assert.equal(f.calls.filter(item=>item?.type==='handle').length,1);
+  assert.equal(f.calls.filter(item=>item?.type==='result').length,1);
+  assert.ok(f.calls.indexOf('reconnect')<f.calls.findIndex(item=>item?.type==='handle'));
+});
+
 test('worker forwards cancellation to the executor and never reports a cancelled result',async()=>{
   const f=fixture();
   let handleSignal;

@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { createHttpsAgentClient } from '../src/https-client.mjs';
 import { createEphemeralPairingIdentity } from '../src/pairing.mjs';
 import { createLocalReadonlyMcp } from '../src/local-mcp-readonly.mjs';
+import { securePrivateWindowsDirectory } from '../src/windows-security.mjs';
 import { createMachineAccessVerifier } from '../../../gateway/devices/machine-access.mjs';
 import { startMachineIngressLoopback } from '../../../gateway/devices/machine-ingress-loopback.mjs';
 import { createDeviceRegistry } from '../../../gateway/devices/registry.mjs';
@@ -147,17 +148,19 @@ test('two layers authenticate an actual local MCP fixture read and return throug
   const tmp=mkdtempSync(path.join(os.tmpdir(),'vpsc-https-agent-test-'));
   const dir=path.join(tmp,'approved');
   mkdirSync(dir);
+  if(process.platform==='win32')securePrivateWindowsDirectory(dir);
   const file=path.join(dir,'hello.txt');
   writeFileSync(file,'end-to-end-device-signed-read\n');
-  const executor=createLocalReadonlyMcp({allowedRoot:dir,entrypoint:MCP_FIXTURE,timeoutMs:5000});
+  let executor;
   try{
+    executor=createLocalReadonlyMcp({allowedRoot:dir,entrypoint:MCP_FIXTURE,timeoutMs:5000});
     await x.client.connect();await x.client.heartbeat();await executor.start();
     const pending=x.router.callDevice({deviceId:x.deviceId,name:'read_file',arguments:{path:file}});
     const task=await x.client.poll();
     const value=await executor.handle(task);
     await x.client.result(task.requestId,value);
     assert.match(JSON.stringify(await pending),/end-to-end-device-signed-read/);
-  }finally{await executor.close();await x.close();rmSync(tmp,{recursive:true,force:true});}
+  }finally{await executor?.close();await x.close();rmSync(tmp,{recursive:true,force:true});}
 });
 test('HTTPS client closes fail-closed and prevents further messages',async()=>{
   const x=await harness();
@@ -175,6 +178,25 @@ test('network error is ambiguous and never retried or exposes service secret',as
     !e.message.includes(SECRET));
   assert.equal(calls,1);
   client.close();
+});
+test('an idle ambiguous client session can be replaced with a fresh proof but a closed client cannot reopen',async()=>{
+  const params=makeInvalid(),sessionId='f1a2b3c4-d5e6-4a9f-8abc-1bb9b99c0005';
+  const nonce=Buffer.alloc(32,7).toString('base64url');let calls=0;
+  params.fetchFn=async input=>{
+    calls++;
+    if(calls===1)throw Error('transient offline');
+    const route=new URL(input).pathname;
+    const body=route==='/agent/challenge'
+      ?{deviceId:params.deviceId,nonce,expiresInMs:30_000}
+      :{deviceId:params.deviceId,sessionId};
+    return new Response(JSON.stringify(body),{status:200,headers:{'content-type':'application/json'}});
+  };
+  const client=createHttpsAgentClient(params);
+  await assert.rejects(client.connect(),error=>error.code==='AMBIGUOUS_TRANSPORT');
+  assert.deepEqual(await client.reconnect(),{deviceId:params.deviceId,sessionId});
+  assert.equal(calls,3);
+  client.close();
+  await assert.rejects(client.reconnect(),error=>error.code==='STATE');
 });
 test('edge rejection never triggers JWT shortcut or client credential leakage',async()=>{
   const client=createHttpsAgentClient(makeInvalid({

@@ -9,6 +9,8 @@ const HOST = 'g7-staging.test';
 const OWNER_ISSUER = 'https://g7-owner-staging.cloudflareaccess.com';
 const OWNER_EMAIL = 'g7-staging-owner@example.test';
 const MACHINE_CLIENT_ID = 'g7-staging-agent.synthetic';
+const ADDITIONAL_MACHINE_CLIENT_ID = 'g7-staging-windows.synthetic';
+const MACHINE_CLIENT_IDS = new Set([MACHINE_CLIENT_ID,ADDITIONAL_MACHINE_CLIENT_ID]);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const HEX64 = /^[a-f0-9]{64}$/;
 const CODE = /^[A-F0-9]{10}$/;
@@ -80,7 +82,7 @@ function validateConfig(config) {
       config.origin !== `https://${HOST}` || config.connectAddress !== '127.0.0.1' ||
       config.tlsServerName !== HOST || !Number.isSafeInteger(config.connectPort) ||
       config.connectPort < 1 || config.connectPort > 65535 ||
-      config.machineClientId !== MACHINE_CLIENT_ID || !HEX64.test(config.stageControlToken ?? '') ||
+      !MACHINE_CLIENT_IDS.has(config.machineClientId) || !HEX64.test(config.stageControlToken ?? '') ||
       !exact(config.owner, ['audience', 'email', 'issuer', 'kid', 'privateKeyPath', 'publicJwk', 'subject']) ||
       config.owner.issuer !== OWNER_ISSUER || !HEX64.test(config.owner.audience ?? '') ||
       config.owner.email !== OWNER_EMAIL ||
@@ -115,13 +117,21 @@ function validateConfig(config) {
   return Object.freeze({ config, ca, privateKey });
 }
 
-function parseConfirmation(value) {
-  if (!exact(value, ['code', 'fingerprint', 'requestId']) || !UUID.test(value.requestId ?? '') ||
+function parseConfirmation(value,addDevice=false) {
+  const keys=addDevice
+    ?['code','expectedBindingRevision','expectedPolicyRevision','expectedTrustRevision','fingerprint','requestId']
+    :['code','fingerprint','requestId'];
+  if (!exact(value,keys) || !UUID.test(value.requestId ?? '') ||
       typeof value.fingerprint !== 'string' || !HEX64.test(value.fingerprint) ||
-      typeof value.code !== 'string') throw failure('CONFIRMATION');
+      typeof value.code !== 'string' || addDevice&&[
+        value.expectedBindingRevision,value.expectedPolicyRevision,value.expectedTrustRevision,
+      ].some(revision=>!Number.isSafeInteger(revision)||revision<1)) throw failure('CONFIRMATION');
   const code = value.code.replace(/[\s-]/g, '').toUpperCase();
   if (!CODE.test(code)) throw failure('CONFIRMATION');
-  return Object.freeze({ requestId: value.requestId, code, fingerprint: value.fingerprint });
+  return Object.freeze({ requestId: value.requestId, code, fingerprint: value.fingerprint,
+    ...(addDevice?{expectedBindingRevision:value.expectedBindingRevision,
+      expectedPolicyRevision:value.expectedPolicyRevision,
+      expectedTrustRevision:value.expectedTrustRevision}:{}) });
 }
 
 function mintOwnerJwt(config, privateKey) {
@@ -190,11 +200,16 @@ function requireStatus(response, status, { mutation = false } = {}) {
   return response.body;
 }
 
-async function runProvisioning({ config, ca, privateKey }, confirmation) {
+async function runProvisioning({ config, ca, privateKey }, confirmation,{addDevice=false}={}) {
   const token = mintOwnerJwt(config, privateKey);
+  const expected={trust:addDevice?confirmation.expectedTrustRevision:0,
+    binding:addDevice?confirmation.expectedBindingRevision:0,
+    policy:addDevice?confirmation.expectedPolicyRevision:0};
+  if(addDevice&&config.machineClientId===MACHINE_CLIENT_ID)throw failure('CONFIG');
   const health = requireStatus(await requestJson({ config, ca, pathname: '/healthz' }), 200);
-  if (health?.status !== 'ready' || health.runtime !== 'g7-staging' || health.trustRevision !== 0 ||
-      health.bindingRevision !== 0 || health.policyRevision !== 0) throw failure('NOT_FRESH');
+  if (health?.status !== 'ready' || health.runtime !== 'g7-staging' ||
+      health.trustRevision !== expected.trust || health.bindingRevision !== expected.binding ||
+      health.policyRevision !== expected.policy) throw failure('REVISION_CONFLICT');
 
   const pendingResponse = requireStatus(await requestJson({ config, ca, token,
     pathname: '/dashboard/api/g7/pairing/pending' }), 200);
@@ -215,34 +230,34 @@ async function runProvisioning({ config, ca, privateKey }, confirmation) {
 
   const bindingResponse = requireStatus(await requestJson({ config, ca, token,
     pathname: '/stage/bind', method: 'POST',
-    body: { clientId: config.machineClientId, deviceId: approval.deviceId, expectedRevision: 0 } }), 200,
-  { mutation: true });
+    body: { clientId: config.machineClientId, deviceId: approval.deviceId,
+      expectedRevision: expected.binding } }), 200, { mutation: true });
   const binding = bindingResponse?.binding;
-  if (bindingResponse.revision !== 1 || !exact(binding, ['approvalEventId', 'bindingEventId',
+  if (bindingResponse.revision !== expected.binding+1 || !exact(binding, ['approvalEventId', 'bindingEventId',
       'bindingRevision', 'clientId', 'deviceId', 'fingerprint', 'ownerDigest', 'ownerId',
       'trustRevision', 'trustRevisionAfter', 'trustRevisionBefore']) ||
       binding?.clientId !== config.machineClientId ||
       binding.deviceId !== approval.deviceId || binding.fingerprint !== confirmation.fingerprint ||
       !UUID.test(binding.approvalEventId ?? '') || !UUID.test(binding.bindingEventId ?? '') ||
-      binding.bindingRevision !== 1 || !/^[a-f0-9]{24}$/.test(binding.ownerId ?? '') ||
-      !HEX64.test(binding.ownerDigest ?? '') || binding.trustRevisionBefore !== 0 ||
-      binding.trustRevisionAfter !== 1 || binding.trustRevision < binding.trustRevisionAfter) {
+      binding.bindingRevision !== expected.binding+1 || !/^[a-f0-9]{24}$/.test(binding.ownerId ?? '') ||
+      !HEX64.test(binding.ownerDigest ?? '') || binding.trustRevisionBefore !== expected.trust ||
+      binding.trustRevisionAfter !== expected.trust+1 || binding.trustRevision < binding.trustRevisionAfter) {
     throw failure('AMBIGUOUS');
   }
 
   const grantResponse = requireStatus(await requestJson({ config, ca, token,
     pathname: '/stage/grant', method: 'POST',
-    body: { deviceId: approval.deviceId, expectedRevision: 0, tool: 'read_file',
+    body: { deviceId: approval.deviceId, expectedRevision: expected.policy, tool: 'read_file',
       scope: { root: config.allowedRoot },
       constraints: { maxBytes: 65_536, maxLength: 1_000, maxOffset: 100_000 } } }), 201,
   { mutation: true });
   const grant = grantResponse?.grant;
-  if (grantResponse.revision !== 1 || !UUID.test(grant?.grantId ?? '') ||
+  if (grantResponse.revision !== expected.policy+1 || !UUID.test(grant?.grantId ?? '') ||
       grant.deviceId !== approval.deviceId || grant.tool !== 'read_file' ||
       !exact(grant.scope, ['root']) || grant.scope.root !== config.allowedRoot ||
       !exact(grant.constraints, ['maxBytes', 'maxLength', 'maxOffset']) ||
       grant.constraints.maxBytes !== 65_536 || grant.constraints.maxLength !== 1_000 ||
-      grant.constraints.maxOffset !== 100_000 || grant.revision !== 1) throw failure('AMBIGUOUS');
+      grant.constraints.maxOffset !== 100_000 || grant.revision !== expected.policy+1) throw failure('AMBIGUOUS');
   return Object.freeze({ status: 'provisioned', deviceId: approval.deviceId,
     fingerprint: confirmation.fingerprint, clientId: config.machineClientId,
     bindingRevision: bindingResponse.revision, grantId: grant.grantId,
@@ -273,9 +288,12 @@ function readStdin() {
 }
 
 function parseArgs(args) {
-  if (args.length !== 2 || args[0] !== '--config' || !path.isAbsolute(args[1]) ||
-      path.normalize(args[1]) !== args[1]) throw failure('USAGE');
-  return args[1];
+  const addDevice=args.length===3&&args[0]==='--add-device'&&args[1]==='--config';
+  const bootstrap=args.length===2&&args[0]==='--config';
+  const configPath=addDevice?args[2]:bootstrap?args[1]:null;
+  if(!configPath||!path.isAbsolute(configPath)||path.normalize(configPath)!==configPath)
+    throw failure('USAGE');
+  return {configPath,addDevice};
 }
 
 export async function runOwnerProvisionCli(args = process.argv.slice(2)) {
@@ -283,11 +301,11 @@ export async function runOwnerProvisionCli(args = process.argv.slice(2)) {
     if (process.platform !== 'linux' || typeof process.getuid !== 'function' || process.getuid() === 0) {
       throw failure('CONFIG');
     }
-    const configPath = parseArgs(args);
-    const config = JSON.parse(readSafeFile(configPath).toString('utf8'));
+    const invocation = parseArgs(args);
+    const config = JSON.parse(readSafeFile(invocation.configPath).toString('utf8'));
     const validated = validateConfig(config);
-    const confirmation = parseConfirmation(await readStdin());
-    const result = await runProvisioning(validated, confirmation);
+    const confirmation = parseConfirmation(await readStdin(),invocation.addDevice);
+    const result = await runProvisioning(validated, confirmation,{addDevice:invocation.addDevice});
     process.stdout.write(JSON.stringify(result) + '\n');
     return 0;
   } catch (error) {
@@ -296,7 +314,7 @@ export async function runOwnerProvisionCli(args = process.argv.slice(2)) {
     } else if (error?.code === 'CONFIG' || error?.code === 'USAGE') {
       process.stderr.write('Invalid synthetic staging Owner client configuration or invocation.\n');
     } else if (error?.code === 'CONFIRMATION') {
-      process.stderr.write('Invalid Owner confirmation input; provide requestId, code, and fingerprint on stdin.\n');
+      process.stderr.write('Invalid Owner confirmation input; provide requestId, code, fingerprint, and expected revisions for --add-device on stdin.\n');
     } else {
       process.stderr.write('Staging provisioning stopped; inspect observed state before another attempt.\n');
     }

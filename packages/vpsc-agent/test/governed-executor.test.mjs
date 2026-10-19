@@ -2,17 +2,31 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import os from 'node:os';
-import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, renameSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, renameSync, linkSync } from 'node:fs';
 import { generateKeyPairSync, randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { existsSync, statSync } from 'node:fs';
 import { analyzeI4ExecutionRecovery } from '../src/governed-executor.mjs';
 import { removeDeadDurableProcessLock } from '../../../gateway/common/durable-process-lock.mjs';
 import { signToolGrantCapability, toolArgumentsDigest } from '../../../gateway/devices/tool-grant-capability.mjs';
+import { removeDeadWindowsFileLock, securePrivateWindowsDirectory,
+  verifyPrivateWindowsFile } from '../src/windows-security.mjs';
 
 const FIXTURE=fileURLToPath(new URL('./fixtures-readonly-mcp.mjs',import.meta.url));
 const DEVICE='f1a2b3c4-d5e6-4a9f-8abc-1bb9b99c0001';
+function replaceWithDecoy(filename,decoy){
+  renameSync(filename,filename+'.original');
+  if(process.platform==='win32')linkSync(decoy,filename);
+  else symlinkSync(decoy,filename);
+}
+function killFixtureProcessTree(child){
+  if(process.platform==='win32'){
+    const result=spawnSync('taskkill.exe',['/PID',String(child.pid),'/T','/F'],
+      {stdio:'ignore',windowsHide:true,timeout:10_000});
+    if(result.error)throw result.error;
+  }else process.kill(-child.pid,'SIGKILL');
+}
 const FINGERPRINT='b'.repeat(64),OWNER='a'.repeat(64);
 const APPROVAL_EVENT='b7e92caf-f591-44c4-8fb7-6c489ea573f5';
 const POLICY_KEYS=generateKeyPairSync('ed25519');
@@ -45,6 +59,7 @@ async function sandbox(t,fn,{commandTimeoutMs=5000,testHooks}={}){
   const directory=mkdtempSync(path.join(os.tmpdir(),'vpsc-i4-executor-'));
   const root=path.join(directory,'approved'),state=path.join(directory,'state');
   mkdirSync(root,{mode:0o700});mkdirSync(state,{mode:0o700});
+  if(process.platform==='win32')securePrivateWindowsDirectory(root);
   const file=path.join(root,'readme.txt');writeFileSync(file,'one\ntwo\nthree\n');
   const executor=configuredExecutor({allowedRoot:root,entrypoint:FIXTURE,
     ledgerDirectory:state,commandTimeoutMs,testHooks,gatewayPolicyPublicKey:POLICY_KEYS.publicKey,
@@ -122,8 +137,7 @@ test('read_file stays bound to the opened file when its pathname is replaced',as
     assert.doesNotMatch(textOf(result),/decoy/);
   },{testHooks:{afterFileOpen:({tool,path:openedPath})=>{
     if(tool!=='read_file'||swapped)return;
-    renameSync(openedPath,openedPath+'.original');
-    symlinkSync(path.join(path.dirname(openedPath),'decoy.txt'),openedPath);
+    replaceWithDecoy(openedPath,path.join(path.dirname(openedPath),'decoy.txt'));
     swapped=true;
   }}});
 });
@@ -151,14 +165,13 @@ test('run_command reads the opened file when its pathname is replaced before spa
     assert.match(result.stdout,/^\s*3\b/);
   },{testHooks:{afterFileOpen:({tool,path:openedPath})=>{
     if(tool!=='run_command'||swapped)return;
-    renameSync(openedPath,openedPath+'.original');
-    symlinkSync(path.join(path.dirname(openedPath),'decoy-count.txt'),openedPath);
+    replaceWithDecoy(openedPath,path.join(path.dirname(openedPath),'decoy-count.txt'));
     swapped=true;
   }}});
 });
 
 test('nonzero command exit is durably recorded as failed, with its exit code',{
-  skip:typeof process.getuid!=='function'||process.getuid()===0,
+  skip:process.platform!=='win32'&&(typeof process.getuid!=='function'||process.getuid()===0),
 },async t=>{
   await sandbox(t,async({file,state,executor})=>{
     const result=JSON.parse(textOf(await call(executor,'run_command',{
@@ -187,12 +200,14 @@ test('pre-cancelled operations fail before a filesystem side effect',async t=>{
 test('cancelling a running fixed command records ambiguity and blocks later operations',async t=>{
   let spawnedResolve;
   const spawned=new Promise(resolve=>{spawnedResolve=resolve;});
+  let openedResolve;
+  const opened=new Promise(resolve=>{openedResolve=resolve;});
   await sandbox(t,async({root,state,executor})=>{
     const large=path.join(root,'count-me.txt');writeFileSync(large,'x'.repeat(1024*1024));
     const controller=new AbortController(),requestId=randomUUID();
     const pending=call(executor,'run_command',{profile:'count_lines',path:large},
       {requestId,signal:controller.signal});
-    await spawned;
+    await (process.platform==='win32'?opened:spawned);
     controller.abort();
     await assert.rejects(pending,error=>error.code==='AMBIGUOUS_CANCELLED');
     const diagnosis=executor.diagnostics();
@@ -200,7 +215,9 @@ test('cancelling a running fixed command records ambiguity and blocks later oper
     assert.equal(diagnosis.ambiguous[0].requestId,requestId);
     await assert.rejects(call(executor,'list_processes',{}),error=>error.code==='RECOVERY_REQUIRED');
     assert.doesNotMatch(readFileSync(path.join(state,'i4-execution.jsonl'),'utf8'),/x{32}/);
-  },{testHooks:{onCommandSpawn:pid=>{process.kill(-pid,'SIGSTOP');spawnedResolve();}}});
+  },{testHooks:process.platform==='win32'
+    ?{sleepCommandForTimeout:true,afterFileOpen:()=>openedResolve()}
+    :{onCommandSpawn:pid=>{process.kill(-pid,'SIGSTOP');spawnedResolve();}}});
 });
 
 test('fixed command timeout kills a real test-only process group and records ambiguity',{
@@ -224,6 +241,7 @@ test('truncated execution ledger blocks startup without repairing or truncating 
   const directory=mkdtempSync(path.join(os.tmpdir(),'vpsc-i4-truncated-'));
   const root=path.join(directory,'approved'),state=path.join(directory,'state');
   mkdirSync(root,{mode:0o700});mkdirSync(state,{mode:0o700});
+  if(process.platform==='win32')securePrivateWindowsDirectory(root);
   const ledger=path.join(state,'i4-execution.jsonl');writeFileSync(ledger,'{"version":1',{mode:0o600});
   const executor=configuredExecutor({allowedRoot:root,entrypoint:FIXTURE,ledgerDirectory:state});
   try{
@@ -285,7 +303,8 @@ test('group or world writable operation roots fail closed',{
 },async()=>{
   const directory=mkdtempSync(path.join(os.tmpdir(),'vpsc-i4-writable-root-'));
   const root=path.join(directory,'approved'),state=path.join(directory,'state');
-  mkdirSync(root,{mode:0o700});mkdirSync(state,{mode:0o700});chmodSync(root,0o770);
+  mkdirSync(root,{mode:0o700});mkdirSync(state,{mode:0o700});
+  if(process.platform==='win32')securePrivateWindowsDirectory(root);chmodSync(root,0o770);
   assert.throws(()=>configuredExecutor({allowedRoot:root,entrypoint:FIXTURE,
     ledgerDirectory:state}),error=>error.code==='POLICY');
   rmSync(directory,{recursive:true,force:true});
@@ -297,6 +316,7 @@ test('SIGKILL in the real executor after durable write and intent leaves ambigui
   const directory=mkdtempSync(path.join(os.tmpdir(),'vpsc-i4-crash-'));
   const root=path.join(directory,'approved'),state=path.join(directory,'state');
   mkdirSync(root,{mode:0o700});mkdirSync(state,{mode:0o700});
+  if(process.platform==='win32')securePrivateWindowsDirectory(root);
   const target=path.join(root,'committed.txt'),requestId=randomUUID();
   const fixturePath=fileURLToPath(new URL('./fixtures-i4-crash-after-write.mjs',import.meta.url));
   const child=spawn(process.execPath,[fixturePath,root,state,target,requestId,DEVICE,FIXTURE],
@@ -305,7 +325,8 @@ test('SIGKILL in the real executor after durable write and intent leaves ambigui
   let output='',stderr='';
   child.stderr.on('data',chunk=>stderr+=chunk.toString());
   const ready=new Promise((resolve,reject)=>{
-    const timer=setTimeout(()=>reject(Error(`real executor did not reach post-effect crash point: ${output} ${stderr}`)),5000);
+    const timer=setTimeout(()=>reject(Error(`real executor did not reach post-effect crash point: ${output} ${stderr}`)),
+      process.platform==='win32'?60_000:5000);
     child.stdout.on('data',chunk=>{
       output+=chunk.toString();
       if(output.includes('AFTER_EFFECT_DURABLE')){clearTimeout(timer);resolve();}
@@ -327,17 +348,19 @@ test('SIGKILL in the real executor after durable write and intent leaves ambigui
     assert.equal(intentOnly[0].type,'intent');
     assert.equal(intentOnly[0].requestId,requestId);
     const childExit=new Promise(resolve=>child.once('exit',resolve));
-    process.kill(-child.pid,'SIGKILL');
+    killFixtureProcessTree(child);
     await childExit;
     assert.equal(existsSync(target),true);
-    assert.equal((statSync(target).mode&0o777),0o600);
+    if(process.platform==='win32')verifyPrivateWindowsFile(path.join(state,'i4-execution.jsonl'));
+    else assert.equal((statSync(target).mode&0o777),0o600);
     let diagnosis=analyzeI4ExecutionRecovery({ledgerDirectory:state});
     assert.equal(diagnosis.status,'stale-lock');
     assert.equal(diagnosis.lock.status,'dead');
     assert.equal(diagnosis.automaticLockRemoval,false);
     assert.equal(diagnosis.unresolved.length,1);
-    assert.equal(removeDeadDurableProcessLock({directory:state,name:'i4-execution-lock',
-      expectedDigest:diagnosis.lock.digest}),true);
+    assert.equal(process.platform==='win32'
+      ?removeDeadWindowsFileLock({directory:state,name:'i4-execution-lock',expectedDigest:diagnosis.lock.digest})
+      :removeDeadDurableProcessLock({directory:state,name:'i4-execution-lock',expectedDigest:diagnosis.lock.digest}),true);
     diagnosis=analyzeI4ExecutionRecovery({ledgerDirectory:state});
     assert.equal(diagnosis.status,'ambiguous-intent');
     const executor=configuredExecutor({allowedRoot:root,entrypoint:FIXTURE,ledgerDirectory:state});
@@ -349,7 +372,7 @@ test('SIGKILL in the real executor after durable write and intent leaves ambigui
   }finally{
     if(child.exitCode===null&&child.signalCode===null){
       const childExit=new Promise(resolve=>child.once('exit',resolve));
-      process.kill(-child.pid,'SIGKILL');await childExit;
+      killFixtureProcessTree(child);await childExit;
     }
     rmSync(directory,{recursive:true,force:true});
   }
@@ -361,6 +384,7 @@ test('SIGKILL after cooperative cancellation but before outcome leaves an ambigu
   const directory=mkdtempSync(path.join(os.tmpdir(),'vpsc-i4-cancel-crash-'));
   const root=path.join(directory,'approved'),state=path.join(directory,'state');
   mkdirSync(root,{mode:0o700});mkdirSync(state,{mode:0o700});
+  if(process.platform==='win32')securePrivateWindowsDirectory(root);
   const target=path.join(root,'effect.txt'),requestId=randomUUID();
   const fixturePath=fileURLToPath(new URL('./fixtures-i4-cancel-crash.mjs',import.meta.url));
   const child=spawn(process.execPath,[fixturePath,root,state,target,requestId,DEVICE,FIXTURE],
@@ -424,6 +448,7 @@ test('two agent processes racing one stable request commit at most one filesyste
   const directory=mkdtempSync(path.join(os.tmpdir(),'vpsc-i4-race-'));
   const root=path.join(directory,'approved'),state=path.join(directory,'state');
   mkdirSync(root,{mode:0o700});mkdirSync(state,{mode:0o700});
+  if(process.platform==='win32')securePrivateWindowsDirectory(root);
   const target=path.join(root,'raced.txt'),requestId=randomUUID();
   const fixturePath=fileURLToPath(new URL('./fixtures-readonly-mcp.mjs',import.meta.url));
   const childPath=fileURLToPath(new URL('./fixtures-i4-write-process.mjs',import.meta.url));

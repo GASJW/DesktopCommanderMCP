@@ -195,7 +195,7 @@ test('revocation persists to disk and invalidates a live session',()=>{
     assert.equal(store.revokeDevice(d.deviceId),false);
   });
 });
-test('adding another trusted record fences all pre-existing sessions',()=>{
+test('adding another trusted record preserves the unchanged device session',()=>{
   temp(dir=>{
     const store=createDurableDeviceTrustStore({directory:dir});
     const key=generate();
@@ -204,8 +204,31 @@ test('adding another trusted record fences all pre-existing sessions',()=>{
     const {sessionId}=store.registry.completeHandshake(d.deviceId,key.sign(deviceChallengeMessage(d.deviceId,nonce)));
     store.registry.heartbeat(d.deviceId,sessionId,1);
     store.trustDevice(metadata(generate(),'VPS gui'));
-    assert.equal(store.registry.isLiveSession(d.deviceId,sessionId),false);
+    assert.equal(store.registry.isLiveSession(d.deviceId,sessionId),true);
     assert.equal(store.registry.listDevices().length,2);
+  });
+});
+test('revoking one of two trusted devices fences only that device session',()=>{
+  temp(dir=>{
+    const store=createDurableDeviceTrustStore({directory:dir});
+    const firstKey=generate(),secondKey=generate();
+    const first=store.trustDevice(metadata(firstKey,'first'));
+    const firstChallenge=store.registry.beginHandshake(first.deviceId);
+    const firstSession=store.registry.completeHandshake(first.deviceId,
+      firstKey.sign(deviceChallengeMessage(first.deviceId,firstChallenge.nonce)));
+    assert.equal(store.registry.heartbeat(first.deviceId,firstSession.sessionId,1),true);
+    const second=store.trustDevice(metadata(secondKey,'second'));
+    const secondChallenge=store.registry.beginHandshake(second.deviceId);
+    const secondSession=store.registry.completeHandshake(second.deviceId,
+      secondKey.sign(deviceChallengeMessage(second.deviceId,secondChallenge.nonce)));
+    assert.equal(store.registry.heartbeat(second.deviceId,secondSession.sessionId,1),true);
+    assert.equal(store.revokeDevice(first.deviceId),true);
+    assert.equal(store.registry.isLiveSession(first.deviceId,firstSession.sessionId),false);
+    assert.equal(store.registry.isLiveSession(second.deviceId,secondSession.sessionId),true);
+    const restarted=createDurableDeviceTrustStore({directory:dir});
+    assert.equal(restarted.registry.listDevices().length,1);
+    assert.equal(restarted.registry.listDevices()[0].deviceId,second.deviceId);
+    assert.equal(restarted.registry.listDevices()[0].online,false);
   });
 });
 test('invalid duplicate public keys and capacity fail without revision change',()=>{

@@ -67,9 +67,26 @@ function assertBasePilot(report){
   assert.equal(report.ownerAuthentication.durableGrant,true);
   assert.equal(report.operations.realMcpRead,true);
   assert.equal(report.operations.governedWrite,true);
+  assert.equal(report.devices.count,2);
+  assert.equal(report.devices.distinctDeviceIds,true);
+  assert.equal(report.devices.distinctFingerprints,true);
+  assert.equal(report.devices.distinctM2mClientIds,true);
+  assert.equal(report.devices.distinctM2mSecrets,true);
+  assert.equal(report.devices.routingIsolation,true);
+  assert.equal(report.devices.independentRevocation,true);
   assert.equal(report.restart.gateway,true);
   assert.equal(report.restart.gatewayAfterSigkill,true);
   assert.equal(report.restart.gatewayAfterSigkillRecovery,'RECONCILED_CONSISTENT');
+  assert.ok(['NO_INTENT','CONSISTENT','LEGACY_UNBOUND','RECONCILED_NO_INTENT',
+    'RECONCILED_CONSISTENT','RECONCILED_LEGACY_UNBOUND'].includes(
+      report.restart.gracefulTrustRecovery));
+  assert.equal(report.restart.gracefulPolicyLockRecovery.temporaryFileCount,0);
+  assert.ok(Number.isSafeInteger(report.restart.gracefulPolicyLockRecovery.cleared));
+  assert.equal(report.restart.policyLockRecovery.temporaryFileCount,0);
+  assert.ok(Number.isSafeInteger(report.restart.policyLockRecovery.cleared));
+  assert.equal(report.restart.trustRevision,2);
+  assert.equal(report.restart.bindingRevision,2);
+  assert.equal(report.restart.policyRevision,4);
   assert.equal(report.restart.agent,true);
   assert.equal(report.revocation.grantBlocksDispatch,true);
   assert.equal(report.security.invalidOwnerRejected,true);

@@ -7,6 +7,11 @@ import { generateKeyPairSync, randomUUID } from 'node:crypto';
 import { createPairingIdentityFromPkcs8 } from './pairing.mjs';
 import { createDurableProcessLock, inspectDurableProcessLock,
   removeDeadDurableProcessLock, removeOwnedDurableProcessLock } from '../../../gateway/common/durable-process-lock.mjs';
+import { createWindowsFileBeneath, createWindowsFileLock,
+  inspectWindowsFileLock, moveWindowsFileWriteThrough, readPrivateWindowsFile,
+  removeDeadWindowsFileLock, removeOwnedWindowsFileLock,
+  securePrivateWindowsDirectory, securePrivateWindowsFile,
+  WINDOWS_POWERSHELL } from './windows-security.mjs';
 
 // This is an offline identity-store candidate, NOT connected to an agent route.
 // Persistence never implies enrollment, trust, or server-side authorization.
@@ -41,6 +46,10 @@ function assertStoreDir(dir,platform) {
   mkdirSync(dir,{recursive:true,mode:0o700});
   const st=lstatSync(dir);
   if (!st.isDirectory() || st.isSymbolicLink()) throw new Error('Unsafe identity directory');
+  if(platform==='win32'){
+    securePrivateWindowsDirectory(dir);
+    return;
+  }
   if (platform !== 'win32' && (st.mode & DIR_MASK)) {
     throw new Error('Identity directory permissions must be owner-only');
   }
@@ -59,7 +68,7 @@ function powershellDpapi(op,input) {
     "$cipher=[System.Security.Cryptography.ProtectedData]::"+(op==='protect'?'Protect':'Unprotect')+"($bytes,$entropy,$scope)",
     "[Console]::Out.Write([Convert]::ToBase64String($cipher))",
   ].join(';');
-  const proc=spawnSync('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',
+  const proc=spawnSync(WINDOWS_POWERSHELL,['-NoProfile','-NonInteractive','-EncodedCommand',
     Buffer.from(code,'utf16le').toString('base64')],{
     input:Buffer.from(input).toString('base64'),encoding:'utf8',
     windowsHide:true,timeout:12_000,maxBuffer:8192,shell:false,
@@ -132,10 +141,18 @@ function parsePersisted(text,platform) {
 }
 
 function syncDirectory(directory){
+  // shortcut: NTFS directory durability uses a flushed file plus MoveFileEx write-through.
+  if(process.platform==='win32')return;
   const fd=openSync(directory,constants.O_RDONLY|(constants.O_DIRECTORY??0)|(constants.O_NOFOLLOW??0));
   try{fsyncSync(fd);}finally{closeSync(fd);}
 }
 
+function createWindowsIdentityRecoveryLock(directory){
+  return createWindowsFileLock(directory,BINDING_RECOVERY_LOCK,'device-identity-recovery');
+}
+function clearWindowsIdentityRecoveryLock(directory,owner){
+  return removeOwnedWindowsFileLock({directory,name:BINDING_RECOVERY_LOCK,owner});
+}
 function assertNoInterruptedBinding(directory){
   for(const name of [BINDING_LOCK,BINDING_RECOVERY_LOCK])try{
     const stat=lstatSync(path.join(directory,name));
@@ -160,6 +177,7 @@ export function analyzeDeviceIdentityBindingRecovery({directory}={}){
     const stat=lstatSync(path.join(directory,name));
     locks.push(stat.isDirectory()&&!stat.isSymbolicLink()&&process.platform==='linux'&&
       typeof process.getuid==='function'?inspectDurableProcessLock(directory,name):
+      process.platform==='win32'?inspectWindowsFileLock(directory,name):
       {present:true,status:'unknown',name});
   }catch(error){if(error?.code!=='ENOENT')return Object.freeze({state:'LOCK_UNVERIFIED'});}
   const temporaryFiles=readdirSync(directory).filter(name=>name.startsWith(BINDING_TEMP_PREFIX));
@@ -189,16 +207,16 @@ export function clearStaleDeviceIdentityBindingLock({directory,expectedLockDiges
   if(operatorConfirmedNoActiveWriters!==true||typeof verifyMachineBinding!=='function'){
     throw new Error('Operator quiescence and machine binding verification are required');
   }
-  if(process.platform!=='linux'||typeof process.getuid!=='function'){
-    throw new Error('Safe identity lock recovery requires Linux process identity evidence');
-  }
+  if(!(['linux','win32'].includes(process.platform))||process.platform==='linux'&&typeof process.getuid!=='function')
+    throw new Error('Safe identity lock recovery requires process identity evidence');
   const diagnosis=analyzeDeviceIdentityBindingRecovery({directory});
   if(diagnosis.state!=='STALE_LOCK'||typeof expectedLockDigest!=='string'||
      diagnosis.lockDigest!==expectedLockDigest){
     throw new Error(`Identity binding lock recovery blocked: ${diagnosis.state}`);
   }
-  const recoveryOwner=createDurableProcessLock(directory,BINDING_RECOVERY_LOCK,
-    'device-identity-recovery');
+  const recoveryOwner=process.platform==='linux'
+    ?createDurableProcessLock(directory,BINDING_RECOVERY_LOCK,'device-identity-recovery')
+    :createWindowsIdentityRecoveryLock(directory);
   try{
     const currentDiagnosis=analyzeDeviceIdentityBindingRecovery({directory});
     if(currentDiagnosis.state!=='RECOVERY_ACTIVE'||currentDiagnosis.lockStatus!=='dead'||
@@ -210,20 +228,30 @@ export function clearStaleDeviceIdentityBindingLock({directory,expectedLockDiges
          binding:current.identity.deviceBinding}))!==true){
       throw new Error('Matching durable Gateway machine binding was not verified');
     }
-    return removeDeadDurableProcessLock({directory,name:BINDING_LOCK,
-      expectedDigest:expectedLockDigest});
+    return process.platform==='linux'
+      ?removeDeadDurableProcessLock({directory,name:BINDING_LOCK,expectedDigest:expectedLockDigest})
+      :removeDeadWindowsFileLock({directory,name:BINDING_LOCK,expectedDigest:expectedLockDigest});
   }finally{
-    removeOwnedDurableProcessLock({directory,name:BINDING_RECOVERY_LOCK,owner:recoveryOwner});
+    if(process.platform==='linux')removeOwnedDurableProcessLock({directory,name:BINDING_RECOVERY_LOCK,owner:recoveryOwner});
+    else clearWindowsIdentityRecoveryLock(directory,recoveryOwner);
   }
 }
 
 function readEnvelope(directory,platform){
-  const filename=path.join(directory,KEY_FILE),nofollow=constants.O_NOFOLLOW??0;
-  const fd=openSync(filename,constants.O_RDONLY|nofollow);
+  const filename=path.join(directory,KEY_FILE);
+  if(platform==='win32'){
+    const bytes=readPrivateWindowsFile(filename,{maxBytes:MAX_FILE_BYTES});
+    const st=lstatSync(filename);
+    if(!st.isFile()||st.nlink!==1||st.size!==bytes.length||st.size<=0||st.size>MAX_FILE_BYTES)
+      throw new Error('Unsafe identity file');
+    const text=bytes.toString('utf8'),identity=parsePersisted(text,platform);
+    return {text,envelope:JSON.parse(text),identity,stat:st};
+  }
+  const fd=openSync(filename,constants.O_RDONLY|(constants.O_NOFOLLOW??0));
   try{
     const st=fstatSync(fd);
-    if(!st.isFile()||st.size<=0||st.size>MAX_FILE_BYTES||
-       platform!=='win32'&&(st.mode&FILE_MASK))throw new Error('Unsafe identity file');
+    if(!st.isFile()||st.size<=0||st.size>MAX_FILE_BYTES||(st.mode&FILE_MASK))
+      throw new Error('Unsafe identity file');
     const text=readFileSync(fd,'utf8');
     const identity=parsePersisted(text,platform);
     return {text,envelope:JSON.parse(text),identity,stat:st};
@@ -251,6 +279,17 @@ function writeBoundEnvelope(directory,envelope){
   if(bytes.length>MAX_FILE_BYTES)throw new Error('Device identity envelope exceeds limit');
   let fd,renameAttempted=false;
   try{
+    if(process.platform==='win32'){
+      createWindowsFileBeneath(directory,temp,bytes);
+      securePrivateWindowsFile(temp);
+      const current=readEnvelope(directory,'win32').stat;
+      if(current.ino!==envelope._expectedInode||current.dev!==envelope._expectedDevice)
+        throw new Error('Identity changed during binding');
+      renameAttempted=true;
+      moveWindowsFileWriteThrough(temp,filename);
+      securePrivateWindowsFile(filename);
+      return persisted;
+    }
     fd=openSync(temp,constants.O_WRONLY|constants.O_CREAT|constants.O_EXCL|
       (constants.O_NOFOLLOW??0),0o600);
     let offset=0;
@@ -302,6 +341,8 @@ export function bindApprovedDeviceIdentity({
   try{
     if(platform==='linux'&&typeof process.getuid==='function'){
       lockOwner=createDurableProcessLock(directory,BINDING_LOCK,'device-identity-binding');
+    }else if(platform==='win32'){
+      lockOwner=createWindowsFileLock(directory,BINDING_LOCK,'device-identity-binding');
     }else{
       lockFd=openSync(lockPath,constants.O_WRONLY|constants.O_CREAT|constants.O_EXCL|
         (constants.O_NOFOLLOW??0),0o600);
@@ -349,8 +390,11 @@ export function bindApprovedDeviceIdentity({
       // The envelope rename or its directory durability/readback is uncertain.
       // Leave the process lock as evidence; after this process exits, recovery
       // must verify the Gateway binding before an operator can clear it.
-    }else if(lockOwner){
+    }else if(lockOwner&&platform==='linux'){
       try{removeOwnedDurableProcessLock({directory,name:BINDING_LOCK,owner:lockOwner});}
+      catch(error){throw new Error('Identity binding commit or lock release is uncertain; operator recovery required',{cause:error});}
+    }else if(lockOwner&&platform==='win32'){
+      try{removeOwnedWindowsFileLock({directory,name:BINDING_LOCK,owner:lockOwner});}
       catch(error){throw new Error('Identity binding commit or lock release is uncertain; operator recovery required',{cause:error});}
     }else{
       try{
@@ -376,6 +420,11 @@ export function loadOrCreateDeviceIdentity({
   assertStoreDir(directory,platform);
   assertNoInterruptedBinding(directory);
   const filename=path.join(directory,KEY_FILE);
+  if(platform==='win32'){
+    try{lstatSync(filename);const current=readEnvelope(directory,platform).identity;
+      assertNoInterruptedBinding(directory);return current;
+    }catch(error){if(error?.code!=='ENOENT')throw error;}
+  }
   const nofollow=constants.O_NOFOLLOW??0;
   let fd;
   try {
@@ -393,12 +442,26 @@ export function loadOrCreateDeviceIdentity({
       encoding:platform==='win32'?'dpapi-current-user':'pkcs8-owner-file',
       fingerprint:identity.fingerprint,key:stored.toString('base64')})+'\n';
     stored.fill(0);
+    if(platform==='win32'){
+      const temp=path.join(directory,`${BINDING_TEMP_PREFIX}${randomUUID()}.tmp`);
+      try{
+        createWindowsFileBeneath(directory,temp,Buffer.from(envelope,'utf8'));
+        securePrivateWindowsFile(temp);
+        moveWindowsFileWriteThrough(temp,filename,{replace:false});
+        return loadOrCreateDeviceIdentity({directory,platform});
+      }catch(error){
+        try{unlinkSync(temp);}catch{}
+        try{return loadOrCreateDeviceIdentity({directory,platform});}
+        catch{throw error;}
+      }
+    }
     try {
       fd=openSync(filename,constants.O_WRONLY|constants.O_CREAT|constants.O_EXCL|nofollow,0o600);
       writeFileSync(fd,envelope,'utf8');
       fsyncSync(fd);
       closeSync(fd);
       fd=undefined;
+      if(platform==='win32')securePrivateWindowsFile(filename);
       syncDirectory(directory);
       // File is complete before this process considers it usable.
       return loadOrCreateDeviceIdentity({directory,platform});

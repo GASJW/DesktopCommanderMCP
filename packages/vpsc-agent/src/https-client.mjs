@@ -56,14 +56,14 @@ export function createHttpsAgentClient({
      identity.deviceBinding.fingerprint!==identity.fingerprint)){
     throw fail('CONFIG','HTTPS client identity differs from its durable approval binding');
   }
-  let sessionId=null,sequence=0,closed=false;
+  let sessionId=null,sequence=0,closed=false,permanentlyClosed=false;
   function ambiguousResponse(){
     // A route may have consumed a challenge, advanced a frame sequence, or
     // accepted a result before the response became unusable. Fence this client.
     closed=true;sessionId=null;sequence=0;
     throw fail('AMBIGUOUS_TRANSPORT','Agent response invalid; request outcome unknown');
   }
-  async function request(route,data,authenticate=false){
+  async function request(route,data,authenticate=false,signal){
     if(closed)throw fail('CLOSED','Agent client closed');
     if(!ROUTES.has(route))throw fail('CONFIG','Unknown agent route');
     const body=JSON.stringify(data);
@@ -87,9 +87,10 @@ export function createHttpsAgentClient({
     }
     let response;
     try{
+      const requestSignal=signal?AbortSignal.any([signal,AbortSignal.timeout(timeoutMs)]):AbortSignal.timeout(timeoutMs);
       response=await fetchFn(origin+route,{
         method:'POST',headers,body,redirect:'error',
-        cache:'no-store',credentials:'omit',signal:AbortSignal.timeout(timeoutMs),
+        cache:'no-store',credentials:'omit',signal:requestSignal,
       });
     }catch{
       // Once the network request started, never assume the operation was not
@@ -122,28 +123,34 @@ export function createHttpsAgentClient({
       return parsed;
     }catch{return ambiguousResponse();}
   }
-  async function connect(){
+  async function connect({signal}={}){
     if(sessionId)throw fail('STATE','Already connected');
-    const challenge=await request('/agent/challenge',{deviceId});
+    const challenge=await request('/agent/challenge',{deviceId},false,signal);
     if(!exactKeys(challenge,'deviceId,expiresInMs,nonce')||challenge.deviceId!==deviceId||
        !NONCE.test(challenge.nonce)||!Number.isSafeInteger(challenge.expiresInMs)||
        challenge.expiresInMs<1||challenge.expiresInMs>60_000)return ambiguousResponse();
     const proof=identity.proveDeviceChallenge(challenge);
-    const current=await request('/agent/connect',{deviceId,signature:proof});
+    const current=await request('/agent/connect',{deviceId,signature:proof},false,signal);
     if(!exactKeys(current,'deviceId,sessionId')||current.deviceId!==deviceId||
        typeof current.sessionId!=='string'||!UUID.test(current.sessionId))return ambiguousResponse();
     sessionId=current.sessionId;sequence=0;
     return Object.freeze({deviceId,sessionId});
   }
-  async function heartbeat(){
-    const answer=await request('/agent/heartbeat',{},true);
+  async function reconnect({signal}={}){
+    if(permanentlyClosed||!closed||sessionId!==null)
+      throw fail('STATE','Only an ambiguous open-client session can reconnect');
+    closed=false;sequence=0;
+    return connect({signal});
+  }
+  async function heartbeat({signal}={}){
+    const answer=await request('/agent/heartbeat',{},true,signal);
     if(!exactKeys(answer,'deviceId,status')||answer.deviceId!==deviceId||answer.status!=='alive'){
       return ambiguousResponse();
     }
     return answer;
   }
-  async function poll(){
-    const answer=await request('/agent/poll',{},true);
+  async function poll({signal}={}){
+    const answer=await request('/agent/poll',{},true,signal);
     if(!exactKeys(answer,'frame')&& !exactKeys(answer,'cancel,frame'))return ambiguousResponse();
     if(!(answer.frame===null||
        answer.frame&&typeof answer.frame==='object'&&!Array.isArray(answer.frame))){
@@ -151,8 +158,8 @@ export function createHttpsAgentClient({
     }
     return answer.frame;
   }
-  async function pollControl(){
-    const answer=await request('/agent/poll',{},true);
+  async function pollControl({signal}={}){
+    const answer=await request('/agent/poll',{},true,signal);
     if(!exactKeys(answer,'frame')&&!exactKeys(answer,'cancel,frame'))return ambiguousResponse();
     if(!(answer.frame===null||answer.frame&&typeof answer.frame==='object'&&!Array.isArray(answer.frame))||
        !(answer.cancel===undefined||answer.cancel===null||
@@ -182,27 +189,27 @@ export function createHttpsAgentClient({
       throw error;
     }
   }
-  const result=async(requestId,value)=>{
+  const result=async(requestId,value,{signal}={})=>{
     if(typeof requestId!=='string'||!UUID.test(requestId)){
       throw fail('BAD_PAYLOAD','Invalid remote request id');
     }
-    const answer=await request('/agent/result',{requestId,result:value},true);
+    const answer=await request('/agent/result',{requestId,result:value},true,signal);
     if(!exactKeys(answer,'accepted')||answer.accepted!==true)return ambiguousResponse();
     return answer;
   };
-  async function cancelAck({requestId,ownerDigest,status}={}){
+  async function cancelAck({requestId,ownerDigest,status,signal}={}){
     if(typeof requestId!=='string'||!UUID.test(requestId)||
        !/^[a-f0-9]{64}$/.test(ownerDigest??'')||
        !['cancelled','completed','ambiguous'].includes(status)){
       throw fail('BAD_PAYLOAD','Invalid cancellation acknowledgement');
     }
-    const answer=await request('/agent/cancel-ack',{requestId,ownerDigest,status},true);
+    const answer=await request('/agent/cancel-ack',{requestId,ownerDigest,status},true,signal);
     if(!exactKeys(answer,'accepted,status')||answer.accepted!==true||
        answer.status!==status&&answer.status!=='ambiguous'){
       return ambiguousResponse();
     }
     return answer;
   }
-  function close(){closed=true;sessionId=null;}
-  return Object.freeze({connect,heartbeat,poll,pollControl,result,cancelAck,disconnect,close});
+  function close(){permanentlyClosed=true;closed=true;sessionId=null;sequence=0;}
+  return Object.freeze({connect,reconnect,heartbeat,poll,pollControl,result,cancelAck,disconnect,close});
 }

@@ -4,10 +4,18 @@ import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import {
   constants, closeSync, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync,
-  openSync, readFileSync, readSync, readdirSync, realpathSync, statSync, unlinkSync, writeSync,
+  openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, statSync,
+  unlinkSync, writeFileSync, writeSync,
 } from 'node:fs';
 import { createDurableProcessLock, inspectDurableProcessLock,
   removeOwnedDurableProcessLock } from '../../../gateway/common/durable-process-lock.mjs';
+import { assertNotElevatedWindows, createWindowsDurableProcessLock, inspectWindowsFileLock,
+  listWindowsDirectoryBeneath, moveWindowsFileWriteThrough, readWindowsFileBeneath,
+  removeDeadWindowsFileLock, removeOwnedWindowsDurableProcessLock,
+  securePrivateWindowsFile, securePrivateWindowsDirectory,
+  verifyPrivateWindowsDirectory, verifyPrivateWindowsFile,
+  verifyWindowsOperationRoot, createWindowsFileBeneath,
+} from './windows-security.mjs';
 import { verifyToolGrantCapability } from '../../../gateway/devices/tool-grant-capability.mjs';
 import { createLocalReadonlyMcp, LocalMcpError } from './local-mcp-readonly.mjs';
 
@@ -44,10 +52,23 @@ function validAuthorization(value){
   return envelope||legacy;
 }
 function syncDirectory(directory){
+  // Windows commits flushed file handles with MOVEFILE_WRITE_THROUGH; Node cannot fsync a directory handle there.
+  if(process.platform==='win32')return;
   const fd=openSync(directory,constants.O_RDONLY|(constants.O_DIRECTORY??0)|(constants.O_NOFOLLOW??0));
   try{fsyncSync(fd);}finally{closeSync(fd);}
 }
 function safeDirectoryPath(directory,{privateFinal=false}={}){
+  if(process.platform==='win32'){
+    if(typeof directory!=='string'||!path.isAbsolute(directory)||path.normalize(directory)!==directory)
+      throw fail('POLICY','Absolute normalized execution directory required');
+    try{
+      if(privateFinal){securePrivateWindowsDirectory(directory);verifyPrivateWindowsDirectory(directory);}
+      else verifyWindowsOperationRoot(directory);
+      return directory;
+    }catch{throw fail('POLICY',privateFinal
+      ?'Execution state directory or its ACL is unsafe'
+      :'Approved operation root or its ACL is unsafe');}
+  }
   if(process.platform!=='linux'||typeof process.getuid!=='function'){
     throw fail('POLICY','Durable execution ledger requires Linux process identity');
   }
@@ -83,6 +104,11 @@ function safeOperationRoot(directory){return safeDirectoryPath(directory);}
 const directoryFlags=constants.O_RDONLY|(constants.O_DIRECTORY??0)|(constants.O_NOFOLLOW??0);
 const procFd=fd=>`/proc/self/fd/${fd}`;
 function assertPinnedDirectory(directory,fd){
+  if(process.platform==='win32'){
+    try{verifyPrivateWindowsDirectory(directory);}
+    catch{throw fail('STATE_DIRECTORY_CHANGED','Execution state directory identity changed');}
+    return;
+  }
   let named,opened;
   try{named=lstatSync(directory,{bigint:true});opened=fstatSync(fd,{bigint:true});}
   catch{throw fail('STATE_DIRECTORY_CHANGED','Execution state directory is unavailable');}
@@ -143,6 +169,15 @@ function openFileBeneath(rootFd,root,filename,maxBytes=MAX_CONTENT_BYTES){
   }finally{if(parent?.owned)closeSync(parent.fd);}
 }
 function validateLedgerFile(filename){
+  if(process.platform==='win32'){
+    try{lstatSync(filename);}catch(error){if(error?.code==='ENOENT')return null;throw error;}
+    try{
+      verifyPrivateWindowsFile(filename);
+      return readWindowsFileBeneath(path.dirname(filename),filename,{maxBytes:MAX_LEDGER_BYTES});
+    }catch{
+      throw fail('LEDGER_CORRUPT','Execution ledger file has unsafe metadata');
+    }
+  }
   let named;
   try{named=lstatSync(filename);}catch(error){if(error?.code==='ENOENT')return null;throw error;}
   if(!named.isFile()||named.isSymbolicLink()||named.nlink!==1||
@@ -209,6 +244,21 @@ function readLedger(filename){
 function appendRecord(directory,filename,record,directoryFd){
   const line=Buffer.from(JSON.stringify(record)+'\n');
   if(line.length>8192)throw fail('LEDGER_FULL','Execution ledger record exceeds its limit');
+  if(process.platform==='win32'){
+    const existing=validateLedgerFile(filename)??Buffer.alloc(0);
+    if(existing.length+line.length>MAX_LEDGER_BYTES)throw fail('LEDGER_FULL','Execution ledger is unsafe or full');
+    const temp=path.join(directory,`.${LEDGER}-${randomUUID()}.tmp`);
+    try{
+      createWindowsFileBeneath(directory,temp,Buffer.concat([existing,line]));
+      securePrivateWindowsFile(temp);
+      moveWindowsFileWriteThrough(temp,filename);
+    }catch(error){
+      try{unlinkSync(temp);}catch{}
+      if(error instanceof LocalMcpError)throw error;
+      throw fail('LEDGER_WRITE_FAILED','Execution ledger could not be committed');
+    }
+    return;
+  }
   try{
     let existing;
     try{existing=lstatSync(filename);}catch(error){if(error?.code!=='ENOENT')throw error;}
@@ -280,6 +330,14 @@ function readPinnedText(opened,maxBytes,offset,length){
   const lines=text.match(/[^\n]*(?:\n|$)/g)?.filter(line=>line.length>0)??[];
   return result(lines.slice(offset,offset+length).join(''));
 }
+function readWindowsText(bytes,maxBytes,offset,length){
+  if(bytes.length>maxBytes)throw fail('DENIED','File is outside the approved operation scope');
+  let text;
+  try{text=new TextDecoder('utf-8',{fatal:true}).decode(bytes);}
+  catch{throw fail('INVALID_UTF8','File is not valid UTF-8 text');}
+  const lines=text.match(/[^\n]*(?:\n|$)/g)?.filter(line=>line.length>0)??[];
+  return result(lines.slice(offset,offset+length).join(''));
+}
 function checkedArguments(name,args){
   if(!args||Object.getPrototypeOf(args)!==Object.prototype)throw fail('DENIED','Invalid tool arguments');
   const exact=(required,optional=[])=>{
@@ -338,6 +396,15 @@ function createOnlyWrite(rootFd,root,filename,content){
   }finally{if(openedParent.owned)closeSync(openedParent.fd);}
   return jsonResult({created:true,bytes:bytes.length});
 }
+function createWindowsOnlyWrite(root,filename,content){
+  try{return jsonResult({created:true,bytes:createWindowsFileBeneath(root,filename,Buffer.from(content,'utf8'))});}
+  catch(error){
+    if(error?.code==='ALREADY_EXISTS')throw fail('ALREADY_EXISTS','Destination file already exists');
+    if(['OUTSIDE_ROOT','REPARSE_OR_TYPE','INVALID_NAME','PATH'].includes(error?.code))
+      throw fail('DENIED','Destination is outside the approved root or unsafe');
+    throw fail('WRITE_FAILED','Destination file could not be created durably');
+  }
+}
 function boundedList(rootFd,root,filename,depthLimit,entryLimit=MAX_DIRECTORY_ENTRIES){
   const opened=openDirectoryBeneath(rootFd,root,path.resolve(filename),{allowRoot:true});
   const entries=[];let truncated=false;
@@ -374,8 +441,49 @@ function boundedList(rootFd,root,filename,depthLimit,entryLimit=MAX_DIRECTORY_EN
   }
   return jsonResult({entries,truncated});
 }
+function runWindowsCountLines({root,filename,timeoutMs,signal,jobs,afterFileOpen,
+  slowTestCommand=false,failTestCommand=false,maxOutputBytes=MAX_OUTPUT_BYTES}){
+  if(signal?.aborted)return Promise.reject(fail('CANCELLED','Operation cancelled before command start'));
+  const job={jobId:randomUUID(),profile:'count_lines',pid:null,state:'running',
+    startedAt:new Date().toISOString(),exitCode:null};
+  jobs.push(job);if(jobs.length>MAX_JOBS)jobs.shift();
+  let bytes;
+  try{
+    bytes=readWindowsFileBeneath(root,filename,{maxBytes:1024*1024});
+    afterFileOpen?.({tool:'run_command',path:filename});
+  }catch(error){job.state='failed';return Promise.reject(error);}
+  if(signal?.aborted){job.state='ambiguous';return Promise.reject(fail('AMBIGUOUS_CANCELLED','Count operation was cancelled after reading'));}
+  if(failTestCommand){
+    const value={profile:'count_lines',exitCode:1,stdout:'',stderr:'fixed count_lines test failure\n'};
+    job.state='failed';job.exitCode=1;
+    return Promise.resolve(jsonResult(value));
+  }
+  if(!slowTestCommand){
+    let count=0;for(const byte of bytes)if(byte===10)count++;
+    const stdout=`${String(count).padStart(7)} ${filename}\n`;
+    if(Buffer.byteLength(stdout)>maxOutputBytes){job.state='failed';return Promise.reject(fail('OUTPUT_LIMIT','Count result exceeds the granted output limit'));}
+    const value={profile:'count_lines',exitCode:0,stdout,stderr:''};
+    job.state='completed';job.exitCode=0;
+    return Promise.resolve(jsonResult(value));
+  }
+  return new Promise((resolve,reject)=>{
+    let finished=false;
+    const finish=(error,value)=>{
+      if(finished)return;finished=true;clearTimeout(timer);signal?.removeEventListener('abort',onAbort);
+      if(error){job.state='ambiguous';reject(error);}else{job.state='completed';job.exitCode=0;resolve(value);}
+    };
+    const timer=setTimeout(()=>finish(fail('AMBIGUOUS_TIMEOUT','Fixed count_lines operation timed out; do not replay')),timeoutMs);
+    const onAbort=()=>finish(fail('AMBIGUOUS_CANCELLED','Count operation was cancelled; do not replay'));
+    signal?.addEventListener('abort',onAbort,{once:true});
+    if(signal?.aborted)onAbort();
+    else setTimeout(()=>finish(null,jsonResult({profile:'count_lines',exitCode:0,stdout:'',stderr:''})),30_000).unref?.();
+  });
+}
+
 function runCountLines({rootFd,root,filename,timeoutMs,signal,jobs,activeChildren,onSpawn,
   afterFileOpen,slowTestCommand=false,failTestCommand=false,maxOutputBytes=MAX_OUTPUT_BYTES}){
+  if(process.platform==='win32')return runWindowsCountLines({root,filename,timeoutMs,signal,jobs,
+    afterFileOpen,slowTestCommand,failTestCommand,maxOutputBytes});
   if(process.platform!=='linux')throw fail('UNSUPPORTED','count_lines profile is Linux-only');
   const opened=openFileBeneath(rootFd,root,filename,1024*1024);
   try{afterFileOpen?.({tool:'run_command',path:filename});}
@@ -444,14 +552,21 @@ function runCountLines({rootFd,root,filename,timeoutMs,signal,jobs,activeChildre
 
 export function analyzeI4ExecutionRecovery({ledgerDirectory}={}){
   const directory=safeStateDirectory(ledgerDirectory);
-  const directoryFd=openSync(directory,directoryFlags);
   let lock,ledger;
-  try{
-    assertPinnedDirectory(directory,directoryFd);
-    lock=inspectDurableProcessLock(directory,LOCK);
-    ledger=readLedger(path.join(procFd(directoryFd),LEDGER));
-    assertPinnedDirectory(directory,directoryFd);
-  }finally{closeSync(directoryFd);}
+  if(process.platform==='win32'){
+    assertPinnedDirectory(directory);
+    lock=inspectWindowsFileLock(directory,LOCK);
+    ledger=readLedger(path.join(directory,LEDGER));
+    assertPinnedDirectory(directory);
+  }else{
+    const directoryFd=openSync(directory,directoryFlags);
+    try{
+      assertPinnedDirectory(directory,directoryFd);
+      lock=inspectDurableProcessLock(directory,LOCK);
+      ledger=readLedger(path.join(procFd(directoryFd),LEDGER));
+      assertPinnedDirectory(directory,directoryFd);
+    }finally{closeSync(directoryFd);}
+  }
   const unresolved=Array.from(ledger.entries.values()).filter(entry=>!entry.outcome)
     .map(entry=>({deviceId:entry.intent.deviceId,requestId:entry.intent.requestId,
       tool:entry.intent.tool,argumentHash:entry.intent.argumentHash}));
@@ -470,7 +585,8 @@ export function createGovernedAgentExecutor({allowedRoot,entrypoint,nodeBin=proc
   ledgerDirectory,timeoutMs=8000,startupTimeoutMs=30_000,maxFileBytes=64*1024,
   commandTimeoutMs=10_000,gatewayPolicyPublicKey,deviceId,fingerprint,testHooks}={}){
   if(typeof process.getuid==='function'&&process.getuid()===0)throw fail('PRIVILEGE','Agent must run as nonroot');
-  if(process.platform!=='linux')throw fail('UNSUPPORTED','I4 durable execution currently requires Linux');
+  if(!['linux','win32'].includes(process.platform))throw fail('UNSUPPORTED','I4 durable execution supports Linux or Windows');
+  if(process.platform==='win32')try{assertNotElevatedWindows();}catch{throw fail('PRIVILEGE','Agent must run unelevated');}
   if(!Number.isSafeInteger(commandTimeoutMs)||commandTimeoutMs<100||commandTimeoutMs>30_000){
     throw fail('POLICY','Invalid fixed command timeout');
   }
@@ -492,23 +608,27 @@ export function createGovernedAgentExecutor({allowedRoot,entrypoint,nodeBin=proc
   try{
     safeOperationRoot(allowedRoot);
     root=realpathSync(allowedRoot);
-    rootFd=openSync(root,directoryFlags);
-    const openedRoot=fstatSync(rootFd);
-    if(!openedRoot.isDirectory()||openedRoot.uid!==process.getuid()||(openedRoot.mode&0o022)!==0||
-       realpathSync(procFd(rootFd))!==root)throw Error();
+    if(process.platform==='linux'){
+      rootFd=openSync(root,directoryFlags);
+      const openedRoot=fstatSync(rootFd);
+      if(!openedRoot.isDirectory()||openedRoot.uid!==process.getuid()||(openedRoot.mode&0o022)!==0||
+         realpathSync(procFd(rootFd))!==root)throw Error();
+    }else root=verifyWindowsOperationRoot(root);
   }catch{if(rootFd!==undefined)closeSync(rootFd);throw fail('POLICY','Absolute private non-symlink approved directory required');}
   let state;
   try{
     state=safeStateDirectory(ledgerDirectory);
-    stateFd=openSync(state,directoryFlags);
-    assertPinnedDirectory(state,stateFd);
+    if(process.platform==='linux'){
+      stateFd=openSync(state,directoryFlags);
+      assertPinnedDirectory(state,stateFd);
+    }else assertPinnedDirectory(state);
   }catch(error){
     if(stateFd!==undefined)closeSync(stateFd);
-    closeSync(rootFd);
+    if(rootFd!==undefined)closeSync(rootFd);
     if(error instanceof LocalMcpError)throw error;
     throw fail('POLICY','Execution ledger directory could not be pinned');
   }
-  const ledgerPath=path.join(procFd(stateFd),LEDGER);
+  const ledgerPath=path.join(stateFd===undefined?state:procFd(stateFd),LEDGER);
   const local=createLocalReadonlyMcp({allowedRoot:root,entrypoint,nodeBin,timeoutMs,
     startupTimeoutMs,maxFileBytes});
   const jobs=[],activeChildren=new Set();
@@ -521,7 +641,12 @@ export function createGovernedAgentExecutor({allowedRoot,entrypoint,nodeBin=proc
   async function start(){
     if(started||closed)throw fail('STATE','Governed executor is single-use');
     started=true;
-    const inspection=inspectCurrentRecovery();
+    let inspection=inspectCurrentRecovery();
+    if(process.platform==='win32'&&inspection.status==='stale-lock'&&
+       inspection.lock.status==='dead'&&!inspection.unresolved.length&&!inspection.ambiguous.length){
+      removeDeadWindowsFileLock({directory:state,name:LOCK,expectedDigest:inspection.lock.digest});
+      inspection=inspectCurrentRecovery();
+    }
     if(inspection.status!=='consistent'){
       throw fail('RECOVERY_REQUIRED',`I4 recovery state requires operator review: ${inspection.status}`);
     }
@@ -549,7 +674,13 @@ export function createGovernedAgentExecutor({allowedRoot,entrypoint,nodeBin=proc
     catch{throw fail('DENIED','Operation lacks a valid Gateway signed tool grant');}
     const argumentHash=hash(JSON.stringify(canonical({tool:name,arguments:args})));
     let lockOwner;
-    try{assertState();lockOwner=createDurableProcessLock(state,LOCK,'i4-agent-op');assertState();}
+    try{
+      assertState();
+      lockOwner=process.platform==='win32'
+        ?await createWindowsDurableProcessLock(state,LOCK,'i4-agent-op')
+        :createDurableProcessLock(state,LOCK,'i4-agent-op');
+      assertState();
+    }
     catch(error){
       if(error?.code==='EEXIST'||/already exists|active/.test(error?.message??'')){
         throw fail('BUSY','Another agent execution is active or awaiting recovery');
@@ -588,20 +719,31 @@ export function createGovernedAgentExecutor({allowedRoot,entrypoint,nodeBin=proc
       try{
         if(signal?.aborted)throw fail('CANCELLED','Operation cancelled after durable intent');
         if(name==='read_file'){
-          const opened=openFileBeneath(rootFd,root,args.path,
-            Math.min(maxFileBytes,grant.constraints.maxBytes));
-          try{
+          const maxBytes=Math.min(maxFileBytes,grant.constraints.maxBytes);
+          if(process.platform==='win32'){
+            const bytes=readWindowsFileBeneath(root,args.path,{maxBytes});
             await testHooks?.afterFileOpen?.({tool:name,path:args.path});
-            output=readPinnedText(opened,maxFileBytes,args.offset??0,args.length??1000);
-          }finally{closeSync(opened.fd);}
+            output=readWindowsText(bytes,maxBytes,args.offset??0,args.length??1000);
+          }else{
+            const opened=openFileBeneath(rootFd,root,args.path,maxBytes);
+            try{
+              await testHooks?.afterFileOpen?.({tool:name,path:args.path});
+              output=readPinnedText(opened,maxBytes,args.offset??0,args.length??1000);
+            }finally{closeSync(opened.fd);}
+          }
         }else if(name==='list_directory'){
-          output=boundedList(rootFd,root,args.path,
-            Math.min(args.depth??0,grant.constraints.maxDepth),grant.constraints.maxEntries);
+          output=process.platform==='win32'
+            ?jsonResult(listWindowsDirectoryBeneath(root,args.path,{depth:Math.min(args.depth??0,grant.constraints.maxDepth),
+              limit:grant.constraints.maxEntries}))
+            :boundedList(rootFd,root,args.path,
+              Math.min(args.depth??0,grant.constraints.maxDepth),grant.constraints.maxEntries);
         }else if(name==='write_file'){
           if(Buffer.byteLength(args.content,'utf8')>grant.constraints.maxBytes){
             throw fail('DENIED','Write content exceeds the granted size');
           }
-          output=createOnlyWrite(rootFd,root,args.path,args.content);
+          output=process.platform==='win32'
+            ?createWindowsOnlyWrite(root,args.path,args.content)
+            :createOnlyWrite(rootFd,root,args.path,args.content);
         }else if(name==='list_processes'){
           output=jsonResult({jobs:jobs.slice(-grant.constraints.maxJobs).map(job=>({...job}))});
         }else{
@@ -643,7 +785,12 @@ export function createGovernedAgentExecutor({allowedRoot,entrypoint,nodeBin=proc
       throw error;
     }finally{
       if(!retainLock&&lockOwner){
-        try{assertState();removeOwnedDurableProcessLock({directory:state,name:LOCK,owner:lockOwner});assertState();}
+        try{
+          assertState();
+          if(process.platform==='win32')await removeOwnedWindowsDurableProcessLock({directory:state,name:LOCK,owner:lockOwner});
+          else removeOwnedDurableProcessLock({directory:state,name:LOCK,owner:lockOwner});
+          assertState();
+        }
         catch{uncertain=true;throw fail('AMBIGUOUS_LOCK_RELEASE','Operation completed but execution lock release is uncertain');}
       }
     }
@@ -663,7 +810,8 @@ export function createGovernedAgentExecutor({allowedRoot,entrypoint,nodeBin=proc
     try{await local.close();}
     finally{
       await Promise.allSettled([...activeOperations]);
-      closeSync(rootFd);closeSync(stateFd);
+      if(rootFd!==undefined)closeSync(rootFd);
+      if(stateFd!==undefined)closeSync(stateFd);
     }
   }
   return Object.freeze({start,handle,close,

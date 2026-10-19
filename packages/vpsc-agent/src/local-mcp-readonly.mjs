@@ -3,6 +3,9 @@ import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync,
   statSync, lstatSync, writeFileSync } from 'node:fs';
+import { assertNotElevatedWindows, readWindowsFileBeneath,
+  securePrivateWindowsDirectory, securePrivateWindowsFile,
+  verifyWindowsOperationRoot } from './windows-security.mjs';
 
 // Nonproduction, single-process read-only MCP adapter.
 // The caller must authenticate device transport and owner/tool policy separately.
@@ -19,16 +22,19 @@ export function createPrivateMcpHome({allowedRoot}={}){
   }
   const directory=mkdtempSync(path.join(os.tmpdir(),'vpsc-agent-home-'));
   try{
-    chmodSync(directory,0o700);
+    if(process.platform==='win32')securePrivateWindowsDirectory(directory);
+    else chmodSync(directory,0o700);
     const configDirectory=path.join(directory,'.claude-server-commander');
     mkdirSync(configDirectory,{mode:0o700});
-    chmodSync(configDirectory,0o700);
+    if(process.platform==='win32')securePrivateWindowsDirectory(configDirectory);
+    else chmodSync(configDirectory,0o700);
     const configPath=path.join(configDirectory,'config.json');
     writeFileSync(configPath,JSON.stringify({allowedDirectories:[allowedRoot],
       telemetryEnabled:false,fileReadLineLimit:1000,fileWriteLineLimit:50,
       welcomeOnboardingEligible:false,pendingWelcomeOnboarding:false})+'\n',
       {flag:'wx',mode:0o600});
-    chmodSync(configPath,0o600);
+    if(process.platform==='win32')securePrivateWindowsFile(configPath);
+    else chmodSync(configPath,0o600);
     return Object.freeze({directory,close(){rmSync(directory,{recursive:true,force:true});}});
   }catch(error){
     rmSync(directory,{recursive:true,force:true});
@@ -44,6 +50,10 @@ function checkedFeatureFlagsUrl(value){
 }
 function checkedRoot(directory){
   if(typeof directory!=='string'||!path.isAbsolute(directory))throw err('POLICY','Absolute allowed root required');
+  if(process.platform==='win32'){
+    try{return verifyWindowsOperationRoot(directory);}
+    catch{throw err('POLICY','Allowed root ACL or reparse path is unsafe');}
+  }
   if(lstatSync(directory).isSymbolicLink())throw err('POLICY','Symlink root forbidden');
   const root=realpathSync(directory);
   if(!statSync(root).isDirectory())throw err('POLICY','Allowed root must be a directory');
@@ -83,6 +93,8 @@ export function createLocalReadonlyMcp({
     throw err('POLICY','Invalid local MCP runtime configuration');
   }
   const root=checkedRoot(allowedRoot);
+  if(process.platform==='win32')try{assertNotElevatedWindows();}
+    catch{throw err('PRIVILEGE','Agent must run unelevated');}
   const safeFeatureFlagsUrl=checkedFeatureFlagsUrl(featureFlagsUrl);
   let child=null,started=false,dead=false,serial=0,privateHome=null,exitPromise=null;
   const pending=new Map();
@@ -200,6 +212,16 @@ export function createLocalReadonlyMcp({
        typeof frame.requestId!=='string'||!UUID.test(frame.requestId)||
        frame.params?.name!=='read_file'){
       throw err('DENIED','Only authenticated, read_file-only tool frames allowed');
+    }
+    if(process.platform==='win32'){
+      const raw=frame.params.arguments;
+      const args=checkedRead(raw,root,maxFileBytes);
+      const bytes=readWindowsFileBeneath(root,raw.path,{maxBytes:maxFileBytes});
+      let text;
+      try{text=new TextDecoder('utf-8',{fatal:true}).decode(bytes);}
+      catch{throw err('DENIED','File is not valid UTF-8 text');}
+      const lines=text.match(/[^\n]*(?:\n|$)/g)?.filter(line=>line.length>0)??[];
+      return {content:[{type:'text',text:lines.slice(args.offset,args.offset+args.length).join('')}],isError:false};
     }
     const args=checkedRead(frame.params.arguments,root,maxFileBytes);
     const out=await send('tools/call',{name:'read_file',arguments:args});
