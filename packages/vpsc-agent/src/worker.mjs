@@ -64,8 +64,14 @@ export function createAgentWorker({deviceId,client,executor,pollIntervalMs=250}=
     throw new TypeError('Invalid remote agent worker configuration');
   }
   const controller=new AbortController();
-  let started=false,closed=false;
+  let started=false,closed=false,stopRequested=false,acknowledgementPending=false;
   let activeOperationController=null;
+  const requestStop=()=>{
+    stopRequested=true;
+    if(acknowledgementPending)return;
+    controller.abort();
+    activeOperationController?.abort();
+  };
   async function readPoll(signal){
     if(typeof client.pollControl==='function'){
       const value=await client.pollControl({signal});
@@ -83,7 +89,7 @@ export function createAgentWorker({deviceId,client,executor,pollIntervalMs=250}=
     if(started||closed)throw fail('STATE','Agent worker is single-use');
     started=true;
     let connected=false;
-    const abort=()=>{controller.abort();activeOperationController?.abort();};
+    const abort=requestStop;
     signal?.addEventListener('abort',abort,{once:true});
     if(signal?.aborted)controller.abort();
     try{
@@ -91,7 +97,7 @@ export function createAgentWorker({deviceId,client,executor,pollIntervalMs=250}=
       if(controller.signal.aborted)return Object.freeze({status:'stopped'});
       async function connectSession(reconnecting=false){
         let delay=250,reset=reconnecting;
-        while(!controller.signal.aborted){
+        while(!controller.signal.aborted&&!stopRequested){
           try{
             if(reset&&typeof client.reconnect!=='function')
               throw fail('AMBIGUOUS_TRANSPORT','Client cannot safely replace an uncertain session');
@@ -113,7 +119,7 @@ export function createAgentWorker({deviceId,client,executor,pollIntervalMs=250}=
       let session=await connectSession();
       if(!session)return Object.freeze({status:'stopped'});
       connected=true;
-      while(!controller.signal.aborted){
+      while(!controller.signal.aborted&&!stopRequested){
         let poll;
         try{
           const heartbeat=await client.heartbeat({signal:controller.signal});
@@ -156,6 +162,7 @@ export function createAgentWorker({deviceId,client,executor,pollIntervalMs=250}=
             if(!currentHeartbeat||currentHeartbeat.deviceId!==deviceId||currentHeartbeat.status!=='alive'){
               throw fail('PROTOCOL','Gateway heartbeat did not confirm the active device session');
             }
+            if(settled)break;
             const control=await readPoll(controller.signal);
             if(control.frame!==null){
               throw fail('PROTOCOL','Gateway delivered a second task while one operation was active');
@@ -195,8 +202,11 @@ export function createAgentWorker({deviceId,client,executor,pollIntervalMs=250}=
             const status=operationError
               ?operationError.code==='CANCELLED'?'cancelled':'ambiguous':'completed';
             const claims=frame.authorization.claims;
-            const acknowledgement=await client.cancelAck({requestId:frame.requestId,
-              ownerDigest:claims.ownerDigest,status,signal:controller.signal});
+            acknowledgementPending=true;
+            let acknowledgement;
+            try{acknowledgement=await client.cancelAck({requestId:frame.requestId,
+              ownerDigest:claims.ownerDigest,status,signal:controller.signal});}
+            finally{acknowledgementPending=false;}
             if(!acknowledgement||acknowledgement.accepted!==true||
                acknowledgement.status!==status&&acknowledgement.status!=='ambiguous'){
               throw fail('AMBIGUOUS_CANCEL_ACK','Cancellation acknowledgement was not accepted; do not replay');
@@ -230,7 +240,10 @@ export function createAgentWorker({deviceId,client,executor,pollIntervalMs=250}=
           result={isError:true,content:[{type:'text',text:`Remote operation rejected (${code})`}],
             structuredContent:{code}};
         }
-        const acknowledgement=await client.result(frame.requestId,result,{signal:controller.signal});
+        acknowledgementPending=true;
+        let acknowledgement;
+        try{acknowledgement=await client.result(frame.requestId,result,{signal:controller.signal});}
+        finally{acknowledgementPending=false;}
         if(!acknowledgement||acknowledgement.accepted!==true){
           throw fail('AMBIGUOUS_ACK','Result acknowledgement missing; do not replay the task');
         }
@@ -250,8 +263,7 @@ export function createAgentWorker({deviceId,client,executor,pollIntervalMs=250}=
   }
   function stop(){
     if(closed)return false;
-    controller.abort();
-    activeOperationController?.abort();
+    requestStop();
     return true;
   }
   return Object.freeze({run,stop});

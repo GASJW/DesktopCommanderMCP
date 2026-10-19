@@ -198,7 +198,7 @@ function makeTlsCertificate(directory,name){
 }
 function makeGateway({trustStore,ownerAccess,machineAccess,bindings,ingressRef,
   auditDirectory,trustDirectory,toolGrantStore,policySigningKey,machineBindingStore}){
-  const router=createDeviceRouter({registry:trustStore.registry,timeoutMs:3000});
+  const router=createDeviceRouter({registry:trustStore.registry,timeoutMs:15_000});
   const approvalReceiptReads=[];
   const dispatchAuthorizationChecks=[];
   const durableReadDeviceApproval=createDurableOwnerDeviceApprovalReader({auditDirectory,trustDirectory});
@@ -642,20 +642,18 @@ test('I3/I4 E2E: Owner approval, durable trust, verified TLS, governed operation
   // reports rollback or replays the request.
   await stopWorker(active);active=null;
   let commandPid;
-  let commandSpawned;
-  const commandStarted=new Promise(resolve=>{commandSpawned=resolve;});
   client=agentClient({identity,deviceId:approved.deviceId,clientSecret:SERVICE_SECRET,
     fetchFn:createTlsFetch({port:edgeInfo.port,ca:certificate.cert,observed:[]})});
   active=await startWorker(client,approved.deviceId,allowedRoot,cancellationExecutionDirectory,
     identity,policyKeys.publicKey,{sleepCommandForTimeout:true,onCommandSpawn:pid=>{
-      commandPid=pid;commandSpawned(pid);
+      commandPid=pid;
     }});
   await waitFor(()=>trustStore.registry.listDevices()[0]?.online,'cancellable command device session');
   const cancelOwner=new AbortController();
   const canceledResponse=ownerCall(mcpUrl,'tools/call',70,{name:'run_command',arguments:{
     deviceId:approved.deviceId,path:file,profile:'count_lines',
   }},ownerToken,cancelOwner.signal).then(value=>({value}),error=>({error}));
-  await commandStarted;
+  await waitFor(()=>Number.isSafeInteger(commandPid),'cancellable command process spawn');
   assert.ok(Number.isSafeInteger(commandPid));
   const cancelledIntent=await waitFor(()=>{
     try{
@@ -682,18 +680,17 @@ test('I3/I4 E2E: Owner approval, durable trust, verified TLS, governed operation
   // Gateway poll fence to request cooperative cancellation; no success crosses
   // the now-revoked authorization boundary.
   commandPid=undefined;
-  const revokeCommandStarted=new Promise(resolve=>{commandSpawned=resolve;});
   client=agentClient({identity,deviceId:approved.deviceId,clientSecret:SERVICE_SECRET,
     fetchFn:createTlsFetch({port:edgeInfo.port,ca:certificate.cert,observed:[]})});
   active=await startWorker(client,approved.deviceId,allowedRoot,revokeExecutionDirectory,
     identity,policyKeys.publicKey,{sleepCommandForTimeout:true,onCommandSpawn:pid=>{
-      commandPid=pid;commandSpawned(pid);
+      commandPid=pid;
     }});
   await waitFor(()=>trustStore.registry.listDevices()[0]?.online,'grant-revocation device session');
   const revokedCall=ownerCall(mcpUrl,'tools/call',71,{name:'run_command',arguments:{
     deviceId:approved.deviceId,path:file,profile:'count_lines',
   }},ownerToken);
-  await revokeCommandStarted;
+  await waitFor(()=>Number.isSafeInteger(commandPid),'grant-revocation command process spawn');
   const revokeIntent=await waitFor(()=>{
     try{
       return readFileSync(path.join(revokeExecutionDirectory,'i4-execution.jsonl'),'utf8')
@@ -760,19 +757,18 @@ test('I3/I4 E2E: Owner approval, durable trust, verified TLS, governed operation
   const trustRevokeExecutionDirectory=path.join(home,'trust-revoke-execution');
   mkdirSync(trustRevokeExecutionDirectory,{mode:0o700});
   let trustRevokePid;
-  const trustRevokeStarted=new Promise(resolve=>{commandSpawned=resolve;});
   client=agentClient({identity,deviceId:approved.deviceId,clientSecret:SERVICE_SECRET,
     fetchFn:createTlsFetch({port:edgeInfo.port,ca:certificate.cert,observed:[]})});
   active=await startWorker(client,approved.deviceId,allowedRoot,trustRevokeExecutionDirectory,
     identity,policyKeys.publicKey,{sleepCommandForTimeout:true,onCommandSpawn:pid=>{
-      trustRevokePid=pid;commandSpawned(pid);
+      trustRevokePid=pid;
     }});
   const trustRevokeWorkerDone=active.done.then(()=>null,error=>error);
   await waitFor(()=>trustStore.registry.listDevices()[0]?.online,'trust-revocation command device session');
   const trustRevokedCall=ownerCall(restartedMcp,'tools/call',72,{name:'run_command',arguments:{
     deviceId:approved.deviceId,path:file,profile:'count_lines',
   }},ownerToken);
-  await trustRevokeStarted;
+  await waitFor(()=>Number.isSafeInteger(trustRevokePid),'trust-revocation command process spawn');
   const trustRevokeIntent=await waitFor(()=>{
     try{return readFileSync(path.join(trustRevokeExecutionDirectory,'i4-execution.jsonl'),'utf8')
       .trim().split('\n').map(line=>JSON.parse(line))

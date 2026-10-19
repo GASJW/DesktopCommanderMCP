@@ -131,8 +131,14 @@ A evidência da release deve identificar a revisão Git, checksum do pacote, res
 
 ### Evidência Windows
 
-- Em Windows nativo e sem elevação: `worker.test.mjs`, `https-client.test.mjs` e `governed-executor.test.mjs` passaram com **44 PASS / 0 FAIL / 6 SKIP**; `windows-security.test.mjs` passou com **5 PASS / 0 FAIL / 0 SKIP**.
-- Os seis skips são cenários que dependem de grupos de processos/sinais Unix, symlink POSIX, troca de diretório por inode ou modos Unix. A cobertura Windows correspondente usa ACL NTFS e junction/reparse, operação cancelável, crash real com recuperação sem replay, DPAPI e locks com identidade de processo.
+- Em Windows nativo, Node **v24.16.0**, a matriz de 83 testes (`worker`, `https-client`, `windows-security`, `identity-store`, `pairing`, `local-mcp-readonly`, CLI de pareamento e templates de serviço) fechou com **76 PASS / 0 FAIL / 7 SKIP**. O Desktop Commander instalado localmente executou leituras MCP reais sob a raiz aprovada.
+- Os sete skips estão identificados no runner: cinco verificações específicas de modos/symlinks POSIX, a injeção de falha em directory `fsync` que resolve o descritor por `/proc`, e um teste de symlink POSIX do MCP. As equivalentes Windows passaram usando DACL NTFS, junction/reparse, substituição `MoveFileEx` write-through, DPAPI CurrentUser e encerramento forçado do processo seguido de recuperação do lock.
+- A suíte Windows do `governed-executor` também havia passado com **44 PASS / 0 FAIL / 6 SKIP**; esse código não mudou nesta correção de harness. O CLI Owner executa no Gateway Linux, não no agente Windows, e foi coberto pela suíte Linux.
 - A suíte HTTPS valida TLS, hostname/CA fixados, autenticação de máquina, replay e leitura por MCP contra fixture local. Ela não é uma sessão autenticada contra o Gateway ativo da VPS.
+
+### Evidência Linux
+
+- Com Node **v22.23.2** e o entrypoint real do Desktop Commander, a suíte integral de `gateway/` e `packages/` fechou com **492 testes / 485 PASS / 0 FAIL / 7 SKIP**. Incluiu o Gateway multi-device, CLI Owner aditivo em revisões não zero, isolamento de grants/rotas, pairing e recuperação após restart/SIGKILL.
+- Depois do ajuste do fixture Windows, `identity-store.test.mjs` foi repetido em Linux com **18 PASS / 0 FAIL / 1 SKIP**. O skip é somente DPAPI CurrentUser, indisponível em Linux.
 
 O Gateway ativo continua em I5F e só autoriza o Client-ID Linux atual. Como este trabalho não pode implantar o candidate nem alterar a autenticação ativa, o handshake cruzado do Gui-PC com esse Gateway fica pendente do rollout multi-device aprovado. O caminho preparado usa SSH local forwarding e mantém o Gateway apenas em loopback.

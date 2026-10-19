@@ -414,13 +414,19 @@ test('two OS processes racing from one trust revision commit at most one writer'
     `;
     const children=['first','second'].map(name=>spawn(process.execPath,
       ['--input-type=module','-e',source,dir,name],{cwd:process.cwd()}));
-    const outputs=children.map(()=> '');
-    let ready=0;
+    const outputs=children.map(()=> ''),errors=children.map(()=> '');
+    let ready=0,exited=0,settled=false,readinessTimer;
+    const fail=error=>{
+      if(settled)return;
+      settled=true;clearTimeout(readinessTimer);
+      for(const child of children)if(child.exitCode===null)child.kill('SIGTERM');
+      reject(error);
+    };
+    readinessTimer=setTimeout(()=>fail(Error(`writer children did not become ready; stdout=${outputs}; stderr=${errors}`)),5000);
     const maybeGo=()=>{
       if(ready===children.length){for(const child of children)child.stdin.write('go\n');}
     };
     const results=[];
-    let exited=0;
     children.forEach((child,index)=>{
       child.stdout.setEncoding('utf8');
       child.stderr.setEncoding('utf8');
@@ -429,11 +435,14 @@ test('two OS processes racing from one trust revision commit at most one writer'
         if(outputs[index].includes('READY\n')){ready++;maybeGo();}
         for(const match of chunk.matchAll(/RESULT:(OK|ERR)\n/g))results.push(match[1]);
       });
-      child.on('error',reject);
+      child.stderr.on('data',chunk=>{errors[index]+=chunk;});
+      child.on('error',fail);
       child.on('exit',(code,signal)=>{
-        if(code!==0)reject(Error(`writer child failed: ${code??signal}; ${outputs[index]}`));
+        if(code!==0){fail(Error(`writer child failed: ${code??signal}; stdout=${outputs[index]}; stderr=${errors[index]}`));return;}
         exited++;
         if(exited===children.length){
+          if(settled)return;
+          settled=true;clearTimeout(readinessTimer);
           try{
             assert.equal(results.filter(x=>x==='OK').length,1);
             assert.equal(results.filter(x=>x==='ERR').length,1);

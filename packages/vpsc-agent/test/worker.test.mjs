@@ -60,6 +60,58 @@ test('worker starts local MCP, authenticates, and dispatches one signed device t
   assert.ok(f.calls.includes('executor-close'));
 });
 
+test('worker skips a cancellation poll when execution settles during heartbeat',async()=>{
+  const f=fixture();let heartbeats=0,polls=0,releaseHeartbeat,activeHeartbeat,handled,worker;
+  const activeHeartbeatStarted=new Promise(resolve=>{activeHeartbeat=resolve;});
+  const executionStarted=new Promise(resolve=>{handled=resolve;});
+  f.client.heartbeat=async()=>{
+    f.calls.push('heartbeat');
+    if(heartbeats++===1){
+      activeHeartbeat();
+      return new Promise(resolve=>{releaseHeartbeat=()=>resolve({status:'alive',deviceId:DEVICE});});
+    }
+    return {status:'alive',deviceId:DEVICE};
+  };
+  f.client.pollControl=async()=>{
+    f.calls.push('poll-control');
+    if(polls++===0)return {frame:{
+      version:1,method:'tools/call',deviceId:DEVICE,sessionId:SESSION,
+      requestId:f.requestId,authorization:AUTHORIZATION,
+      params:{name:'read_file',arguments:{path:'/approved/test.txt'}},
+    },cancel:null};
+    return {frame:null,cancel:null};
+  };
+  f.executor.handle=async value=>{f.calls.push({type:'handle',frame:value});handled();
+    return {content:[{type:'text',text:'ok'}]};};
+  const result=f.client.result;
+  f.client.result=async(...args)=>{const acknowledgement=await result(...args);worker.stop();return acknowledgement;};
+  worker=createAgentWorker({deviceId:DEVICE,client:f.client,executor:f.executor,pollIntervalMs:25});
+  const running=worker.run();
+  await activeHeartbeatStarted;await executionStarted;
+  await new Promise(resolve=>setTimeout(resolve,25));releaseHeartbeat();
+  await running;
+  assert.equal(polls,2);
+  assert.equal(f.calls.filter(item=>item?.type==='result').length,1);
+});
+
+test('graceful stop finishes an in-flight result acknowledgement before disconnecting',async()=>{
+  const f=fixture();let worker,releaseResult,markResultStarted;
+  const resultStarted=new Promise(resolve=>{markResultStarted=resolve;});
+  f.client.result=async(id,value)=>{
+    f.calls.push({type:'result',id,value});markResultStarted();
+    return new Promise(resolve=>{releaseResult=()=>resolve({accepted:true});});
+  };
+  worker=createAgentWorker({deviceId:DEVICE,client:f.client,executor:f.executor,pollIntervalMs:25});
+  const running=worker.run();
+  await resultStarted;
+  assert.equal(worker.stop(),true);
+  assert.equal(f.calls.includes('disconnect'),false);
+  releaseResult();
+  assert.deepEqual(await running,{status:'stopped'});
+  assert.equal(f.calls.filter(item=>item?.type==='result').length,1);
+  assert.ok(f.calls.includes('disconnect'));
+});
+
 test('idle transport ambiguity reconnects with a fresh session without replaying a delivered operation',async()=>{
   const f=fixture(),sessionId=randomUUID();
   let firstPoll=true,taskDelivered=false,reconnects=0;
@@ -107,7 +159,7 @@ test('authenticated cancel control aborts only the active request and reports am
   const frame={version:1,method:'tools/call',deviceId:DEVICE,sessionId:SESSION,
     requestId:f.requestId,authorization:{version:1,claims:{ownerDigest},signature:'A'.repeat(86)},
     params:{name:'run_command',arguments:{profile:'count_lines',path:'/approved/test.txt'}}};
-  let polls=0,handleSignal;
+  let polls=0,handleSignal,releaseCancelAck;
   f.client.pollControl=async()=>{
     f.calls.push('poll-control');
     if(polls++===0)return {frame,cancel:null};
@@ -116,7 +168,7 @@ test('authenticated cancel control aborts only the active request and reports am
     return {frame:null,cancel:null};
   };
   f.client.cancelAck=async value=>{f.calls.push({type:'cancel-ack',value});
-    return {accepted:true,status:value.status};};
+    return new Promise(resolve=>{releaseCancelAck=()=>resolve({accepted:true,status:value.status});});};
   f.executor.handle=async(_value,{signal}={})=>{
     handleSignal=signal;
     return new Promise((_resolve,reject)=>signal.addEventListener('abort',()=>
@@ -128,6 +180,8 @@ test('authenticated cancel control aborts only the active request and reports am
   await waitFor(()=>handleSignal!==undefined);
   await waitFor(()=>f.calls.some(item=>item?.type==='cancel-ack'));
   worker.stop();
+  assert.equal(f.calls.includes('disconnect'),false);
+  releaseCancelAck();
   await running;
   const acknowledgement=f.calls.find(item=>item?.type==='cancel-ack').value;
   assert.equal(acknowledgement.requestId,f.requestId);

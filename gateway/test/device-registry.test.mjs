@@ -148,5 +148,5 @@ test('challenge API never accepts malformed device identifiers or nonce', () => 
 });
 test('registry instance has no filesystem or HTTP side effects', () => {
   const {registry}=withDevice();
-  assert.deepEqual(Object.keys(registry).sort(),['acceptSignedFrame','beginHandshake','completeHandshake','disconnect','heartbeat','isLiveSession','listDevices','revokeDevice','snapshotTrustedDevices','trustDevice'].sort());
+  assert.deepEqual(Object.keys(registry).sort(),['acceptSignedFrame','beginHandshake','completeHandshake','disconnect','heartbeat','isLiveSession','listDevices','replaceTrustedDevices','revokeDevice','snapshotTrustedDevices','trustDevice'].sort());
 });

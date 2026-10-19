@@ -34,7 +34,7 @@ function checkDirectory(directory,{create=false}={}){
     try{st=lstatSync(cursor);}catch(e){
       if(e?.code!=='ENOENT')throw e;
       if(cursor!==directory||!create)throw Error('Missing trusted store directory');
-      mkdirSync(cursor,{mode:0o700});
+      try{mkdirSync(cursor,{mode:0o700});}catch(error){if(error?.code!=='EEXIST')throw error;}
       st=lstatSync(cursor);
     }
     if(!st.isDirectory()||st.isSymbolicLink())throw Error('Unsafe trust directory ancestor');
