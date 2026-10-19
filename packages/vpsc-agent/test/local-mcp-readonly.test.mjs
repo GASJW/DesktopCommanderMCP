@@ -12,6 +12,8 @@ import { createDeviceRouter } from '../../../gateway/devices/router.mjs';
 import { startLoopbackAgentPilot } from '../../../gateway/devices/loopback-pilot.mjs';
 import { createEphemeralPairingIdentity } from '../src/pairing.mjs';
 import { createLoopbackAgentClient } from '../src/loopback-client.mjs';
+import { securePrivateWindowsDirectory, verifyPrivateWindowsDirectory,
+  verifyPrivateWindowsFile } from '../src/windows-security.mjs';
 
 const FIXTURE=fileURLToPath(new URL('./fixtures-readonly-mcp.mjs',import.meta.url));
 const UUID='f1a2b3c4-d5e6-4a9f-8abc-1bb9b99c0001';
@@ -26,6 +28,7 @@ async function sandbox(fn,{entrypoint=FIXTURE}={}){
   const approved=path.join(d,'approved');
   const outside=path.join(d,'outside');
   mkdirSync(approved);
+  if(process.platform==='win32')securePrivateWindowsDirectory(approved);
   mkdirSync(outside);
   const file=path.join(approved,'demo.txt');
   writeFileSync(file,'vpsc-readonly-real-text\n');
@@ -47,6 +50,7 @@ test('remote agent rejects every feature flag URL override to prevent redirect f
   const d=mkdtempSync(path.join(os.tmpdir(),'vpsc-feature-flags-policy-'));
   const approved=path.join(d,'approved');
   mkdirSync(approved);
+  if(process.platform==='win32')securePrivateWindowsDirectory(approved);
   try{
     for(const featureFlagsUrl of [
       'https://desktopcommander.app/flags/v2/production.json',
@@ -70,9 +74,15 @@ test('local MCP child gets a private HOME with only the canonical approved root'
     const config=JSON.parse(readFileSync(configPath,'utf8'));
     assert.deepEqual(config.allowedDirectories,[approved]);
     assert.equal(config.telemetryEnabled,false);
-    assert.equal((statSync(home.directory).mode&0o777),0o700);
-    assert.equal((statSync(path.dirname(configPath)).mode&0o777),0o700);
-    assert.equal((statSync(configPath).mode&0o777),0o600);
+    if(process.platform==='win32'){
+      verifyPrivateWindowsDirectory(home.directory);
+      verifyPrivateWindowsDirectory(path.dirname(configPath));
+      verifyPrivateWindowsFile(configPath);
+    }else{
+      assert.equal((statSync(home.directory).mode&0o777),0o700);
+      assert.equal((statSync(path.dirname(configPath)).mode&0o777),0o700);
+      assert.equal((statSync(configPath).mode&0o777),0o600);
+    }
   }finally{home.close();rmSync(d,{recursive:true,force:true});}
 });
 test('write_file, start_process, get_config and shell are rejected before MCP dispatch',async()=>{

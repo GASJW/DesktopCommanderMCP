@@ -12,6 +12,34 @@ const fail=message=>Object.assign(new Error(message),{code:'INVALID_GRANT_CAPABI
 const sameKeys=(value,expected)=>value&&typeof value==='object'&&!Array.isArray(value)&&
   Object.getPrototypeOf(value)===Object.prototype&&
   Object.keys(value).sort().join(',')===[...expected].sort().join(',');
+function windowsSegmentsAreSafe(parts){
+  return parts.length>0&&parts.every(part=>part&&!part.includes(':')&&
+    !/[<>:"|?*\x00-\x1f]/.test(part)&&!/[. ]$/.test(part));
+}
+function grantPathApi(value){
+  if(process.platform!=='win32')return path;
+  if(typeof value!=='string')return null;
+  if(path.posix.isAbsolute(value)&&path.posix.normalize(value)===value&&
+     !value.includes('\\')&&!value.startsWith('//')&&
+     windowsSegmentsAreSafe(value.slice(1).split('/')))return path.posix;
+  if(/^[A-Za-z]:\\/.test(value)&&path.win32.isAbsolute(value)&&
+     path.win32.resolve(value)===value&&
+     windowsSegmentsAreSafe(value.slice(3).split('\\')))return path.win32;
+  return null;
+}
+function validGrantPath(value,{normalized=false}={}){
+  return typeof value==='string'&&value.length<=4096&&!value.includes('\0')&&
+    (process.platform==='win32'?grantPathApi(value)!==null:
+      path.isAbsolute(value)&&(!normalized||path.normalize(value)===value));
+}
+function windowsGrantPath(allowedRoot,value){
+  const api=grantPathApi(value);
+  if(!validGrantPath(value)||process.platform!=='win32')return null;
+  if(api===path.win32)return path.win32.resolve(value);
+  const driveRoot=path.win32.parse(allowedRoot).root;
+  if(!/^[A-Za-z]:\\$/.test(driveRoot))return null;
+  return path.win32.resolve(driveRoot,...value.slice(1).split('/'));
+}
 
 export function canonicalJson(value){
   if(value===null||typeof value==='string'||typeof value==='boolean')return JSON.stringify(value);
@@ -30,8 +58,7 @@ function validScopeAndConstraints(tool,scope,constraints){
   if(tool==='list_processes')return sameKeys(scope,[])&&
     sameKeys(constraints,['maxJobs'])&&Number.isSafeInteger(constraints.maxJobs)&&
     constraints.maxJobs>=1&&constraints.maxJobs<=32;
-  const hasRoot=scope&&typeof scope.root==='string'&&path.isAbsolute(scope.root)&&
-    path.normalize(scope.root)===scope.root&&!scope.root.includes('\0')&&scope.root.length<=4096;
+  const hasRoot=scope&&validGrantPath(scope.root,{normalized:true});
   if(!hasRoot)return false;
   if(tool==='read_file')return sameKeys(scope,['root'])&&
     sameKeys(constraints,['maxBytes','maxLength','maxOffset'])&&
@@ -88,15 +115,17 @@ export function signToolGrantCapability(claims,privateKey){
   return Object.freeze({version:1,claims:Object.freeze({...claims}),signature});
 }
 
-function inside(root,target,{allowRoot=false}={}){
-  const relative=path.relative(root,target);
+function inside(root,target,{allowRoot=false,pathApi=path}={}){
+  const relative=pathApi.relative(root,target);
   return (allowRoot&&relative==='')||relative!==''&&relative!=='..'&&
-    !relative.startsWith('..'+path.sep)&&!path.isAbsolute(relative);
+    !relative.startsWith('..'+pathApi.sep)&&!pathApi.isAbsolute(relative);
 }
 function pathAllowed(root,filename,{allowRoot=false}={}){
-  if(typeof filename!=='string'||!path.isAbsolute(filename)||filename.length>4096||filename.includes('\0'))return false;
-  const absolute=path.resolve(filename);
-  return inside(root,absolute,{allowRoot});
+  const pathApi=process.platform==='win32'?grantPathApi(filename):path;
+  if(!validGrantPath(root,{normalized:true})||!validGrantPath(filename)||
+     process.platform==='win32'&&grantPathApi(root)!==pathApi)return false;
+  const absolute=pathApi.resolve(filename);
+  return inside(root,absolute,{allowRoot,pathApi});
 }
 function argumentsWithinGrant(claims,args){
   if(!args||Object.getPrototypeOf(args)!==Object.prototype)return false;
@@ -131,9 +160,19 @@ export function verifyToolGrantCapability(value,publicKey,{now=Date.now(),device
     throw fail('Capability does not bind this device, request or operation');
   }
   if(!argumentsWithinGrant(claims,arguments_))throw fail('Operation arguments are outside the granted scope or constraints');
-  if(typeof allowedRoot!=='string'||!path.isAbsolute(allowedRoot)||
-     path.normalize(allowedRoot)!==allowedRoot||claims.tool!=='list_processes'&&
-     !inside(path.resolve(allowedRoot),path.resolve(claims.scope.root),{allowRoot:true})){
+  const validAllowedRoot=typeof allowedRoot==='string'&&(process.platform==='win32'
+    ?/^[A-Za-z]:\\/.test(allowedRoot)&&path.win32.resolve(allowedRoot)===allowedRoot
+    :path.isAbsolute(allowedRoot)&&path.normalize(allowedRoot)===allowedRoot);
+  let scopeWithinRoot=false;
+  if(validAllowedRoot&&claims.tool!=='list_processes'){
+    if(process.platform==='win32'){
+      const scoped=windowsGrantPath(allowedRoot,claims.scope.root);
+      scopeWithinRoot=scoped!==null&&inside(path.win32.resolve(allowedRoot),scoped,
+        {allowRoot:true,pathApi:path.win32});
+    }else scopeWithinRoot=inside(path.resolve(allowedRoot),path.resolve(claims.scope.root),
+      {allowRoot:true});
+  }
+  if(!validAllowedRoot||claims.tool!=='list_processes'&&!scopeWithinRoot){
     throw fail('Capability scope is outside the agent approved root');
   }
   return Object.freeze({...claims,scope:Object.freeze({...claims.scope}),

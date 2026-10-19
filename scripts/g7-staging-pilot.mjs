@@ -12,10 +12,13 @@ import { loadOrCreateDeviceIdentity, bindApprovedDeviceIdentity } from '../packa
 import { analyzeI4ExecutionRecovery } from '../packages/vpsc-agent/src/governed-executor.mjs';
 import { analyzeOwnerPairingRecovery, reconcileOwnerPairingRecovery }
   from '../gateway/dashboard/owner-pairing-reconciliation.mjs';
+import { clearStaleDurableToolGrantLocks } from '../gateway/devices/durable-tool-grants.mjs';
+import { inspectDurableProcessLock } from '../gateway/common/durable-process-lock.mjs';
 
 const ROOT=fileURLToPath(new URL('../',import.meta.url));
 const HOST='g7-staging.test';
 const CLIENT='g7-staging-agent.synthetic';
+const CLIENT2='g7-staging-windows.synthetic';
 const OWNER_ISSUER='https://g7-owner-staging.cloudflareaccess.com';
 const MACHINE_ISSUER='https://g7-machine-staging.cloudflareaccess.com';
 const OWNER_AUD='a'.repeat(64),MACHINE_AUD='b'.repeat(64);
@@ -24,6 +27,12 @@ const DISPLAYED_READ='G7 standalone staging real MCP read\n';
 const TEST_ACTIVE_JOB_SCENARIOS=new Set(['owner-cancel','grant-revoke','device-revoke']);
 const FIXTURE_COMMAND_TIMEOUT_MS=10_000;
 const trace=message=>{if(process.env.VPSC_STAGING_TRACE==='1')process.stderr.write(`[g7-staging] ${message}\n`);};
+function policyLockEvidence(directory){
+  return readdirSync(directory).filter(name=>name.endsWith('.lock')).map(name=>{
+    try{return {name,status:inspectDurableProcessLock(directory,name).status};}
+    catch(error){return {name,status:error?.code??'unverified'};}
+  });
+}
 function ensure(condition,message){if(!condition)throw Error(message);}
 function modeDir(dir){mkdirSync(dir,{recursive:true,mode:0o700});chmodSync(dir,0o700);}
 function privateJson(filename,value){writeFileSync(filename,JSON.stringify(value)+'\n',{mode:0o600,flag:'wx'});chmodSync(filename,0o600);}
@@ -46,9 +55,9 @@ function ownerToken(owner){
   return makeJwt(owner.privateKey,owner.jwk.kid,{iss:OWNER_ISSUER,aud:OWNER_AUD,
     email:OWNER_EMAIL,sub:OWNER_SUBJECT,iat:now-1,exp:now+3600});
 }
-function machineConfig(machine,privateKeyPath,secret){
-  return {issuer:MACHINE_ISSUER,audience:MACHINE_AUD,clientId:CLIENT,jwks:[machine.jwk],
-    signingKeyPath:privateKeyPath,serviceSecret:secret};
+function machineConfig(machine,privateKeyPath,clients){
+  return {issuer:MACHINE_ISSUER,audience:MACHINE_AUD,clients,jwks:[machine.jwk],
+    signingKeyPath:privateKeyPath};
 }
 function waitForEvent(proc,event,timeoutMs=15_000){
   if(proc.events.some(value=>value.event===event))return Promise.resolve(proc.events.find(value=>value.event===event));
@@ -246,11 +255,13 @@ async function runPilot(){
   chmodSync(scratch,0o700);
   trace('private scratch created');
   const gatewayHome=path.join(scratch,'gateway-home'),agentHome=path.join(scratch,'agent-home');
+  const agentHome2=path.join(scratch,'agent-home-2');
   const ownerClientHome=path.join(scratch,'owner-client-home');
   const gatewayTmp=path.join(scratch,'gateway-tmp'),agentTmp=path.join(scratch,'agent-tmp');
+  const agentTmp2=path.join(scratch,'agent-tmp-2');
   const ownerClientTmp=path.join(scratch,'owner-client-tmp');
-  for(const dir of [gatewayHome,agentHome,ownerClientHome,gatewayTmp,agentTmp,ownerClientTmp])modeDir(dir);
-  let gatewayProc,agentProc,agentRestartProc,gatewayRestartProc;
+  for(const dir of [gatewayHome,agentHome,agentHome2,ownerClientHome,gatewayTmp,agentTmp,agentTmp2,ownerClientTmp])modeDir(dir);
+  let gatewayProc,agentProc,agent2Proc,agentRestartProc,gatewayRestartProc;
   const allProcesses=[];
   const launchProcess=(script,args,options)=>{
     const proc=startProcess(script,args,options);allProcesses.push(proc);return proc;
@@ -258,12 +269,15 @@ async function runPilot(){
   let gatewayPort=null,report;
   try{
     const dirs={};
-    for(const name of ['audit','trust','bindings','grants','policy','identity','ledger']){
+    for(const name of ['audit','trust','bindings','grants','policy','identity','identity2','ledger','ledger2']){
       dirs[name]=path.join(scratch,name);modeDir(dirs[name]);
     }
     dirs['allowed-root']=path.join(scratch,'g7-staging-approved-root');modeDir(dirs['allowed-root']);
+    dirs['allowed-root-2']=path.join(scratch,'g7-staging-approved-root-2');modeDir(dirs['allowed-root-2']);
     const inputFile=path.join(dirs['allowed-root'],'approved.txt');
+    const inputFile2=path.join(dirs['allowed-root-2'],'approved.txt');
     writeFileSync(inputFile,DISPLAYED_READ,{mode:0o600,flag:'wx'});
+    writeFileSync(inputFile2,'Second G7 device read\\n',{mode:0o600,flag:'wx'});
     const owner=rsa('g7-staging-owner-i5d-pilot'),machine=rsa('g7-staging-machine');
     const policy=generateKeyPairSync('ed25519');
     const tlsDir=path.join(scratch,'tls');modeDir(tlsDir);
@@ -276,8 +290,12 @@ async function runPilot(){
     writeFileSync(machinePrivate,machine.privateKey.export({format:'pem',type:'pkcs8'}),{mode:0o600,flag:'wx'});
     const controlToken=randomUUID().replaceAll('-','')+randomUUID().replaceAll('-','');
     const serviceSecret=randomUUID().replaceAll('-','')+randomUUID().replaceAll('-','');
+    const serviceSecret2=randomUUID().replaceAll('-','')+randomUUID().replaceAll('-','');
+    ensure(serviceSecret!==serviceSecret2,'M2M device secrets were reused');
     const gatewayConfigPath=path.join(scratch,'gateway.json');
     const agentConfigPath=path.join(scratch,'agent.json');
+    const agentConfigPath2=path.join(scratch,'agent-2.json');
+    const ownerClientConfigPath2=path.join(ownerClientHome,'owner-client-2.json');
     const ownerSigningKeyPath=path.join(ownerClientHome,'owner-signing.key');
     writeFileSync(ownerSigningKeyPath,owner.privateKey.export({format:'pem',type:'pkcs8'}),
       {mode:0o600,flag:'wx'});
@@ -285,11 +303,12 @@ async function runPilot(){
     const ownerPrincipal={issuer:OWNER_ISSUER,subject:OWNER_SUBJECT};
     const ownerDigest=createHash('sha256').update('VPSC-I4-OWNER-v1\n')
       .update(JSON.stringify([OWNER_ISSUER,OWNER_SUBJECT])).digest('hex');
-    privateJson(gatewayConfigPath,{version:1,hostname:HOST,listen:{host:'127.0.0.1',port:0},
+    privateJson(gatewayConfigPath,{version:2,hostname:HOST,listen:{host:'127.0.0.1',port:0},
       tls:{keyPath:tlsKey,certificatePath:tlsCert},
       owner:{issuer:OWNER_ISSUER,audience:OWNER_AUD,email:OWNER_EMAIL,subject:OWNER_SUBJECT,
         origin:`https://${HOST}`,controlToken,jwks:[owner.jwk]},
-      machine:machineConfig(machine,machinePrivate,serviceSecret),
+      machine:machineConfig(machine,machinePrivate,[{clientId:CLIENT,serviceSecret},
+        {clientId:CLIENT2,serviceSecret:serviceSecret2}]),
       policy:{directory:dirs.policy,privateKeyPem:policy.privateKey.export({format:'pem',type:'pkcs8'}),
         publicKeyPem:policy.publicKey.export({format:'pem',type:'spki'})},
       storage:{auditDirectory:dirs.audit,trustDirectory:dirs.trust,
@@ -368,7 +387,50 @@ async function runPilot(){
       'identity binding was not persisted');
     trace('durable M2M binding persisted');
 
-    let policyRevision=ownerProvisioning.grantRevision;
+    const identity2=loadOrCreateDeviceIdentity({directory:dirs.identity2,platform:process.platform});
+    const started2=await post(gatewayPort,readFileSync(tlsCert),'/pairing/start',{
+      name:'g7-i7-synthetic-device-2',platform:process.platform,publicKeyPem:identity2.publicKeyPem,
+    });
+    ensure(started2.status===201,'second synthetic pairing request failed');
+    const pairing2=started2.json;
+    const proof2=identity2.prove(pairing2);
+    const proved2=await post(gatewayPort,readFileSync(tlsCert),'/pairing/prove',{
+      requestId:pairing2.requestId,proof:proof2,
+    });
+    ensure(proved2.status===200&&proved2.json.proved===true,'second Ed25519 pairing proof failed');
+    privateJson(ownerClientConfigPath2,{...ownerClientConfig,machineClientId:CLIENT2,
+      allowedRoot:dirs['allowed-root-2']});
+    const ownerProvisioning2=JSON.parse(execFileSync(process.execPath,
+      [path.join(ROOT,'scripts/g7-staging-owner-provision.mjs'),'--add-device','--config',ownerClientConfigPath2],{
+        cwd:ROOT,encoding:'utf8',maxBuffer:64*1024,timeout:20_000,
+        input:JSON.stringify({requestId:pairing2.requestId,code:pairing2.displayCode,
+          fingerprint:pairing2.fingerprint,expectedTrustRevision:1,
+          expectedBindingRevision:1,expectedPolicyRevision:1})+'\n',
+        env:{PATH:'/usr/bin:/bin',HOME:ownerClientHome,TMPDIR:ownerClientTmp,LANG:'C.UTF-8'},
+      }));
+    ensure(ownerProvisioning2.status==='provisioned'&&ownerProvisioning2.clientId===CLIENT2&&
+      ownerProvisioning2.deviceId!==deviceId&&ownerProvisioning2.fingerprint===pairing2.fingerprint&&
+      ownerProvisioning2.fingerprint!==identity.fingerprint&&
+      ownerProvisioning2.binding?.bindingRevision===2&&ownerProvisioning2.grantRevision===2,
+      'add-device Owner flow did not preserve revision-1 state or isolate the second device');
+    const deviceId2=ownerProvisioning2.deviceId;
+    const boundIdentity2=bindApprovedDeviceIdentity({directory:dirs.identity2,
+      machineBinding:ownerProvisioning2.binding});
+    ensure(boundIdentity2.deviceBinding.bindingEventId===ownerProvisioning2.binding.bindingEventId,
+      'second durable M2M binding was not persisted');
+    const crossChallenge1=await post(gatewayPort,readFileSync(tlsCert),'/agent/challenge',{
+      deviceId:deviceId2,
+    },{headers:{'cf-access-client-id':CLIENT,'cf-access-client-secret':serviceSecret}});
+    const crossChallenge2=await post(gatewayPort,readFileSync(tlsCert),'/agent/challenge',{
+      deviceId,
+    },{headers:{'cf-access-client-id':CLIENT2,'cf-access-client-secret':serviceSecret2}});
+    const invalidSecondSecret=await post(gatewayPort,readFileSync(tlsCert),'/agent/challenge',{
+      deviceId:deviceId2,
+    },{headers:{'cf-access-client-id':CLIENT2,'cf-access-client-secret':`${serviceSecret}x`}});
+    ensure(crossChallenge1.status===403&&crossChallenge2.status===403&&invalidSecondSecret.status===403,
+      'M2M credentials crossed device bindings or reused the first device secret');
+
+    let policyRevision=ownerProvisioning2.grantRevision;
     const grant=async(tool,scope,constraints)=>{
       const response=await post(gatewayPort,readFileSync(tlsCert),'/stage/grant',{
         deviceId,expectedRevision:policyRevision,tool,scope,constraints,
@@ -381,25 +443,40 @@ async function runPilot(){
     const writeGrant=await grant('write_file',{root:dirs['allowed-root']},{maxBytes:65_536});
     const commandGrant=await grant('run_command',{root:dirs['allowed-root'],profile:'count_lines'},
       {maxOutputBytes:4096,maxRuntimeMs:FIXTURE_COMMAND_TIMEOUT_MS,profile:'count_lines'});
-    ensure(readGrant.deviceId===deviceId&&writeGrant.deviceId===deviceId,'grant identity binding mismatch');
+    const secondReadGrant=ownerProvisioning2.grant;
+    ensure(readGrant.deviceId===deviceId&&writeGrant.deviceId===deviceId&&
+      secondReadGrant.deviceId===deviceId2&&secondReadGrant.scope.root===dirs['allowed-root-2'],
+      'per-device grant identity binding mismatch');
     trace('durable grants committed');
 
-    const makeAgentConfig=port=>({version:1,hostname:HOST,port,deviceId,clientId:CLIENT,clientSecret:serviceSecret,
-      identityDirectory:dirs.identity,allowedRoot:dirs['allowed-root'],ledgerDirectory:dirs.ledger,
-      mcpEntrypoint:path.resolve(mcpEntrypoint),policyPublicKeyPem:policy.publicKey.export({format:'pem',type:'spki'}),
+    const policyPublicKeyPem=policy.publicKey.export({format:'pem',type:'spki'});
+    const makeAgentConfig=port=>({version:1,hostname:HOST,port,deviceId,clientId:CLIENT,
+      clientSecret:serviceSecret,identityDirectory:dirs.identity,allowedRoot:dirs['allowed-root'],
+      ledgerDirectory:dirs.ledger,mcpEntrypoint:path.resolve(mcpEntrypoint),policyPublicKeyPem,
+      caPath:tlsCert,pollIntervalMs:25});
+    const makeAgentConfig2=port=>({version:1,hostname:HOST,port,deviceId:deviceId2,clientId:CLIENT2,
+      clientSecret:serviceSecret2,identityDirectory:dirs.identity2,allowedRoot:dirs['allowed-root-2'],
+      ledgerDirectory:dirs.ledger2,mcpEntrypoint:path.resolve(mcpEntrypoint),policyPublicKeyPem,
       caPath:tlsCert,pollIntervalMs:25});
     privateJson(agentConfigPath,makeAgentConfig(gatewayPort));
+    privateJson(agentConfigPath2,makeAgentConfig2(gatewayPort));
     const startAgent=()=>launchProcess(path.join(ROOT,'packages/vpsc-agent/bin/g7-staging-worker.mjs'),
       ['--config',agentConfigPath],{home:agentHome,tmp:agentTmp,testActiveJob:fixtureRequested});
+    const startAgent2=()=>launchProcess(path.join(ROOT,'packages/vpsc-agent/bin/g7-staging-worker.mjs'),
+      ['--config',agentConfigPath2],{home:agentHome2,tmp:agentTmp2});
     agentProc=startAgent();
     const agentReady=await waitForEvent(agentProc,'READY');
     await waitForEvent(agentProc,'ONLINE');
-    trace('agent process connected');
-    ensure(agentReady.deviceId===deviceId,'agent connected as wrong device');
+    agent2Proc=startAgent2();
+    const agent2Ready=await waitForEvent(agent2Proc,'READY');
+    await waitForEvent(agent2Proc,'ONLINE');
+    trace('two independent device agents connected');
+    ensure(agentReady.deviceId===deviceId&&agent2Ready.deviceId===deviceId2,
+      'an agent connected using the wrong durable device identity');
 
     let rpcId=0;
-    const ownerCall=async(name,args,{signal}={})=>post(gatewayPort,readFileSync(tlsCert),'/mcp',{
-      jsonrpc:'2.0',id:++rpcId,method:'tools/call',params:{name,arguments:{deviceId,...args}},
+    const ownerCall=async(name,args,{signal,targetDeviceId=deviceId}={})=>post(gatewayPort,readFileSync(tlsCert),'/mcp',{
+      jsonrpc:'2.0',id:++rpcId,method:'tools/call',params:{name,arguments:{deviceId:targetDeviceId,...args}},
     },{headers:authHeaders,signal});
     let preExecutionCancellation=null;
     if(activeJobScenario==='owner-cancel'){
@@ -432,6 +509,18 @@ async function runPilot(){
     const read1=assertMcpOk(await ownerCall('read_file',{path:inputFile}),'real MCP read');
     trace('real MCP read completed');
     ensure(JSON.stringify(read1).includes(DISPLAYED_READ.trim()),'real Desktop Commander MCP did not return file content');
+    const readDevice2=assertMcpOk(await ownerCall('read_file',{path:inputFile2},{targetDeviceId:deviceId2}),
+      'second-device MCP read');
+    ensure(JSON.stringify(readDevice2).includes('Second G7 device read'),
+      'second device did not receive its own routed MCP read');
+    const crossRead1=await ownerCall('read_file',{path:inputFile2});
+    const crossRead2=await ownerCall('read_file',{path:inputFile},{targetDeviceId:deviceId2});
+    ensure(!JSON.stringify(crossRead1).includes('Second G7 device read')&&
+      !JSON.stringify(crossRead2).includes(DISPLAYED_READ.trim())&&
+      (crossRead1.status>=400||crossRead1.json?.result?.isError===true)&&
+      (crossRead2.status>=400||crossRead2.json?.result?.isError===true),
+      'device-scoped grants exposed another device root');
+    trace('two device routes and grant isolation passed');
     const outputFile=path.join(dirs['allowed-root'],'created-by-governed-tool.txt');
     const write=assertMcpOk(await ownerCall('write_file',{path:outputFile,
       content:'I4 governed create-only write\n',mode:'create'}),'governed write');
@@ -460,14 +549,37 @@ async function runPilot(){
     ensure(JSON.stringify(readAfterAgentRestart).includes(DISPLAYED_READ.trim()),'agent restart lost real MCP access');
 
     await stopProcess(agentRestartProc,'SIGTERM');agentRestartProc=null;
+    await stopProcess(agent2Proc,'SIGTERM');agent2Proc=null;
+    trace(`policy lock evidence before graceful Gateway stop ${JSON.stringify(policyLockEvidence(dirs.grants))}`);
     const gatewayStopped=waitForEvent(gatewayProc,'STOPPED');
     await stopProcess(gatewayProc,'SIGTERM');await gatewayStopped;gatewayProc=null;
+    trace(`policy lock evidence after graceful Gateway stop ${JSON.stringify(policyLockEvidence(dirs.grants))}`);
+    ensure(allProcesses.every(proc=>proc.stopVerified===true),
+      'a known writer remained live during graceful policy lock recovery');
+    const gracefulTrustRecovery=reconcileOwnerPairingRecovery({auditDirectory:dirs.audit,
+      trustDirectory:dirs.trust,operatorConfirmedNoActiveWriters:true});
+    ensure(['NO_INTENT','CONSISTENT','LEGACY_UNBOUND','RECONCILED_NO_INTENT',
+      'RECONCILED_CONSISTENT','RECONCILED_LEGACY_UNBOUND'].includes(gracefulTrustRecovery.state),
+      `graceful Gateway shutdown left trust state requiring review: ${gracefulTrustRecovery.state}`);
+    trace(`graceful trust recovery ${gracefulTrustRecovery.state}`);
+    const gracefulPolicyLockRecovery=clearStaleDurableToolGrantLocks({directory:dirs.grants,
+      operatorConfirmedNoActiveWriters:true,operatorConfirmedNoActiveRecovery:true});
+    ensure(gracefulPolicyLockRecovery.temporaryFileCount===0,
+      'graceful Gateway shutdown left temporary policy evidence requiring review');
+    trace(`graceful policy recovery cleared=${gracefulPolicyLockRecovery.cleared}`);
     gatewayRestartProc=launchProcess(path.join(ROOT,'gateway/staging/server.mjs'),
       ['--config',gatewayConfigPath],{home:gatewayHome,tmp:gatewayTmp});
-    const gatewayRestartReady=await waitForEvent(gatewayRestartProc,'READY');gatewayPort=gatewayRestartReady.port;
+    let gatewayRestartReady;
+    try{gatewayRestartReady=await waitForEvent(gatewayRestartProc,'READY');}
+    catch(error){
+      trace(`policy files after graceful restart failure ${JSON.stringify(readdirSync(dirs.grants))}`);
+      trace(`policy locks after graceful restart failure ${JSON.stringify(policyLockEvidence(dirs.grants))}`);
+      throw error;
+    }
+    gatewayPort=gatewayRestartReady.port;
     const restored=await waitHealth(gatewayPort,readFileSync(tlsCert));
     trace('Gateway graceful restart restored durable state');
-    ensure(restored.trustRevision===1&&restored.policyRevision===3&&restored.bindingRevision===1,
+    ensure(restored.trustRevision===2&&restored.policyRevision===4&&restored.bindingRevision===2,
       'Gateway durable trust, binding or grant revision did not survive restart');
     replacePrivateJson(agentConfigPath,makeAgentConfig(gatewayPort));
     agentRestartProc=startAgent();
@@ -477,9 +589,19 @@ async function runPilot(){
     const readAfterGatewayRestart=assertMcpOk(await ownerCall('read_file',{path:inputFile}),
       'read after Gateway restart');
     ensure(JSON.stringify(readAfterGatewayRestart).includes(DISPLAYED_READ.trim()),'Gateway restart lost approved device');
+    replacePrivateJson(agentConfigPath2,makeAgentConfig2(gatewayPort));
+    agent2Proc=startAgent2();
+    const agent2AfterGatewayRestart=await waitForEvent(agent2Proc,'READY');
+    await waitForEvent(agent2Proc,'ONLINE');
+    ensure(agent2AfterGatewayRestart.deviceId===deviceId2,'second agent failed after Gateway restart');
+    const secondReadAfterGatewayRestart=assertMcpOk(await ownerCall('read_file',{path:inputFile2},
+      {targetDeviceId:deviceId2}),'second device read after Gateway restart');
+    ensure(JSON.stringify(secondReadAfterGatewayRestart).includes('Second G7 device read'),
+      'Gateway restart lost second device grants');
     trace('new session passed post-restart real MCP read');
 
     await stopProcess(agentRestartProc,'SIGTERM');agentRestartProc=null;
+    await stopProcess(agent2Proc,'SIGTERM');agent2Proc=null;
     await stopProcess(gatewayRestartProc,'SIGKILL');gatewayRestartProc=null;
     ensure(allProcesses.every(proc=>proc.stopVerified===true),
       'a known Gateway or agent process group remained live at reconciliation time');
@@ -487,16 +609,29 @@ async function runPilot(){
     const crashEvidence=analyzeOwnerPairingRecovery({auditDirectory:dirs.audit,trustDirectory:dirs.trust});
     ensure(crashEvidence.state==='CONSISTENT_LOCK_HELD'&&crashEvidence.auditLockPresent===true&&
       crashEvidence.auditLockStatus==='dead'&&
-      (!crashEvidence.trustLockPresent||crashEvidence.trustLockStatus==='dead'),
+      (!crashEvidence.trustLockPresent||crashEvidence.trustLockStatus==='dead'||
+        crashEvidence.trustOperationGateStatus==='dead'||
+        crashEvidence.trustDispatchPermitStatuses?.includes('dead')),
       `Gateway SIGKILL recovery evidence was not safe: ${JSON.stringify(crashEvidence)}`);
     const crashRecovery=reconcileOwnerPairingRecovery({auditDirectory:dirs.audit,
       trustDirectory:dirs.trust,operatorConfirmedNoActiveWriters:true});
     ensure(crashRecovery.state==='RECONCILED_CONSISTENT',
       `Gateway SIGKILL recovery did not reconcile consistently: ${crashRecovery.state}`);
+    const policyLockRecovery=clearStaleDurableToolGrantLocks({directory:dirs.grants,
+      operatorConfirmedNoActiveWriters:true,operatorConfirmedNoActiveRecovery:true});
+    ensure(policyLockRecovery.temporaryFileCount===0,
+      'Gateway SIGKILL left temporary policy evidence requiring operator review');
+    trace(`policy recovery cleared=${policyLockRecovery.cleared} remaining=${JSON.stringify(policyLockEvidence(dirs.grants))}`);
     trace('stale locks reconciled after captured Gateway process groups were verified stopped');
     gatewayRestartProc=launchProcess(path.join(ROOT,'gateway/staging/server.mjs'),
       ['--config',gatewayConfigPath],{home:gatewayHome,tmp:gatewayTmp});
-    const gatewayAfterSigkillReady=await waitForEvent(gatewayRestartProc,'READY');
+    let gatewayAfterSigkillReady;
+    try{gatewayAfterSigkillReady=await waitForEvent(gatewayRestartProc,'READY');}
+    catch(error){
+      trace(`policy files after SIGKILL restart failure ${JSON.stringify(readdirSync(dirs.grants))}`);
+      trace(`policy locks after SIGKILL restart failure ${JSON.stringify(policyLockEvidence(dirs.grants))}`);
+      throw error;
+    }
     gatewayPort=gatewayAfterSigkillReady.port;
     const restoredAfterSigkill=await waitHealth(gatewayPort,readFileSync(tlsCert));
     ensure(restoredAfterSigkill.trustRevision===restored.trustRevision&&
@@ -513,13 +648,24 @@ async function runPilot(){
       'read after Gateway SIGKILL restart');
     ensure(JSON.stringify(readAfterGatewaySigkill).includes(DISPLAYED_READ.trim()),
       'Gateway SIGKILL restart lost approved device access');
+    replacePrivateJson(agentConfigPath2,makeAgentConfig2(gatewayPort));
+    agent2Proc=startAgent2();
+    const agent2AfterGatewaySigkill=await waitForEvent(agent2Proc,'READY');
+    await waitForEvent(agent2Proc,'ONLINE');
+    ensure(agent2AfterGatewaySigkill.deviceId===deviceId2,
+      'second agent failed to establish a fresh session after Gateway SIGKILL');
+    const secondReadAfterGatewaySigkill=assertMcpOk(await ownerCall('read_file',{path:inputFile2},
+      {targetDeviceId:deviceId2}),'second device read after Gateway SIGKILL restart');
+    ensure(JSON.stringify(secondReadAfterGatewaySigkill).includes('Second G7 device read'),
+      'Gateway SIGKILL restart lost second device access');
     trace('new session passed post-Gateway-SIGKILL real MCP read');
 
     const revokeGrant=await post(gatewayPort,readFileSync(tlsCert),'/stage/revoke-grant',{
       deviceId,expectedRevision:policyRevision,grantId:writeGrant.grantId,
     },{headers:controlHeaders});
-    ensure(revokeGrant.status===200&&revokeGrant.json.revision===4,'grant revocation was not durable');
-    policyRevision=4;
+    ensure(revokeGrant.status===200&&revokeGrant.json.revision===policyRevision+1,
+      'grant revocation was not durable');
+    policyRevision=revokeGrant.json.revision;
     trace('grant revoked');
     const deniedWrite=await ownerCall('write_file',{path:path.join(dirs['allowed-root'],'revoked-write.txt'),
       content:'must not be created\n',mode:'create'});
@@ -585,7 +731,7 @@ async function runPilot(){
         },{headers:controlHeaders});
         const revocationResponseNs=process.hrtime.bigint();
         ensure(revokedDevice.status===200&&revokedDevice.json.revoked===true&&
-          revokedDevice.json.trustRevision===2,'active device trust revocation was not durable');
+          revokedDevice.json.trustRevision===3,'active device trust revocation was not durable');
         const jobStartedNs=BigInt(started.monotonicNs);
         const commitElapsedMs=Number(revocationResponseNs-jobStartedNs)/1_000_000;
         const commitBeforeCommandTimeout=commitElapsedMs<FIXTURE_COMMAND_TIMEOUT_MS-500;
@@ -638,26 +784,46 @@ async function runPilot(){
       revokedDevice=await post(gatewayPort,readFileSync(tlsCert),'/stage/revoke-device',{
         clientId:CLIENT,deviceId,
       },{headers:controlHeaders});
-      ensure(revokedDevice.status===200&&revokedDevice.json.revoked===true&&revokedDevice.json.trustRevision===2,
+      ensure(revokedDevice.status===200&&revokedDevice.json.revoked===true&&revokedDevice.json.trustRevision===3,
         'device revocation was not durably committed');
     }
     const afterDeviceRevoke=await ownerCall('read_file',{path:inputFile});
     ensure(afterDeviceRevoke.status===403&&afterDeviceRevoke.json?.error!==undefined,
       'revoked device received a new dispatch');
+    const secondStillAuthorized=assertMcpOk(await ownerCall('read_file',{path:inputFile2},
+      {targetDeviceId:deviceId2}),'second device read after first device revocation');
+    ensure(JSON.stringify(secondStillAuthorized).includes('Second G7 device read'),
+      'revoking the first device affected the independent second device');
+    const revokedDevice2=await post(gatewayPort,readFileSync(tlsCert),'/stage/revoke-device',{
+      clientId:CLIENT2,deviceId:deviceId2,
+    },{headers:controlHeaders});
+    ensure(revokedDevice2.status===200&&revokedDevice2.json.revoked===true&&
+      revokedDevice2.json.trustRevision===4,'second device revocation was not independent and durable');
+    const afterSecondDeviceRevoke=await ownerCall('read_file',{path:inputFile2},{targetDeviceId:deviceId2});
+    ensure(afterSecondDeviceRevoke.status===403&&afterSecondDeviceRevoke.json?.error!==undefined,
+      'second revoked device received a new dispatch');
 
     await stopProcess(agentRestartProc,'SIGTERM');agentRestartProc=null;
+    await stopProcess(agent2Proc,'SIGTERM');agent2Proc=null;
     const ledger=analyzeI4ExecutionRecovery({ledgerDirectory:dirs.ledger});
     ensure(ledger.automaticReplay===false&&ledger.automaticLockRemoval===false,
       'I4 recovery contract enabled automatic replay or lock removal');
     ensure(ledger.status==='consistent'||ledger.status==='ambiguous-outcome',
       `unexpected I4 ledger recovery state: ${ledger.status}`);
     const auditText=readFileSync(path.join(dirs.audit,'owner-decisions-v1.jsonl'),'utf8');
-    const forbidden=[ownerJwt,serviceSecret,controlToken,pairing.nonce,pairing.displayCode,
+    const forbidden=[ownerJwt,serviceSecret,serviceSecret2,controlToken,pairing.nonce,pairing.displayCode,
+      pairing2.nonce,pairing2.displayCode,
       owner.privateKey.export({format:'pem',type:'pkcs8'}).toString(),
       machine.privateKey.export({format:'pem',type:'pkcs8'}).toString()];
     ensure(forbidden.every(secret=>!auditText.includes(secret)),'synthetic credentials leaked into owner WAL');
     report={status:'pass_with_limitations',gateway:{processIndependent:true,pid:gatewayReady.pid},
       agent:{processIndependent:true,pid:agentReady.pid,deviceId},
+      devices:{count:2,distinctDeviceIds:deviceId!==deviceId2,
+        distinctFingerprints:identity.fingerprint!==identity2.fingerprint,
+        distinctM2mClientIds:CLIENT!==CLIENT2,distinctM2mSecrets:serviceSecret!==serviceSecret2,
+        secondDeviceId:deviceId2,secondBindingRevision:ownerProvisioning2.binding.bindingRevision,
+        secondGrantRevision:ownerProvisioning2.grantRevision,routingIsolation:true,
+        independentRevocation:revokedDevice.json.trustRevision===3&&revokedDevice2.json.trustRevision===4},
       https:{tlsValidated:true,hostname:HOST,loopbackOnly:true},
       ownerAuthentication:{verified:true,separateFromMachine:true,
         provisioningClientProcess:true,durableApproval:true,durableBinding:true,durableGrant:true},
@@ -665,8 +831,14 @@ async function runPilot(){
       operations:{realMcpRead:true,governedWrite:true,revokedGrantDenied:true},
       restart:{agent:true,gateway:true,identityPersistent:true,newGatewaySession:true,
         gatewayAfterSigkill:true,gatewayAfterSigkillRecovery:crashRecovery.state,
+        gracefulTrustRecovery:gracefulTrustRecovery.state,
+        gracefulPolicyLockRecovery:{cleared:gracefulPolicyLockRecovery.cleared,
+          temporaryFileCount:gracefulPolicyLockRecovery.temporaryFileCount},
+        policyLockRecovery:{cleared:policyLockRecovery.cleared,
+          temporaryFileCount:policyLockRecovery.temporaryFileCount},
         gatewayAfterSigkillTrustRevision:restoredAfterSigkill.trustRevision,
-        trustRevision:restored.trustRevision,policyRevision:restored.policyRevision},
+        trustRevision:restored.trustRevision,policyRevision:restored.policyRevision,
+        bindingRevision:restored.bindingRevision},
       revocation:{grantBlocksDispatch:true,deviceBlocksDispatch:true,trustRevision:revokedDevice.json.trustRevision},
       security:{invalidOwnerRejected:true,ownerTokenRejectedByMachineIngress:true,
         invalidMachineSecretRejected:true,mismatchedMachineClientIdRejected:true,

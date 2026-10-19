@@ -8,6 +8,7 @@ const ROUTES=new Set(['/agent/challenge','/agent/connect','/agent/heartbeat',
   '/agent/poll','/agent/result','/agent/cancel-ack','/agent/disconnect']);
 const MAX_BYTES=256*1024;
 const MAX_RESPONSE=512*1024;
+const MAX_CLOCK_OFFSET_MS=5*60_000;
 const NONCE=/^[A-Za-z0-9_-]{43}$/;
 export class HttpsAgentError extends Error{
   constructor(code,message){super(message);this.name='HttpsAgentError';this.code=code;}
@@ -56,14 +57,21 @@ export function createHttpsAgentClient({
      identity.deviceBinding.fingerprint!==identity.fingerprint)){
     throw fail('CONFIG','HTTPS client identity differs from its durable approval binding');
   }
-  let sessionId=null,sequence=0,closed=false;
-  function ambiguousResponse(){
+  let sessionId=null,sequence=0,closed=false,permanentlyClosed=false,deliveredRequestId=null;
+  let gatewayClockOffsetMs=0;
+  const gatewayNowMs=()=>Date.now()+gatewayClockOffsetMs;
+  function ambiguousResponse(activeRequestId){
+    if(UUID.test(activeRequestId??'')){
+      // Keep the delivered session fenced to its one result/control path. The
+      // Gateway accepts only a strictly larger signed sequence after a lost reply.
+      throw fail('CONTROL_POLL_UNAVAILABLE','Active control response is unavailable');
+    }
     // A route may have consumed a challenge, advanced a frame sequence, or
     // accepted a result before the response became unusable. Fence this client.
     closed=true;sessionId=null;sequence=0;
     throw fail('AMBIGUOUS_TRANSPORT','Agent response invalid; request outcome unknown');
   }
-  async function request(route,data,authenticate=false){
+  async function request(route,data,authenticate=false,signal,activeRequestId){
     if(closed)throw fail('CLOSED','Agent client closed');
     if(!ROUTES.has(route))throw fail('CONFIG','Unknown agent route');
     const body=JSON.stringify(data);
@@ -87,11 +95,15 @@ export function createHttpsAgentClient({
     }
     let response;
     try{
+      const requestSignal=signal?AbortSignal.any([signal,AbortSignal.timeout(timeoutMs)]):AbortSignal.timeout(timeoutMs);
       response=await fetchFn(origin+route,{
         method:'POST',headers,body,redirect:'error',
-        cache:'no-store',credentials:'omit',signal:AbortSignal.timeout(timeoutMs),
+        cache:'no-store',credentials:'omit',signal:requestSignal,
       });
     }catch{
+      if((route==='/agent/poll'||route==='/agent/heartbeat')&&UUID.test(activeRequestId??'')){
+        throw fail('CONTROL_POLL_UNAVAILABLE','Active control transport is unavailable');
+      }
       // Once the network request started, never assume the operation was not
       // delivered. No implicit replay after an uncertain outcome.
       closed=true;sessionId=null;sequence=0;
@@ -99,13 +111,22 @@ export function createHttpsAgentClient({
     }
     if(!response||typeof response.status!=='number'||
        !response.headers?.get?.('content-type')?.toLowerCase().includes('application/json')){
-      return ambiguousResponse();
+      return ambiguousResponse(activeRequestId);
     }
     if(!response.ok){
       if(response.status>=400&&response.status<500){
+        if(route==='/agent/result'&&response.status===409){
+          throw fail('RESULT_NOT_ACCEPTED','Gateway no longer accepts this delivered result');
+        }
         throw fail('REJECTED','Agent ingress denied request: '+response.status);
       }
-      return ambiguousResponse();
+      return ambiguousResponse(activeRequestId);
+    }
+    // Trust Gateway time only after the configured HTTPS fetch verifies its certificate.
+    const gatewayDate=Date.parse(response.headers.get('date')??'');
+    const clockOffset=Number.isFinite(gatewayDate)?gatewayDate-Date.now():NaN;
+    if(Number.isFinite(clockOffset)&&Math.abs(clockOffset)<=MAX_CLOCK_OFFSET_MS){
+      gatewayClockOffsetMs=clockOffset;
     }
     let total=0;const chunks=[];
     try{
@@ -120,39 +141,60 @@ export function createHttpsAgentClient({
         throw Error('Invalid JSON response');
       }
       return parsed;
-    }catch{return ambiguousResponse();}
+    }catch{return ambiguousResponse(activeRequestId);}
   }
-  async function connect(){
+  async function connect({signal}={}){
     if(sessionId)throw fail('STATE','Already connected');
-    const challenge=await request('/agent/challenge',{deviceId});
+    const challenge=await request('/agent/challenge',{deviceId},false,signal);
     if(!exactKeys(challenge,'deviceId,expiresInMs,nonce')||challenge.deviceId!==deviceId||
        !NONCE.test(challenge.nonce)||!Number.isSafeInteger(challenge.expiresInMs)||
        challenge.expiresInMs<1||challenge.expiresInMs>60_000)return ambiguousResponse();
     const proof=identity.proveDeviceChallenge(challenge);
-    const current=await request('/agent/connect',{deviceId,signature:proof});
+    const current=await request('/agent/connect',{deviceId,signature:proof},false,signal);
     if(!exactKeys(current,'deviceId,sessionId')||current.deviceId!==deviceId||
        typeof current.sessionId!=='string'||!UUID.test(current.sessionId))return ambiguousResponse();
     sessionId=current.sessionId;sequence=0;
     return Object.freeze({deviceId,sessionId});
   }
-  async function heartbeat(){
-    const answer=await request('/agent/heartbeat',{},true);
+  async function reconnect({signal}={}){
+    if(permanentlyClosed||!closed||sessionId!==null)
+      throw fail('STATE','Only an ambiguous open-client session can reconnect');
+    closed=false;sequence=0;
+    return connect({signal});
+  }
+  async function heartbeat({signal,activeRequestId}={}){
+    if(activeRequestId!==undefined&&activeRequestId!==deliveredRequestId){
+      throw fail('STATE','Active heartbeat must match the delivered operation');
+    }
+    const safeActiveRequestId=activeRequestId===deliveredRequestId?activeRequestId:undefined;
+    const answer=await request('/agent/heartbeat',{},true,signal,safeActiveRequestId);
     if(!exactKeys(answer,'deviceId,status')||answer.deviceId!==deviceId||answer.status!=='alive'){
       return ambiguousResponse();
     }
     return answer;
   }
-  async function poll(){
-    const answer=await request('/agent/poll',{},true);
+  async function poll({signal}={}){
+    if(deliveredRequestId!==null)throw fail('STATE','Cannot dequeue while a delivered operation is active');
+    const answer=await request('/agent/poll',{},true,signal);
     if(!exactKeys(answer,'frame')&& !exactKeys(answer,'cancel,frame'))return ambiguousResponse();
     if(!(answer.frame===null||
        answer.frame&&typeof answer.frame==='object'&&!Array.isArray(answer.frame))){
       return ambiguousResponse();
     }
+    if(answer.frame!==null){
+      if(!UUID.test(answer.frame?.requestId??'')||answer.frame.deviceId!==deviceId||
+         answer.frame.sessionId!==sessionId)return ambiguousResponse();
+      deliveredRequestId=answer.frame.requestId;
+    }
     return answer.frame;
   }
-  async function pollControl(){
-    const answer=await request('/agent/poll',{},true);
+  async function pollControl({signal,activeRequestId}={}){
+    if(activeRequestId!==undefined&&activeRequestId!==deliveredRequestId||
+       activeRequestId===undefined&&deliveredRequestId!==null){
+      throw fail('STATE','Control poll must match the current delivered operation');
+    }
+    const safeActiveRequestId=activeRequestId===deliveredRequestId?activeRequestId:undefined;
+    const answer=await request('/agent/poll',{},true,signal,safeActiveRequestId);
     if(!exactKeys(answer,'frame')&&!exactKeys(answer,'cancel,frame'))return ambiguousResponse();
     if(!(answer.frame===null||answer.frame&&typeof answer.frame==='object'&&!Array.isArray(answer.frame))||
        !(answer.cancel===undefined||answer.cancel===null||
@@ -164,7 +206,14 @@ export function createHttpsAgentClient({
         answer.cancel.version!==1||answer.cancel.type!=='cancel'||
         answer.cancel.deviceId!==deviceId||answer.cancel.sessionId!==sessionId||
         !UUID.test(answer.cancel.requestId??'')||!/^[a-f0-9]{64}$/.test(answer.cancel.ownerDigest??''))){
-      return ambiguousResponse();
+      return ambiguousResponse(activeRequestId);
+    }
+    if(answer.frame!==null){
+      if(deliveredRequestId!==null||!UUID.test(answer.frame?.requestId??'')||
+         answer.frame.deviceId!==deviceId||answer.frame.sessionId!==sessionId){
+        return ambiguousResponse();
+      }
+      deliveredRequestId=answer.frame.requestId;
     }
     return Object.freeze({frame:answer.frame,cancel:answer.cancel??null});
   }
@@ -173,7 +222,7 @@ export function createHttpsAgentClient({
     try{
       const result=await request('/agent/disconnect',{},true);
       if(!exactKeys(result,'disconnected')||result.disconnected!==true)return ambiguousResponse();
-      sessionId=null;sequence=0;
+      sessionId=null;sequence=0;deliveredRequestId=null;
       return Object.freeze({disconnected:true});
     }catch(error){
       // The disconnect may have reached the Gateway even if its response was
@@ -182,27 +231,29 @@ export function createHttpsAgentClient({
       throw error;
     }
   }
-  const result=async(requestId,value)=>{
+  const result=async(requestId,value,{signal}={})=>{
     if(typeof requestId!=='string'||!UUID.test(requestId)){
       throw fail('BAD_PAYLOAD','Invalid remote request id');
     }
-    const answer=await request('/agent/result',{requestId,result:value},true);
+    const answer=await request('/agent/result',{requestId,result:value},true,signal);
     if(!exactKeys(answer,'accepted')||answer.accepted!==true)return ambiguousResponse();
+    if(deliveredRequestId===requestId)deliveredRequestId=null;
     return answer;
   };
-  async function cancelAck({requestId,ownerDigest,status}={}){
+  async function cancelAck({requestId,ownerDigest,status,signal}={}){
     if(typeof requestId!=='string'||!UUID.test(requestId)||
        !/^[a-f0-9]{64}$/.test(ownerDigest??'')||
        !['cancelled','completed','ambiguous'].includes(status)){
       throw fail('BAD_PAYLOAD','Invalid cancellation acknowledgement');
     }
-    const answer=await request('/agent/cancel-ack',{requestId,ownerDigest,status},true);
+    const answer=await request('/agent/cancel-ack',{requestId,ownerDigest,status},true,signal);
     if(!exactKeys(answer,'accepted,status')||answer.accepted!==true||
        answer.status!==status&&answer.status!=='ambiguous'){
       return ambiguousResponse();
     }
+    if(deliveredRequestId===requestId)deliveredRequestId=null;
     return answer;
   }
-  function close(){closed=true;sessionId=null;}
-  return Object.freeze({connect,heartbeat,poll,pollControl,result,cancelAck,disconnect,close});
+  function close(){permanentlyClosed=true;closed=true;sessionId=null;sequence=0;deliveredRequestId=null;}
+  return Object.freeze({connect,reconnect,heartbeat,poll,pollControl,result,cancelAck,disconnect,close,gatewayNowMs});
 }

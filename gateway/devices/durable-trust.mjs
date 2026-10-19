@@ -34,7 +34,7 @@ function checkDirectory(directory,{create=false}={}){
     try{st=lstatSync(cursor);}catch(e){
       if(e?.code!=='ENOENT')throw e;
       if(cursor!==directory||!create)throw Error('Missing trusted store directory');
-      mkdirSync(cursor,{mode:0o700});
+      try{mkdirSync(cursor,{mode:0o700});}catch(error){if(error?.code!=='EEXIST')throw error;}
       st=lstatSync(cursor);
     }
     if(!st.isDirectory()||st.isSymbolicLink())throw Error('Unsafe trust directory ancestor');
@@ -305,8 +305,8 @@ export function createDurableDeviceTrustStore({directory,maxDevices=32,now=Date.
       throw error;
     }
   };
-  // Read-only session facade always points to current state. Persistence of any
-  // trust change resets ALL live sessions; callers must re-authenticate.
+  // Read-only session facade always points to current state. Trust changes keep
+  // sessions for unchanged identities and remove only identities no longer trusted.
   const registry=Object.freeze({
     listDevices:(...args)=>{requireHealthy();return current.listDevices(...args);},
     isLiveSession:(...args)=>{requireHealthy();return current.isLiveSession(...args);},
@@ -354,7 +354,7 @@ export function createDurableDeviceTrustStore({directory,maxDevices=32,now=Date.
       commitSnapshot(directory,next); // Do NOT change memory before durable write.
       committed=true;
       snapshot=next;
-      current=candidate; // New registry discards sessions / challenges.
+      current.replaceTrustedDevices(next.devices);
       removeOwnedDurableProcessLock({directory,name:lockName,owner:writerOwner});
       writerOwner=null;
       const dirFd=openSync(directory,constants.O_RDONLY|(constants.O_NOFOLLOW??0));

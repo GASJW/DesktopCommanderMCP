@@ -195,7 +195,7 @@ test('revocation persists to disk and invalidates a live session',()=>{
     assert.equal(store.revokeDevice(d.deviceId),false);
   });
 });
-test('adding another trusted record fences all pre-existing sessions',()=>{
+test('adding another trusted record preserves the unchanged device session',()=>{
   temp(dir=>{
     const store=createDurableDeviceTrustStore({directory:dir});
     const key=generate();
@@ -204,8 +204,31 @@ test('adding another trusted record fences all pre-existing sessions',()=>{
     const {sessionId}=store.registry.completeHandshake(d.deviceId,key.sign(deviceChallengeMessage(d.deviceId,nonce)));
     store.registry.heartbeat(d.deviceId,sessionId,1);
     store.trustDevice(metadata(generate(),'VPS gui'));
-    assert.equal(store.registry.isLiveSession(d.deviceId,sessionId),false);
+    assert.equal(store.registry.isLiveSession(d.deviceId,sessionId),true);
     assert.equal(store.registry.listDevices().length,2);
+  });
+});
+test('revoking one of two trusted devices fences only that device session',()=>{
+  temp(dir=>{
+    const store=createDurableDeviceTrustStore({directory:dir});
+    const firstKey=generate(),secondKey=generate();
+    const first=store.trustDevice(metadata(firstKey,'first'));
+    const firstChallenge=store.registry.beginHandshake(first.deviceId);
+    const firstSession=store.registry.completeHandshake(first.deviceId,
+      firstKey.sign(deviceChallengeMessage(first.deviceId,firstChallenge.nonce)));
+    assert.equal(store.registry.heartbeat(first.deviceId,firstSession.sessionId,1),true);
+    const second=store.trustDevice(metadata(secondKey,'second'));
+    const secondChallenge=store.registry.beginHandshake(second.deviceId);
+    const secondSession=store.registry.completeHandshake(second.deviceId,
+      secondKey.sign(deviceChallengeMessage(second.deviceId,secondChallenge.nonce)));
+    assert.equal(store.registry.heartbeat(second.deviceId,secondSession.sessionId,1),true);
+    assert.equal(store.revokeDevice(first.deviceId),true);
+    assert.equal(store.registry.isLiveSession(first.deviceId,firstSession.sessionId),false);
+    assert.equal(store.registry.isLiveSession(second.deviceId,secondSession.sessionId),true);
+    const restarted=createDurableDeviceTrustStore({directory:dir});
+    assert.equal(restarted.registry.listDevices().length,1);
+    assert.equal(restarted.registry.listDevices()[0].deviceId,second.deviceId);
+    assert.equal(restarted.registry.listDevices()[0].online,false);
   });
 });
 test('invalid duplicate public keys and capacity fail without revision change',()=>{
@@ -391,13 +414,19 @@ test('two OS processes racing from one trust revision commit at most one writer'
     `;
     const children=['first','second'].map(name=>spawn(process.execPath,
       ['--input-type=module','-e',source,dir,name],{cwd:process.cwd()}));
-    const outputs=children.map(()=> '');
-    let ready=0;
+    const outputs=children.map(()=> ''),errors=children.map(()=> '');
+    let ready=0,exited=0,settled=false,readinessTimer;
+    const fail=error=>{
+      if(settled)return;
+      settled=true;clearTimeout(readinessTimer);
+      for(const child of children)if(child.exitCode===null)child.kill('SIGTERM');
+      reject(error);
+    };
+    readinessTimer=setTimeout(()=>fail(Error(`writer children did not become ready; stdout=${outputs}; stderr=${errors}`)),5000);
     const maybeGo=()=>{
       if(ready===children.length){for(const child of children)child.stdin.write('go\n');}
     };
     const results=[];
-    let exited=0;
     children.forEach((child,index)=>{
       child.stdout.setEncoding('utf8');
       child.stderr.setEncoding('utf8');
@@ -406,11 +435,14 @@ test('two OS processes racing from one trust revision commit at most one writer'
         if(outputs[index].includes('READY\n')){ready++;maybeGo();}
         for(const match of chunk.matchAll(/RESULT:(OK|ERR)\n/g))results.push(match[1]);
       });
-      child.on('error',reject);
+      child.stderr.on('data',chunk=>{errors[index]+=chunk;});
+      child.on('error',fail);
       child.on('exit',(code,signal)=>{
-        if(code!==0)reject(Error(`writer child failed: ${code??signal}; ${outputs[index]}`));
+        if(code!==0){fail(Error(`writer child failed: ${code??signal}; stdout=${outputs[index]}; stderr=${errors[index]}`));return;}
         exited++;
         if(exited===children.length){
+          if(settled)return;
+          settled=true;clearTimeout(readinessTimer);
           try{
             assert.equal(results.filter(x=>x==='OK').length,1);
             assert.equal(results.filter(x=>x==='ERR').length,1);

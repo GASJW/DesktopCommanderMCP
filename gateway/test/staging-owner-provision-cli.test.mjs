@@ -61,9 +61,12 @@ function jwtParts(token) {
 }
 
 async function fixture({ pendingFingerprint = FINGERPRINT, proofVerified = true,
-  abortApproval = false, approvalStatus = 200 } = {}) {
+  abortApproval = false, approvalStatus = 200, addDevice = false } = {}) {
   const scratch = mkdtempSync(path.join(os.tmpdir(), 'g7-staging-owner-cli-'));
   chmodSync(scratch, 0o700);
+  const expectedTrustRevision=addDevice?4:0,expectedBindingRevision=addDevice?8:0,expectedPolicyRevision=addDevice?12:0;
+  const deviceId=addDevice?'93ca6fd0-9042-44d1-a4be-ae83d1cd24bc':'1041e5c1-74b8-45d1-8f61-dca1e8468239';
+  const confirmationFingerprint=addDevice?'d'.repeat(64):FINGERPRINT;
   const allowedRoot = path.join(scratch, 'g7-staging-approved-root');
   mkdirSync(allowedRoot, { mode: 0o700 });
   const tlsKeyPath = path.join(scratch, 'tls.key');
@@ -97,7 +100,7 @@ async function fixture({ pendingFingerprint = FINGERPRINT, proofVerified = true,
       publicJwk,
       privateKeyPath,
     },
-    machineClientId: CLIENT_ID,
+    machineClientId: addDevice?'g7-staging-windows.synthetic':CLIENT_ID,
     allowedRoot,
   };
   const requests = [];
@@ -107,35 +110,35 @@ async function fixture({ pendingFingerprint = FINGERPRINT, proofVerified = true,
     try { body = rawBody ? JSON.parse(rawBody) : null; } catch { body = null; }
     requests.push({ method: req.method, url: req.url, headers: req.headers, body });
     if (req.url === '/healthz' && req.method === 'GET') {
-      return send(res, 200, { status: 'ready', runtime: 'g7-staging', trustRevision: 0,
-        policyRevision: 0, bindingRevision: 0 });
+      return send(res, 200, { status: 'ready', runtime: 'g7-staging', trustRevision: expectedTrustRevision,
+        policyRevision: expectedPolicyRevision, bindingRevision: expectedBindingRevision });
     }
     const auth = req.headers['cf-access-jwt-assertion'];
     if (!auth || !validOwnerJwt(auth, owner.publicKey)) return send(res, 401, { error: 'Owner required' });
     if (req.url === '/dashboard/api/g7/pairing/pending' && req.method === 'GET') {
       return send(res, 200, { enabled: true, csrf: CSRF, pending: [{ requestId: REQUEST_ID,
-        name: 'synthetic-agent', platform: 'linux', fingerprint: pendingFingerprint,
+        name: 'synthetic-agent', platform: 'linux', fingerprint: pendingFingerprint==='c'.repeat(64)?confirmationFingerprint:pendingFingerprint,
         proofVerified, createdAt: new Date().toISOString() }] });
     }
     if (req.method === 'POST' && !validOwnerHeaders(req.headers)) return send(res, 403, { error: 'Owner headers required' });
     if (req.url === '/dashboard/api/g7/pairing/approve') {
       if (abortApproval) return req.socket.destroy();
       if (approvalStatus !== 200) return send(res, approvalStatus, { error: 'Pairing outcome requires reconciliation' });
-      return send(res, 200, { deviceId: '1041e5c1-74b8-45d1-8f61-dca1e8468239',
-        fingerprint: FINGERPRINT, status: 'approved_offline' });
+      return send(res, 200, { deviceId,
+        fingerprint: confirmationFingerprint, status: 'approved_offline' });
     }
     if (req.url === '/stage/bind') {
-      return send(res, 200, { revision: 1, binding: { clientId: CLIENT_ID,
-        deviceId: '1041e5c1-74b8-45d1-8f61-dca1e8468239', fingerprint: FINGERPRINT,
+      return send(res, 200, { revision: expectedBindingRevision+1, binding: { clientId: config.machineClientId,
+        deviceId, fingerprint: confirmationFingerprint,
         approvalEventId: APPROVAL_EVENT_ID, bindingEventId: BINDING_EVENT_ID,
-        bindingRevision: 1, ownerId: 'a'.repeat(24), ownerDigest: 'b'.repeat(64),
-        trustRevisionBefore: 0, trustRevisionAfter: 1, trustRevision: 1 } });
+        bindingRevision: expectedBindingRevision+1, ownerId: 'a'.repeat(24), ownerDigest: 'b'.repeat(64),
+        trustRevisionBefore: expectedTrustRevision, trustRevisionAfter: expectedTrustRevision+1, trustRevision: expectedTrustRevision+1 } });
     }
     if (req.url === '/stage/grant') {
-      return send(res, 201, { revision: 1, grant: { grantId: 'ee5f8150-a2a6-4e2d-a217-744060ce9682',
-        deviceId: '1041e5c1-74b8-45d1-8f61-dca1e8468239', tool: 'read_file',
+      return send(res, 201, { revision: expectedPolicyRevision+1, grant: { grantId: 'ee5f8150-a2a6-4e2d-a217-744060ce9682',
+        deviceId, tool: 'read_file',
         scope: { root: allowedRoot }, constraints: { maxBytes: 65536, maxLength: 1000, maxOffset: 100000 },
-        revision: 1 } });
+        revision: expectedPolicyRevision+1 } });
     }
     return send(res, 404, { error: 'Not found' });
   });
@@ -163,11 +166,12 @@ async function fixture({ pendingFingerprint = FINGERPRINT, proofVerified = true,
   await once(server, 'listening');
   config.connectPort = server.address().port;
   privateWrite(configPath, JSON.stringify(config));
-  const input = JSON.stringify({ requestId: REQUEST_ID, code: CODE, fingerprint: FINGERPRINT }) + '\n';
+  const input = JSON.stringify({ requestId: REQUEST_ID, code: CODE, fingerprint: confirmationFingerprint,
+    ...(addDevice?{expectedTrustRevision,expectedBindingRevision,expectedPolicyRevision}:{}) }) + '\n';
   return {
     scratch, server, requests, config, configPath, input, owner,
     run: async () => {
-      const child = spawn(process.execPath, [CLI, '--config', configPath], {
+      const child = spawn(process.execPath, [CLI, ...(addDevice?['--add-device']:[]), '--config', configPath], {
         cwd: ROOT,
         env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: scratch, TMPDIR: scratch, LANG: 'C.UTF-8' },
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -185,6 +189,32 @@ async function fixture({ pendingFingerprint = FINGERPRINT, proofVerified = true,
     },
   };
 }
+
+test('Owner CLI adds a second device at explicit nonzero revisions without resetting prior state', async () => {
+  const x = await fixture({ addDevice: true });
+  try {
+    const result = await x.run();
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual(x.requests.map(item => `${item.method} ${item.url}`), [
+      'GET /healthz',
+      'GET /dashboard/api/g7/pairing/pending',
+      'POST /dashboard/api/g7/pairing/approve',
+      'POST /stage/bind',
+      'POST /stage/grant',
+    ]);
+    const bind=x.requests.find(item=>item.url==='/stage/bind');
+    const grant=x.requests.find(item=>item.url==='/stage/grant');
+    assert.deepEqual(bind.body,{clientId:'g7-staging-windows.synthetic',
+      deviceId:'93ca6fd0-9042-44d1-a4be-ae83d1cd24bc',expectedRevision:8});
+    assert.equal(grant.body.expectedRevision,12);
+    const summary=JSON.parse(result.stdout.trim());
+    assert.equal(summary.clientId,'g7-staging-windows.synthetic');
+    assert.equal(summary.bindingRevision,9);
+    assert.equal(summary.binding.trustRevisionBefore,4);
+    assert.equal(summary.binding.trustRevisionAfter,5);
+    assert.equal(summary.grantRevision,13);
+  } finally { await x.close(); }
+});
 
 test('Owner CLI completes first approval, durable binding and one restricted read grant over verified TLS', async () => {
   const x = await fixture();

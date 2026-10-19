@@ -1,13 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { generateKeyPairSync,sign } from 'node:crypto';
-import { mkdirSync,mkdtempSync,rmSync,writeFileSync } from 'node:fs';
+import { generateKeyPairSync,randomUUID,sign } from 'node:crypto';
+import { appendFileSync,mkdirSync,mkdtempSync,readFileSync,rmSync,writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHttpsAgentClient } from '../src/https-client.mjs';
+import { createAgentWorker } from '../src/worker.mjs';
 import { createEphemeralPairingIdentity } from '../src/pairing.mjs';
 import { createLocalReadonlyMcp } from '../src/local-mcp-readonly.mjs';
+import { securePrivateWindowsDirectory } from '../src/windows-security.mjs';
 import { createMachineAccessVerifier } from '../../../gateway/devices/machine-access.mjs';
 import { startMachineIngressLoopback } from '../../../gateway/devices/machine-ingress-loopback.mjs';
 import { createDeviceRegistry } from '../../../gateway/devices/registry.mjs';
@@ -29,8 +31,8 @@ function jwt(privateKey){
     aud:AUD,iss:ISSUER,iat:SEC-10,exp:SEC+3600})).toString('base64url');
   return a+'.'+b+'.'+sign('RSA-SHA256',Buffer.from(a+'.'+b),privateKey).toString('base64url');
 }
-async function harness(){
-  const registry=createDeviceRegistry(),router=createDeviceRouter({registry,timeoutMs:5000});
+async function harness({timeoutMs=30_000,beforeFetch,afterFetch,shouldCancelOperation}={}){
+  const registry=createDeviceRegistry(),router=createDeviceRouter({registry,timeoutMs});
   const pairing=createPairingCoordinator({registry});
   const identity=createEphemeralPairingIdentity();
   const request=pairing.startPairing({name:'test-Windows',platform:'win32',
@@ -42,7 +44,7 @@ async function harness(){
   const verifyMachineToken=createMachineAccessVerifier({issuer:ISSUER,audience:AUD,
     allowedClientIds:[CLIENT],now:()=>T,keyProvider:async()=>({keys:[jwk]})});
   const ingress=await startMachineIngressLoopback({registry,router,
-    verifyMachineToken,machineBindings:new Map([[CLIENT,deviceId]]),
+    verifyMachineToken,machineBindings:new Map([[CLIENT,deviceId]]),shouldCancelOperation,
     enableTestIngress:true});
   const assertion=jwt(privateKey);
   const observed=[];
@@ -58,13 +60,16 @@ async function harness(){
       return new Response(JSON.stringify({error:'Edge rejects service token'}),
         {status:403,headers:{'content-type':'application/json'}});
     }
+    const intercepted=await beforeFetch?.({route:u.pathname});
+    if(intercepted)return intercepted;
     const headers={...opts.headers};
     delete headers['cf-access-client-id'];
     delete headers['cf-access-client-secret'];
     headers['cf-access-jwt-assertion']=assertion;
-    return fetch(ingress.url+u.pathname,{
+    const response=await fetch(ingress.url+u.pathname,{
       ...opts,headers,redirect:'error',
     });
+    return afterFetch?await afterFetch({route:u.pathname,response}):response;
   };
   const client=createHttpsAgentClient({gatewayUrl:BASE_URL,expectedHostname:HOST,
     identity,deviceId,clientId:CLIENT,clientSecret:SECRET,fetchFn:fakeEdge});
@@ -77,6 +82,26 @@ function makeInvalid(overrides={}){
     deviceId:'f1a2b3c4-d5e6-4a9f-8abc-1bb9b99c0001',
     clientId:CLIENT,clientSecret:SECRET, ...overrides};
 }
+test('uses a bounded clock offset from successful Gateway Date responses',async()=>{
+  let requests=0;
+  const client=createHttpsAgentClient(makeInvalid({fetchFn:async input=>{
+    requests++;
+    const route=new URL(input).pathname;
+    const payload=route==='/agent/challenge'
+      ?{deviceId:DEVICE,nonce:'n'.repeat(43),expiresInMs:30_000}
+      :{deviceId:DEVICE,sessionId:SESSION};
+    const offset=requests===1?18_000:600_000;
+    return new Response(JSON.stringify(payload),{status:200,headers:{
+      'content-type':'application/json','date':new Date(Date.now()+offset).toUTCString(),
+    }});
+  }}));
+  try{
+    await client.connect();
+    const offset=client.gatewayNowMs()-Date.now();
+    assert.ok(offset>=16_000&&offset<=19_000,'trusted server time should follow the accepted offset');
+    assert.equal(requests,2);
+  }finally{client.close();}
+});
 test('reject HTTP, credentials in URL, other hosts, IP and untrusted port',()=>{
   for(const gatewayUrl of [
     'http://devices.example.test','https://evil.example.test/',
@@ -147,17 +172,228 @@ test('two layers authenticate an actual local MCP fixture read and return throug
   const tmp=mkdtempSync(path.join(os.tmpdir(),'vpsc-https-agent-test-'));
   const dir=path.join(tmp,'approved');
   mkdirSync(dir);
+  if(process.platform==='win32')securePrivateWindowsDirectory(dir);
   const file=path.join(dir,'hello.txt');
   writeFileSync(file,'end-to-end-device-signed-read\n');
-  const executor=createLocalReadonlyMcp({allowedRoot:dir,entrypoint:MCP_FIXTURE,timeoutMs:5000});
+  let executor;
   try{
+    executor=createLocalReadonlyMcp({allowedRoot:dir,entrypoint:MCP_FIXTURE,timeoutMs:5000});
     await x.client.connect();await x.client.heartbeat();await executor.start();
     const pending=x.router.callDevice({deviceId:x.deviceId,name:'read_file',arguments:{path:file}});
     const task=await x.client.poll();
     const value=await executor.handle(task);
     await x.client.result(task.requestId,value);
     assert.match(JSON.stringify(await pending),/end-to-end-device-signed-read/);
-  }finally{await executor.close();await x.close();rmSync(tmp,{recursive:true,force:true});}
+  }finally{await executor?.close();await x.close();rmSync(tmp,{recursive:true,force:true});}
+});
+
+test('a completed read submits its result without a post-commit control-poll round trip',async()=>{
+  const requestId=randomUUID();let ledgerFile,postCommitPolls=0,resultAttempts=0;
+  const x=await harness({timeoutMs:30_000,beforeFetch:async({route})=>{
+    if(route!=='/agent/poll'||!ledgerFile)return null;
+    let records=[];
+    try{records=readFileSync(ledgerFile,'utf8').trim().split(/\r?\n/).filter(Boolean).map(JSON.parse);}
+    catch{return null;}
+    const committed=records.some(record=>record.type==='outcome'&&
+      record.requestId===requestId&&record.status==='success');
+    if(!committed)return null;
+    postCommitPolls++;
+    return new Response('{"error":"synthetic post-commit control response lost"}',{
+      status:503,headers:{'content-type':'application/json'},
+    });
+  }});
+  const tmp=mkdtempSync(path.join(os.tmpdir(),'vpsc-result-delivery-'));
+  const root=path.join(tmp,'approved'),state=path.join(tmp,'ledger');
+  mkdirSync(root,{mode:0o700});mkdirSync(state,{mode:0o700});
+  if(process.platform==='win32'){securePrivateWindowsDirectory(root);securePrivateWindowsDirectory(state);}
+  const file=path.join(root,'delivery-proof.txt');
+  writeFileSync(file,'synthetic durable result delivery proof\n');
+  ledgerFile=path.join(state,'i4-execution.jsonl');
+  writeFileSync(ledgerFile,'');
+  const local=createLocalReadonlyMcp({allowedRoot:root,entrypoint:MCP_FIXTURE,timeoutMs:5000});
+  const executor={start:()=>local.start(),close:()=>local.close(),handle:async frame=>{
+    appendFileSync(ledgerFile,JSON.stringify({requestId:frame.requestId,type:'intent'})+'\n');
+    try{
+      const value=await local.handle(frame);
+      appendFileSync(ledgerFile,JSON.stringify({requestId:frame.requestId,type:'outcome',status:'success'})+'\n');
+      return value;
+    }catch(error){
+      appendFileSync(ledgerFile,JSON.stringify({requestId:frame.requestId,type:'outcome',status:'failed'})+'\n');
+      throw error;
+    }
+  }};
+  const args={path:file};
+  let worker,run,onlineResolve,workerFailure=null;
+  const online=new Promise(resolve=>{onlineResolve=resolve;});
+  const diagnostics=[];
+  const client={
+    connect:(...values)=>x.client.connect(...values),
+    heartbeat:async(...values)=>{const value=await x.client.heartbeat(...values);onlineResolve();return value;},
+    poll:(...values)=>x.client.poll(...values),
+    pollControl:(...values)=>x.client.pollControl(...values),
+    result:async(...values)=>{resultAttempts++;const value=await x.client.result(...values);worker.stop();return value;},
+    cancelAck:(...values)=>x.client.cancelAck(...values),
+    disconnect:(...values)=>x.client.disconnect(...values),
+    close:(...values)=>x.client.close(...values),
+  };
+  try{
+    worker=createAgentWorker({deviceId:x.deviceId,client,executor,pollIntervalMs:25,
+      onDiagnostic:event=>diagnostics.push(event)});
+    run=worker.run();run.catch(error=>{workerFailure=error?.code??'UNKNOWN';});
+    await online;
+    const pending=x.router.callDevice({deviceId:x.deviceId,name:'read_file',arguments:args,requestId,
+      beforeDispatch:async()=>({authorization:{version:1,
+        claims:{ownerDigest:'a'.repeat(64)},signature:'A'.repeat(86)},release:()=>true})});
+    let value;
+    try{value=await pending;}
+    catch(error){
+      assert.fail(JSON.stringify({routerCode:error?.code,workerFailure,diagnostics,
+        routes:x.observed.map(item=>new URL(item.url).pathname),postCommitPolls,resultAttempts}));
+    }
+    assert.match(JSON.stringify(value),/synthetic durable result delivery proof/);
+    assert.equal(resultAttempts,1,'the executor result is submitted exactly once');
+    assert.equal(postCommitPolls,0,'the worker does not add a control request after local execution completes');
+    const records=readFileSync(ledgerFile,'utf8').trim().split(/\r?\n/).filter(Boolean).map(JSON.parse)
+      .filter(record=>record.requestId===requestId);
+    assert.deepEqual(records.map(record=>record.type),['intent','outcome']);
+    assert.equal(records[1].status,'success');
+    assert.equal(x.observed.filter(item=>item.url===BASE_URL+'agent/result').length,1);
+    await run;
+  }finally{
+    worker?.stop();
+    await run?.catch(()=>{});
+    await executor.close();
+    await x.close();
+    rmSync(tmp,{recursive:true,force:true});
+  }
+});
+
+for(const failure of ['request not delivered','dropped response','HTTP 503']){
+  test(`one Owner-dispatched result survives a delayed active-heartbeat ${failure}`,async()=>{
+    const requestId=randomUUID();let ledgerFile,activeHeartbeats=0,resultAttempts=0,
+      postCommitPolls=0,committedOutcome=false,worker;
+    let commitLedger,activeHeartbeatStarted,gatewayHeartbeatStatus=null;
+    const committed=new Promise(resolve=>{commitLedger=resolve;});
+    const heartbeatInFlight=new Promise(resolve=>{activeHeartbeatStarted=resolve;});
+    const x=await harness({timeoutMs:3000,
+      beforeFetch:async({route})=>{
+        if(route==='/agent/poll'&&committedOutcome)postCommitPolls++;
+        if(route!=='/agent/heartbeat'||++activeHeartbeats!==2||failure!=='request not delivered')return null;
+        activeHeartbeatStarted();
+        await committed;
+        await new Promise(resolve=>setImmediate(resolve));
+        return new Response('{"error":"synthetic heartbeat request unavailable"}',{
+          status:503,headers:{'content-type':'application/json'},
+        });
+      },
+      afterFetch:async({route,response})=>{
+        if(route!=='/agent/heartbeat'||activeHeartbeats!==2||failure==='request not delivered')return response;
+        activeHeartbeatStarted();
+        await committed;
+        await new Promise(resolve=>setImmediate(resolve));
+        gatewayHeartbeatStatus=response.status;
+        if(failure==='dropped response')throw Error('synthetic lost heartbeat response');
+        return new Response('{"error":"synthetic heartbeat response unavailable"}',{
+          status:503,headers:{'content-type':'application/json'},
+        });
+      }});
+    const tmp=mkdtempSync(path.join(os.tmpdir(),'vpsc-active-heartbeat-'));
+    ledgerFile=path.join(tmp,'i4-execution.jsonl');writeFileSync(ledgerFile,'');
+    let executions=0,onlineResolve;
+    const online=new Promise(resolve=>{onlineResolve=resolve;});
+    const diagnostics=[];
+    const executor={start:async()=>{},close:async()=>{},handle:async frame=>{
+      executions++;
+      appendFileSync(ledgerFile,JSON.stringify({requestId:frame.requestId,type:'intent'})+'\n');
+      appendFileSync(ledgerFile,JSON.stringify({requestId:frame.requestId,
+        type:'outcome',status:'success'})+'\n');
+      committedOutcome=true;
+      commitLedger();
+      return {content:[{type:'text',text:'synthetic active heartbeat result proof'}]};
+    }};
+    const client={
+      connect:(...values)=>x.client.connect(...values),
+      heartbeat:async(...values)=>{const value=await x.client.heartbeat(...values);onlineResolve();return value;},
+      poll:(...values)=>x.client.poll(...values),pollControl:(...values)=>x.client.pollControl(...values),
+      result:async(...values)=>{resultAttempts++;const value=await x.client.result(...values);worker.stop();return value;},
+      cancelAck:(...values)=>x.client.cancelAck(...values),
+      disconnect:(...values)=>x.client.disconnect(...values),close:(...values)=>x.client.close(...values),
+    };
+    let run;
+    try{
+      worker=createAgentWorker({deviceId:x.deviceId,client,executor,pollIntervalMs:25,
+        onDiagnostic:event=>diagnostics.push(event)});
+      run=worker.run();
+      await online;
+      const pending=x.router.callDevice({deviceId:x.deviceId,name:'read_file',
+        arguments:{path:'/approved/heartbeat-proof.txt'},requestId,
+        beforeDispatch:async()=>({authorization:{version:1,
+          claims:{ownerDigest:'a'.repeat(64)},signature:'A'.repeat(86)},release:()=>true})});
+      const finish=Promise.race([
+        pending.then(value=>({kind:'owner',value}),error=>({kind:'owner-error',code:error?.code??'UNKNOWN'})),
+        run.then(()=>({kind:'worker-stopped'}),error=>({kind:'worker-error',code:error?.code??'UNKNOWN'})),
+      ]);
+      await heartbeatInFlight;
+      const outcome=await finish;
+      assert.equal(outcome.kind,'owner',JSON.stringify({kind:outcome.kind,code:outcome.code}));
+      await run;
+      assert.equal(gatewayHeartbeatStatus,failure==='request not delivered'?null:200,
+        'the test distinguishes a lost request from a lost response after Gateway acceptance');
+      assert.match(JSON.stringify(outcome.value),/synthetic active heartbeat result proof/);
+      assert.equal(executions,1,'the delivered operation executes once');
+      assert.equal(resultAttempts,1,'the durable outcome is submitted once');
+      assert.equal(postCommitPolls,0,'a completed operation proceeds directly to its one result submission');
+      const records=readFileSync(ledgerFile,'utf8').trim().split(/\r?\n/).filter(Boolean).map(JSON.parse)
+        .filter(record=>record.requestId===requestId);
+      assert.deepEqual(records.map(record=>record.type),['intent','outcome']);
+      assert.equal(records[1].status,'success');
+      assert.ok(diagnostics.some(event=>event.requestId===requestId&&event.route==='/agent/heartbeat'&&
+        event.phase==='active_control'&&event.outcomeCode==='CONTROL_POLL_UNAVAILABLE'));
+      const signed=x.observed.filter(item=>item.headers['x-vpsc-sequence']);
+      const sequences=signed.map(item=>Number(item.headers['x-vpsc-sequence']));
+      assert.ok(sequences.every((value,index)=>index===0||value>sequences[index-1]),
+        'heartbeat loss preserves the signed sequence for result submission');
+      assert.equal(new Set(signed.map(item=>item.headers['x-vpsc-session-id'])).size,1,
+        'the in-flight operation keeps its original authenticated session');
+      assert.ok(diagnostics.some(event=>event.requestId===requestId&&event.route==='/agent/result'&&
+        event.phase==='acknowledgement'&&event.outcomeCode==='ACCEPTED'));
+    }finally{
+      worker?.stop();
+      await run?.catch(()=>{});
+      await executor.close().catch(()=>{});
+      await x.close();
+      rmSync(tmp,{recursive:true,force:true});
+    }
+  });
+}
+test('an explicit expired-session response remains a rejection during an active operation',async()=>{
+  let heartbeatCount=0;
+  const x=await harness({beforeFetch:async({route})=>{
+    if(route==='/agent/heartbeat'&&++heartbeatCount===2){
+      return new Response('{"error":"expired session"}',{
+        status:401,headers:{'content-type':'application/json'},
+      });
+    }
+    return null;
+  }});
+  const requestId=randomUUID();
+  let pending;
+  try{
+    await x.client.connect();
+    await x.client.heartbeat();
+    pending=x.router.callDevice({deviceId:x.deviceId,name:'read_file',
+      arguments:{path:'/approved/expired-session.txt'},requestId,
+      beforeDispatch:async()=>({authorization:{version:1,
+        claims:{ownerDigest:'b'.repeat(64)},signature:'A'.repeat(86)},release:()=>true})});
+    pending.catch(()=>{});
+    const frame=await x.client.poll();
+    assert.equal(frame.requestId,requestId);
+    await assert.rejects(x.client.heartbeat({activeRequestId:requestId}),
+      error=>error.code==='REJECTED');
+  }finally{
+    await x.close();
+    await pending?.catch(()=>{});
+  }
 });
 test('HTTPS client closes fail-closed and prevents further messages',async()=>{
   const x=await harness();
@@ -175,6 +411,25 @@ test('network error is ambiguous and never retried or exposes service secret',as
     !e.message.includes(SECRET));
   assert.equal(calls,1);
   client.close();
+});
+test('an idle ambiguous client session can be replaced with a fresh proof but a closed client cannot reopen',async()=>{
+  const params=makeInvalid(),sessionId='f1a2b3c4-d5e6-4a9f-8abc-1bb9b99c0005';
+  const nonce=Buffer.alloc(32,7).toString('base64url');let calls=0;
+  params.fetchFn=async input=>{
+    calls++;
+    if(calls===1)throw Error('transient offline');
+    const route=new URL(input).pathname;
+    const body=route==='/agent/challenge'
+      ?{deviceId:params.deviceId,nonce,expiresInMs:30_000}
+      :{deviceId:params.deviceId,sessionId};
+    return new Response(JSON.stringify(body),{status:200,headers:{'content-type':'application/json'}});
+  };
+  const client=createHttpsAgentClient(params);
+  await assert.rejects(client.connect(),error=>error.code==='AMBIGUOUS_TRANSPORT');
+  assert.deepEqual(await client.reconnect(),{deviceId:params.deviceId,sessionId});
+  assert.equal(calls,3);
+  client.close();
+  await assert.rejects(client.reconnect(),error=>error.code==='STATE');
 });
 test('edge rejection never triggers JWT shortcut or client credential leakage',async()=>{
   const client=createHttpsAgentClient(makeInvalid({
@@ -225,6 +480,71 @@ test('a processed result followed by HTTP 503 is ambiguous and never replayed',a
     }),error=>error.code==='AMBIGUOUS_TRANSPORT');
     assert.equal(processed,1);
     assert.equal(routes.filter(route=>route==='/agent/result').length,1);
+  }finally{client.close();}
+});
+
+test('an active control-poll failure preserves a monotonic sequence for its one result submission',async()=>{
+  const routes=[],sequences=[];
+  const requestId=randomUUID();
+  const client=createHttpsAgentClient(makeInvalid({fetchFn:async(input,options)=>{
+    const route=new URL(input).pathname;routes.push(route);
+    const sequence=options.headers['x-vpsc-sequence'];
+    if(sequence)sequences.push(Number(sequence));
+    if(route==='/agent/challenge')return new Response(JSON.stringify({deviceId:DEVICE,
+      expiresInMs:30_000,nonce:'n'.repeat(43)}),{
+      status:200,headers:{'content-type':'application/json'},
+    });
+    if(route==='/agent/connect')return new Response(JSON.stringify({deviceId:DEVICE,sessionId:SESSION}),{
+      status:200,headers:{'content-type':'application/json'},
+    });
+    if(route==='/agent/poll'&&routes.filter(item=>item==='/agent/poll').length===1){
+      return new Response(JSON.stringify({frame:{version:1,method:'tools/call',deviceId:DEVICE,
+        sessionId:SESSION,requestId,authorization:{},params:{name:'read_file',arguments:{}}},cancel:null}),{
+        status:200,headers:{'content-type':'application/json'},
+      });
+    }
+    if(route==='/agent/poll')return new Response('{"error":"synthetic dropped control response"}',{
+      status:503,headers:{'content-type':'application/json'},
+    });
+    if(route==='/agent/result')return new Response('{"accepted":true}',{
+      status:200,headers:{'content-type':'application/json'},
+    });
+    throw Error('unexpected route');
+  }}));
+  try{
+    await client.connect();
+    assert.equal((await client.pollControl()).frame.requestId,requestId);
+    await assert.rejects(client.pollControl({activeRequestId:requestId}),
+      error=>error.code==='CONTROL_POLL_UNAVAILABLE');
+    assert.deepEqual(await client.result(requestId,{content:[]}),{accepted:true});
+    assert.deepEqual(routes.slice(-3),['/agent/poll','/agent/poll','/agent/result']);
+    assert.equal(new Set(sequences).size,sequences.length,'each signed request uses a fresh sequence');
+    assert.ok(sequences.every((value,index)=>index===0||value>sequences[index-1]));
+  }finally{client.close();}
+});
+
+test('an active control-poll exception requires the request actually delivered in this session',async()=>{
+  let polls=0;
+  const client=createHttpsAgentClient(makeInvalid({fetchFn:async input=>{
+    const route=new URL(input).pathname;
+    if(route==='/agent/challenge')return new Response(JSON.stringify({deviceId:DEVICE,
+      expiresInMs:30_000,nonce:'n'.repeat(43)}),{status:200,headers:{'content-type':'application/json'}});
+    if(route==='/agent/connect')return new Response(JSON.stringify({deviceId:DEVICE,sessionId:SESSION}),
+      {status:200,headers:{'content-type':'application/json'}});
+    if(route==='/agent/poll'){
+      polls++;
+      return new Response('{"frame":null,"cancel":null}',{status:200,
+        headers:{'content-type':'application/json'}});
+    }
+    throw Error('unexpected request');
+  }}));
+  try{
+    await client.connect();
+    await assert.rejects(client.pollControl({activeRequestId:randomUUID()}),
+      error=>error.code==='STATE');
+    assert.equal(polls,0);
+    await client.pollControl();
+    assert.equal(polls,1);
   }finally{client.close();}
 });
 

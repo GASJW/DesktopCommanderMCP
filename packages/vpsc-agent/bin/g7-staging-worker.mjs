@@ -6,6 +6,7 @@ import { loadOrCreateDeviceIdentity } from '../src/identity-store.mjs';
 import { createGovernedAgentExecutor } from '../src/governed-executor.mjs';
 import { createAgentWorker } from '../src/worker.mjs';
 import { readPrivateStagingFile } from '../../../gateway/staging/private-file.mjs';
+import { assertNotElevatedWindows, readPrivateWindowsFile } from '../src/windows-security.mjs';
 import { parseStagingCommandLine } from '../../../gateway/staging/runtime-mode.mjs';
 
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -22,11 +23,14 @@ async function waitForFixtureAbort(signal){
   });
 }
 function safeFile(filename,{privateOnly=true}={}){
-  return readPrivateStagingFile(filename,{privateOnly});
+  return process.platform==='win32'
+    ?readPrivateWindowsFile(filename,{privateOnly,maxBytes:1024*1024})
+    :readPrivateStagingFile(filename,{privateOnly});
 }
 function parseConfig(filename){
-  if(process.platform!=='linux'||typeof process.getuid!=='function'||process.getuid()===0)throw Error();
-  const value=JSON.parse(readPrivateStagingFile(filename).toString('utf8'));
+  if(process.platform==='win32')assertNotElevatedWindows();
+  else if(process.platform!=='linux'||typeof process.getuid!=='function'||process.getuid()===0)throw Error();
+  const value=JSON.parse(safeFile(filename).toString('utf8'));
   const keys='allowedRoot,deviceId,hostname,identityDirectory,ledgerDirectory,mcpEntrypoint,port,policyPublicKeyPem,version,clientId,clientSecret,caPath,pollIntervalMs';
   if(!value||typeof value!=='object'||Array.isArray(value)||Object.getPrototypeOf(value)!==Object.prototype||
      Object.keys(value).sort().join(',')!==keys.split(',').sort().join(',')||value.version!==1||
@@ -108,8 +112,10 @@ try{
     clientSecret:config.clientSecret,fetchFn:stagingFetch(config)});
   let connected=false,online=false;
   const observedClient={
-    connect:async()=>{const session=await client.connect();connected=true;
+    connect:async(...args)=>{const session=await client.connect(...args);connected=true;
       process.stdout.write(JSON.stringify({event:'READY',deviceId:config.deviceId,pid:process.pid})+'\n');return session;},
+    reconnect:async(...args)=>{const session=await client.reconnect(...args);connected=true;
+      process.stdout.write(JSON.stringify({event:'RECONNECTED',deviceId:config.deviceId,pid:process.pid})+'\n');return session;},
     heartbeat:async(...args)=>{const value=await fixtureCall('heartbeat',client.heartbeat,args);
       if(!online){online=true;process.stdout.write(JSON.stringify({event:'ONLINE',deviceId:config.deviceId})+'\n');}
       return value;},poll:(...args)=>fixtureCall('poll',client.poll,args),
@@ -128,7 +134,7 @@ try{
   const baseExecutor=createGovernedAgentExecutor({allowedRoot:config.allowedRoot,
     entrypoint:config.mcpEntrypoint,ledgerDirectory:config.ledgerDirectory,
     deviceId:config.deviceId,fingerprint:identity.fingerprint,
-    gatewayPolicyPublicKey:config.policyPublicKeyPem,
+    gatewayPolicyPublicKey:config.policyPublicKeyPem,gatewayNowMs:client.gatewayNowMs,
     ...(fixtureRequested?{testHooks:{sleepCommandForTimeout:true,
       onCommandSpawn:pid=>emitFixture('FIXTURE_JOB_STARTED',{pid,requestId:activeRequestId})}}:{})});
   const executor=fixtureRequested?{
@@ -151,7 +157,9 @@ try{
     close:(...args)=>baseExecutor.close(...args),
   }:baseExecutor;
   const worker=createAgentWorker({deviceId:config.deviceId,client:observedClient,executor,
-    pollIntervalMs:config.pollIntervalMs});
+    pollIntervalMs:config.pollIntervalMs,onDiagnostic:event=>{
+      try{process.stdout.write(JSON.stringify({event:'REQUEST_DIAGNOSTIC',...event})+'\n');}catch{}
+    }});
   const controller=new AbortController();
   const done=worker.run({signal:controller.signal});
   active={controller,done};

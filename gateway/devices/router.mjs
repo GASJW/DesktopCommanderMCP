@@ -27,17 +27,23 @@ const copy = (value, maxBytes) => {
 
 export function createDeviceRouter({
   registry, timeoutMs = 30_000, maxPendingPerDevice = 4,
-  maxRequestBytes = 128 * 1024, maxResponseBytes = 1024 * 1024,
+  maxRequestBytes = 128 * 1024, maxResponseBytes = 1024 * 1024,onDiagnostic,
 } = {}) {
   if (!registry || typeof registry.isLiveSession !== 'function' ||
       !Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 120_000 ||
       !Number.isInteger(maxPendingPerDevice) || maxPendingPerDevice < 1 || maxPendingPerDevice > 16 ||
       !Number.isInteger(maxRequestBytes) || maxRequestBytes < 1024 || maxRequestBytes > 1024 * 1024 ||
-      !Number.isInteger(maxResponseBytes) || maxResponseBytes < 1024 || maxResponseBytes > 8 * 1024 * 1024) {
+      !Number.isInteger(maxResponseBytes) || maxResponseBytes < 1024 || maxResponseBytes > 8 * 1024 * 1024 ||
+      onDiagnostic!==undefined&&typeof onDiagnostic!=='function') {
     throw new TypeError('Invalid router configuration');
   }
   const active = new Map();
   let stopped = false;
+  const report=(item,route,phase,outcomeCode)=>{
+    if(!onDiagnostic)return;
+    try{onDiagnostic(Object.freeze({requestId:item.requestId,deviceId:item.deviceId,route,phase,
+      outcomeCode,elapsedMs:Math.max(0,Math.round(performance.now()-item.startedAt))}));}catch{}
+  };
   const endPending = (channel, error) => {
     for (const [id, item] of channel.pending) {
       channel.pending.delete(id);
@@ -114,12 +120,14 @@ export function createDeviceRouter({
     }
     if (channel.pending.size >= maxPendingPerDevice) throw fail('BUSY', 'Device busy');
     if(channel.pending.has(requestId))throw fail('DUPLICATE_REQUEST','Execution request is already pending');
+    const startedAt=performance.now();
     return new Promise((resolve,reject) => {
-      const item={timer:null,resolve,reject,signal,dispatched:false,delivered:false,onAbort:null,
+      const item={requestId,deviceId,startedAt,timer:null,resolve,reject,signal,dispatched:false,delivered:false,onAbort:null,
         authorizationOwnerDigest:authorization?.ownerDigest};
       const finish=(error)=>{
         if(!channel.pending.delete(requestId))return false;
         clearTimeout(item.timer);signal?.removeEventListener('abort',item.onAbort);
+        report(item,'/mcp','owner_response',error?.code??'REJECTED');
         reject(error);return true;
       };
       item.onAbort=()=>{
@@ -130,6 +138,7 @@ export function createDeviceRouter({
         reject(item.dispatched&&!removed
           ?fail('AMBIGUOUS_CANCELLED','Cancellation arrived after dispatch; outcome unknown; do not replay')
           :fail('CANCELLED','Operation was cancelled before the agent received it'));
+        report(item,'/mcp','owner_response',item.dispatched&&!removed?'AMBIGUOUS_CANCELLED':'CANCELLED');
       };
       item.timer=setTimeout(()=>{
         if(!channel.pending.delete(requestId))return;
@@ -139,8 +148,10 @@ export function createDeviceRouter({
         reject(item.dispatched&&!removed
           ?fail('AMBIGUOUS_TIMEOUT','Outcome unknown; do not replay')
           :fail('CANCELLED','Request expired before the agent received it'));
+        report(item,'/mcp','owner_response',item.dispatched&&!removed?'AMBIGUOUS_TIMEOUT':'CANCELLED');
       },timeoutMs);
       channel.pending.set(requestId,item);
+      report(item,'/mcp','router_queue','QUEUED');
       signal?.addEventListener('abort',item.onAbort,{once:true});
       if(signal?.aborted){item.onAbort();return;}
       Promise.resolve().then(async()=>{
@@ -176,6 +187,7 @@ export function createDeviceRouter({
           try{
             await channel.send(frame);
             item.delivered=true;
+            report(item,'/agent/poll','delivery','DELIVERED');
           }finally{
             if(permit){const release=permit.release;permit=undefined;release();}
           }
@@ -207,12 +219,14 @@ export function createDeviceRouter({
       channel.pending.delete(requestId);
       clearTimeout(item.timer);
       item.reject(fail('BAD_RESPONSE','Remote response invalid or too large'));
+      report(item,'/agent/result','gateway_accept','BAD_RESPONSE');
       return false;
     }
     const item=channel.pending.get(requestId);
     channel.pending.delete(requestId);
     clearTimeout(item.timer);
     item.signal?.removeEventListener('abort',item.onAbort);
+    report(item,'/agent/result','gateway_accept','ACCEPTED');
     item.resolve(payload);
     return true;
   }

@@ -15,15 +15,16 @@ const now=1_800_000_000_000;
 
 function fixture(){
   const {privateKey,publicKey}=generateKeyPairSync('ed25519');
-  const root=path.resolve('/tmp/i4-approved');
-  const args={path:path.join(root,'file.txt'),offset:0,length:10};
+  const scopeRoot=process.platform==='win32'?'/tmp/i4-approved':path.resolve('/tmp/i4-approved');
+  const root=process.platform==='win32'?path.resolve(scopeRoot):scopeRoot;
+  const args={path:process.platform==='win32'?scopeRoot+'/file.txt':path.join(scopeRoot,'file.txt'),offset:0,length:10};
   const claims={version:1,grantId:GRANT,decisionId:DECISION,requestId:REQUEST,
     ownerDigest:OWNER,deviceId:DEVICE,fingerprint:FINGERPRINT,tool:'read_file',
     argumentsDigest:toolArgumentsDigest('read_file',args),policyRevision:3,
     approvalEventId:APPROVAL,trustRevision:7,approvalTrustRevisionBefore:6,
-    approvalTrustRevisionAfter:7,scope:{root},constraints:{maxBytes:65536,maxLength:100,maxOffset:1000},
+    approvalTrustRevisionAfter:7,scope:{root:scopeRoot},constraints:{maxBytes:65536,maxLength:100,maxOffset:1000},
     issuedAt:now,expiresAt:now+30_000};
-  return {privateKey,publicKey,root,args,claims,authorization:signToolGrantCapability(claims,privateKey)};
+  return {privateKey,publicKey,root,scopeRoot,args,claims,authorization:signToolGrantCapability(claims,privateKey)};
 }
 
 test('signed grant capability binds exact device, request, tool, arguments and approved path',()=>{
@@ -61,4 +62,20 @@ test('grant capability enforces per-tool resource restrictions independently on 
   assert.throws(()=>verifyToolGrantCapability(authorization,f.publicKey,{now,
     deviceId:DEVICE,requestId:REQUEST,fingerprint:FINGERPRINT,tool:'read_file',
     arguments:tooMuch,allowedRoot:f.root}),/scope|constraint|authorization/i);
+});
+
+test('grant scope maps to the approved Windows drive and still rejects path escape',()=>{
+  const f=fixture();
+  const outsideRoot=process.platform==='win32'
+    ?path.win32.resolve(path.win32.parse(f.root).root,'tmp\\i4-outside')
+    :path.resolve('/tmp/i4-outside');
+  assert.throws(()=>verifyToolGrantCapability(f.authorization,f.publicKey,{now,
+    deviceId:DEVICE,requestId:REQUEST,fingerprint:FINGERPRINT,tool:'read_file',
+    arguments:f.args,allowedRoot:outsideRoot}),/scope|approved root/i);
+  const outsideArgs={...f.args,path:f.scopeRoot+'/../outside.txt'};
+  const outsideAuthorization=signToolGrantCapability({...f.claims,
+    argumentsDigest:toolArgumentsDigest('read_file',outsideArgs)},f.privateKey);
+  assert.throws(()=>verifyToolGrantCapability(outsideAuthorization,f.publicKey,{now,
+    deviceId:DEVICE,requestId:REQUEST,fingerprint:FINGERPRINT,tool:'read_file',
+    arguments:outsideArgs,allowedRoot:f.root}),/scope|outside/i);
 });

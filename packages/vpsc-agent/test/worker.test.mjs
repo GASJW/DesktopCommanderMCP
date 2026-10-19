@@ -60,6 +60,191 @@ test('worker starts local MCP, authenticates, and dispatches one signed device t
   assert.ok(f.calls.includes('executor-close'));
 });
 
+test('a failed active cancellation poll after local completion cannot block result delivery',async()=>{
+  const f=fixture();let polls=0,worker,finishExecution,markPollStarted;const diagnostics=[];
+  const executionFinished=new Promise(resolve=>{finishExecution=resolve;});
+  const pollStarted=new Promise(resolve=>{markPollStarted=resolve;});
+  f.client.pollControl=async()=>{
+    f.calls.push('poll-control');
+    if(polls++===0)return {frame:{
+      version:1,method:'tools/call',deviceId:DEVICE,sessionId:SESSION,
+      requestId:f.requestId,authorization:AUTHORIZATION,
+      params:{name:'read_file',arguments:{path:'/approved/synthetic-result.txt'}},
+    },cancel:null};
+    markPollStarted();
+    await executionFinished;
+    throw Object.assign(Error('synthetic dropped control response'),{code:'CONTROL_POLL_UNAVAILABLE'});
+  };
+  const handle=f.executor.handle;
+  f.executor.handle=async(...args)=>{await pollStarted;const value=await handle(...args);finishExecution();return value;};
+  const result=f.client.result;
+  f.client.result=async(...args)=>{const acknowledgement=await result(...args);worker.stop();return acknowledgement;};
+  worker=createAgentWorker({deviceId:DEVICE,client:f.client,executor:f.executor,pollIntervalMs:25,
+    onDiagnostic:event=>diagnostics.push(event)});
+  await worker.run();
+  assert.equal(f.calls.filter(item=>item?.type==='handle').length,1);
+  assert.equal(f.calls.filter(item=>item?.type==='result').length,1);
+  assert.equal(polls,2,'the operation starts with one delivery poll and one active control poll');
+  assert.ok(diagnostics.some(event=>event.route==='/agent/result'&&event.outcomeCode==='ACCEPTED'));
+  assert.ok(diagnostics.every(event=>Object.keys(event).sort().join(',')===
+    'deviceId,elapsedMs,outcomeCode,phase,requestId,route'));
+  assert.equal(JSON.stringify(diagnostics).includes('synthetic-result.txt'),false);
+});
+
+test('worker skips a cancellation poll when execution settles during heartbeat',async()=>{
+  const f=fixture();let heartbeats=0,polls=0,releaseHeartbeat,activeHeartbeat,handled,worker;
+  const activeHeartbeatStarted=new Promise(resolve=>{activeHeartbeat=resolve;});
+  const executionStarted=new Promise(resolve=>{handled=resolve;});
+  f.client.heartbeat=async()=>{
+    f.calls.push('heartbeat');
+    if(heartbeats++===1){
+      activeHeartbeat();
+      return new Promise(resolve=>{releaseHeartbeat=()=>resolve({status:'alive',deviceId:DEVICE});});
+    }
+    return {status:'alive',deviceId:DEVICE};
+  };
+  f.client.pollControl=async()=>{
+    f.calls.push('poll-control');
+    if(polls++===0)return {frame:{
+      version:1,method:'tools/call',deviceId:DEVICE,sessionId:SESSION,
+      requestId:f.requestId,authorization:AUTHORIZATION,
+      params:{name:'read_file',arguments:{path:'/approved/test.txt'}},
+    },cancel:null};
+    return {frame:null,cancel:null};
+  };
+  f.executor.handle=async value=>{f.calls.push({type:'handle',frame:value});handled();
+    return {content:[{type:'text',text:'ok'}]};};
+  const result=f.client.result;
+  f.client.result=async(...args)=>{const acknowledgement=await result(...args);worker.stop();return acknowledgement;};
+  worker=createAgentWorker({deviceId:DEVICE,client:f.client,executor:f.executor,pollIntervalMs:25});
+  const running=worker.run();
+  await activeHeartbeatStarted;await executionStarted;
+  await new Promise(resolve=>setTimeout(resolve,25));releaseHeartbeat();
+  await running;
+  assert.equal(polls,1);
+  assert.equal(f.calls.filter(item=>item?.type==='result').length,1);
+});
+
+test('explicit active-session rejection stays fail-closed after a successful local outcome',async()=>{
+  const f=fixture();let signalActiveHeartbeat,finishExecution;
+  const activeHeartbeat=new Promise(resolve=>{signalActiveHeartbeat=resolve;});
+  const executionCommitted=new Promise(resolve=>{finishExecution=resolve;});
+  f.client.heartbeat=async({activeRequestId}={})=>{
+    f.calls.push({type:'heartbeat',activeRequestId});
+    if(activeRequestId){
+      signalActiveHeartbeat();
+      await executionCommitted;
+      throw Object.assign(Error('synthetic expired session'),{code:'REJECTED'});
+    }
+    return {status:'alive',deviceId:DEVICE};
+  };
+  f.executor.handle=async frame=>{
+    f.calls.push({type:'handle',frame});
+    await activeHeartbeat;
+    f.calls.push({type:'ledger-outcome',requestId:frame.requestId,status:'success'});
+    finishExecution();
+    return {content:[{type:'text',text:'locally committed'}]};
+  };
+  const worker=createAgentWorker({deviceId:DEVICE,client:f.client,executor:f.executor,pollIntervalMs:25});
+  await assert.rejects(worker.run(),error=>error.code==='REJECTED');
+  assert.equal(f.calls.filter(item=>item?.type==='handle').length,1);
+  assert.deepEqual(f.calls.filter(item=>item?.type==='ledger-outcome').map(item=>item.status),['success']);
+  assert.equal(f.calls.filter(item=>item?.type==='result').length,0,
+    'an explicit session rejection is not downgraded to an ambiguous heartbeat');
+  assert.ok(f.calls.some(item=>item?.type==='heartbeat'&&item.activeRequestId===f.requestId));
+});
+
+test('late cancellation after an ambiguous active heartbeat acknowledges committed work once',async()=>{
+  const f=fixture(),ownerDigest='e'.repeat(64);let worker,signalControlPoll,commitExecution;
+  const controlPollStarted=new Promise(resolve=>{signalControlPoll=resolve;});
+  const executionCommitted=new Promise(resolve=>{commitExecution=resolve;});
+  const frame={version:1,method:'tools/call',deviceId:DEVICE,sessionId:SESSION,
+    requestId:f.requestId,authorization:{version:1,claims:{ownerDigest},signature:'A'.repeat(86)},
+    params:{name:'read_file',arguments:{path:'/approved/grant-revoked.txt'}}};
+  f.client.heartbeat=async({activeRequestId}={})=>{
+    f.calls.push({type:'heartbeat',activeRequestId});
+    if(activeRequestId)throw Object.assign(Error('ambiguous active heartbeat'),
+      {code:'CONTROL_POLL_UNAVAILABLE'});
+    return {status:'alive',deviceId:DEVICE};
+  };
+  f.client.pollControl=async({activeRequestId}={})=>{
+    f.calls.push({type:'poll-control',activeRequestId});
+    if(!activeRequestId)return {frame,cancel:null};
+    signalControlPoll();
+    await executionCommitted;
+    return {frame:null,cancel:{version:1,type:'cancel',deviceId:DEVICE,
+      sessionId:SESSION,requestId:f.requestId,ownerDigest}};
+  };
+  f.executor.handle=async value=>{
+    f.calls.push({type:'handle',frame:value});
+    await controlPollStarted;
+    f.calls.push({type:'ledger-outcome',requestId:value.requestId,status:'success'});
+    commitExecution();
+    return {content:[{type:'text',text:'locally committed once'}]};
+  };
+  f.client.cancelAck=async value=>{
+    f.calls.push({type:'cancel-ack',value});
+    worker.stop();
+    return {accepted:true,status:'ambiguous'};
+  };
+  const diagnostics=[];
+  worker=createAgentWorker({deviceId:DEVICE,client:f.client,executor:f.executor,
+    pollIntervalMs:25,onDiagnostic:event=>diagnostics.push(event)});
+  await worker.run();
+  assert.equal(f.calls.filter(item=>item?.type==='handle').length,1);
+  assert.deepEqual(f.calls.filter(item=>item?.type==='ledger-outcome').map(item=>item.status),['success']);
+  assert.equal(f.calls.filter(item=>item?.type==='result').length,0);
+  const acknowledgement=f.calls.find(item=>item?.type==='cancel-ack').value;
+  assert.equal(acknowledgement.requestId,f.requestId);
+  assert.equal(acknowledgement.ownerDigest,ownerDigest);
+  assert.equal(acknowledgement.status,'completed');
+  assert.ok(diagnostics.some(event=>event.requestId===f.requestId&&
+    event.route==='/agent/heartbeat'&&event.outcomeCode==='CONTROL_POLL_UNAVAILABLE'));
+});
+
+test('graceful stop finishes an in-flight result acknowledgement before disconnecting',async()=>{
+  const f=fixture();let worker,releaseResult,markResultStarted;
+  const resultStarted=new Promise(resolve=>{markResultStarted=resolve;});
+  f.client.result=async(id,value)=>{
+    f.calls.push({type:'result',id,value});markResultStarted();
+    return new Promise(resolve=>{releaseResult=()=>resolve({accepted:true});});
+  };
+  worker=createAgentWorker({deviceId:DEVICE,client:f.client,executor:f.executor,pollIntervalMs:25});
+  const running=worker.run();
+  await resultStarted;
+  assert.equal(worker.stop(),true);
+  assert.equal(f.calls.includes('disconnect'),false);
+  releaseResult();
+  assert.deepEqual(await running,{status:'stopped'});
+  assert.equal(f.calls.filter(item=>item?.type==='result').length,1);
+  assert.ok(f.calls.includes('disconnect'));
+});
+
+test('idle transport ambiguity reconnects with a fresh session without replaying a delivered operation',async()=>{
+  const f=fixture(),sessionId=randomUUID();
+  let firstPoll=true,taskDelivered=false,reconnects=0;
+  const frame={version:1,method:'tools/call',deviceId:DEVICE,sessionId,
+    requestId:f.requestId,authorization:AUTHORIZATION,
+    params:{name:'read_file',arguments:{path:'/approved/test.txt'}}};
+  f.client.poll=async()=>{
+    f.calls.push('poll');
+    if(firstPoll){firstPoll=false;throw Object.assign(Error('lost idle poll response'),{code:'AMBIGUOUS_TRANSPORT'});}
+    if(!taskDelivered){taskDelivered=true;return frame;}
+    return null;
+  };
+  f.client.reconnect=async()=>{reconnects++;f.calls.push('reconnect');
+    return {deviceId:DEVICE,sessionId};};
+  const worker=createAgentWorker({deviceId:DEVICE,client:f.client,executor:f.executor,pollIntervalMs:25});
+  const running=worker.run();
+  await waitFor(()=>f.calls.some(item=>item?.type==='result'));
+  worker.stop();
+  await running;
+  assert.equal(reconnects,1);
+  assert.equal(f.calls.filter(item=>item?.type==='handle').length,1);
+  assert.equal(f.calls.filter(item=>item?.type==='result').length,1);
+  assert.ok(f.calls.indexOf('reconnect')<f.calls.findIndex(item=>item?.type==='handle'));
+});
+
 test('worker forwards cancellation to the executor and never reports a cancelled result',async()=>{
   const f=fixture();
   let handleSignal;
@@ -82,7 +267,7 @@ test('authenticated cancel control aborts only the active request and reports am
   const frame={version:1,method:'tools/call',deviceId:DEVICE,sessionId:SESSION,
     requestId:f.requestId,authorization:{version:1,claims:{ownerDigest},signature:'A'.repeat(86)},
     params:{name:'run_command',arguments:{profile:'count_lines',path:'/approved/test.txt'}}};
-  let polls=0,handleSignal;
+  let polls=0,handleSignal,releaseCancelAck;
   f.client.pollControl=async()=>{
     f.calls.push('poll-control');
     if(polls++===0)return {frame,cancel:null};
@@ -91,7 +276,7 @@ test('authenticated cancel control aborts only the active request and reports am
     return {frame:null,cancel:null};
   };
   f.client.cancelAck=async value=>{f.calls.push({type:'cancel-ack',value});
-    return {accepted:true,status:value.status};};
+    return new Promise(resolve=>{releaseCancelAck=()=>resolve({accepted:true,status:value.status});});};
   f.executor.handle=async(_value,{signal}={})=>{
     handleSignal=signal;
     return new Promise((_resolve,reject)=>signal.addEventListener('abort',()=>
@@ -103,6 +288,8 @@ test('authenticated cancel control aborts only the active request and reports am
   await waitFor(()=>handleSignal!==undefined);
   await waitFor(()=>f.calls.some(item=>item?.type==='cancel-ack'));
   worker.stop();
+  assert.equal(f.calls.includes('disconnect'),false);
+  releaseCancelAck();
   await running;
   const acknowledgement=f.calls.find(item=>item?.type==='cancel-ack').value;
   assert.equal(acknowledgement.requestId,f.requestId);
@@ -186,6 +373,38 @@ test('cancellation arriving after completion is acknowledged as completed withou
   assert.equal(executions,1,'completed work is never replayed');
   assert.equal(f.calls.filter(item=>item?.type==='result').length,0,
     'a late cancellation cannot convert completion into a result or rollback claim');
+});
+
+test('a rejected result is reconciled only with its matching authenticated cancellation',async()=>{
+  const f=fixture();let polls=0,resultAttempted=false,worker;
+  const ownerDigest='d'.repeat(64);
+  const frame={version:1,method:'tools/call',deviceId:DEVICE,sessionId:SESSION,
+    requestId:f.requestId,authorization:{version:1,claims:{ownerDigest},signature:'A'.repeat(86)},
+    params:{name:'read_file',arguments:{path:'/approved/synthetic-cancel-race.txt'}}};
+  f.client.pollControl=async()=>{
+    f.calls.push('poll-control');
+    if(polls++===0)return {frame,cancel:null};
+    if(!resultAttempted)return {frame:null,cancel:null};
+    return {frame:null,cancel:{version:1,type:'cancel',deviceId:DEVICE,sessionId:SESSION,
+      requestId:f.requestId,ownerDigest}};
+  };
+  f.client.result=async(id,value)=>{
+    f.calls.push({type:'result',id,value});
+    resultAttempted=true;
+    throw Object.assign(Error('synthetic Owner deadline won the race'),{code:'RESULT_NOT_ACCEPTED'});
+  };
+  f.client.cancelAck=async value=>{
+    f.calls.push({type:'cancel-ack',value});
+    worker.stop();
+    return {accepted:true,status:'ambiguous'};
+  };
+  worker=createAgentWorker({deviceId:DEVICE,client:f.client,executor:f.executor,pollIntervalMs:25});
+  await worker.run();
+  assert.equal(f.calls.filter(item=>item?.type==='handle').length,1);
+  assert.equal(f.calls.filter(item=>item?.type==='result').length,1);
+  const acknowledgement=f.calls.find(item=>item?.type==='cancel-ack').value;
+  assert.equal(acknowledgement.requestId,f.requestId);
+  assert.equal(acknowledgement.status,'completed');
 });
 
 test('mismatched cancellation control cannot abort or acknowledge another owner request',async()=>{

@@ -95,7 +95,10 @@ test('approved identity binding rejects a receipt for another key or invalid rev
     assert.equal(loadOrCreateDeviceIdentity({directory:dir}).deviceBinding,null);
   });
 });
-test('directory fsync failure after identity rename preserves a recovery lock',()=>{
+test('POSIX directory fsync failure after identity rename preserves a recovery lock',
+  {skip:process.platform==='win32'
+    ?'Fault injection resolves the directory descriptor through /proc; Windows write-through replacement is covered by windows-security.test.mjs'
+    :false},()=>{
   withTemp(dir=>{
     const identity=loadOrCreateDeviceIdentity({directory:dir});
     const original=fs.fsyncSync;
@@ -212,8 +215,11 @@ test('SIGKILL during identity binding leaves evidence that blocks identity loadi
       }catch(error){reject(error);}});
       child.once('error',reject);
     });
-    child.kill('SIGKILL');
-    await new Promise(resolve=>child.once('close',resolve));
+    const childClosed=new Promise(resolve=>child.once('close',resolve));
+    if(process.platform==='win32')execFileSync(path.join(process.env.SystemRoot??'C:\\Windows',
+      'System32','taskkill.exe'),['/PID',String(child.pid),'/T','/F'],{stdio:'ignore',windowsHide:true});
+    else child.kill('SIGKILL');
+    await childClosed;
     assert.throws(()=>loadOrCreateDeviceIdentity({directory:dir}),/binding.*recovery|interrupted binding/i);
     const diagnosis=analyzeDeviceIdentityBindingRecovery({directory:dir});
     assert.equal(diagnosis.state,'STALE_LOCK');

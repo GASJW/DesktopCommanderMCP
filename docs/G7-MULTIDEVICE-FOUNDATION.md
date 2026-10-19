@@ -1,5 +1,7 @@
 # G7.1 — Device Registry Foundation (inert candidate)
 
+> Histórico: este documento descreve os gates anteriores ao baseline I5F. O follow-on I7 implementa parte do escopo descrito abaixo em um release candidate separado; ainda não está implantado no Gateway ativo.
+
 **Goal:** Prepare our own-Gateway device identity and observation model to replace RDC routing in future stages. This PR does **not** provide multi-device execution, enrollment endpoints, an npx agent, root access, or production rollout.
 
 ## Owner-approved target
@@ -43,3 +45,7 @@ Keep standard agents non-root and non-administrator. Build an independent, audit
 - G7.3 requires separate privileged-operation threat model/approval.
 - A signature proves possession of a private key, not physical-machine attestation or consent. Heartbeat measures a session, not child-process health.
 - Preserve G6 production and PR #10 G5.2. Do not touch Cloudflare DNS/policies, cofre, Pantheon, Hermes or OpenMausBot.
+
+## I7 follow-on
+
+The I7 candidate adds a native Windows worker, DPAPI/NTFS identity and ledger storage, additive per-device M2M configuration and explicit `deviceId` routing. See [G7 I7 Windows and multi-device RC](G7-I7-WINDOWS-MULTIDEVICE-RC.md) for its behavior, test boundary, pilot connection, and rollback. Those capabilities remain inactive on the live Gateway until a separately approved rollout.

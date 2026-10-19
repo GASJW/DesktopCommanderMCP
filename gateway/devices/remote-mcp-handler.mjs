@@ -110,7 +110,7 @@ async function readRequest(req){
 }
 
 export function createRemoteDeviceMcpHandler({accessVerifier,deviceRegistry,trustStore,router,
-  authorizeDevice,grantStore,policySigningKey,getTrustRevision,getDeviceApprovalReceipt}={}){
+  authorizeDevice,grantStore,policySigningKey,getTrustRevision,getDeviceApprovalReceipt,onDiagnostic}={}){
   if(!accessVerifier||typeof accessVerifier.verifyPrincipal!=='function'||
      !deviceRegistry||typeof deviceRegistry.listDevices!=='function'||
      typeof deviceRegistry.isLiveSession!=='function'||
@@ -119,7 +119,8 @@ export function createRemoteDeviceMcpHandler({accessVerifier,deviceRegistry,trus
      !router||typeof router.callDevice!=='function'||typeof authorizeDevice!=='function'||
      !grantStore||typeof grantStore.authorizeAndPermit!=='function'||
      typeof grantStore.withCurrentAuthorization!=='function'||!policySigningKey||
-     typeof getTrustRevision!=='function'||typeof getDeviceApprovalReceipt!=='function'){
+     typeof getTrustRevision!=='function'||typeof getDeviceApprovalReceipt!=='function'||
+     onDiagnostic!==undefined&&typeof onDiagnostic!=='function'){
     throw new TypeError('Owner verifier, durable trust and approval receipt, router, durable tool grant store and Gateway signing key are required');
   }
   return async function handleRemoteDeviceMcp(req,res){
@@ -210,9 +211,16 @@ export function createRemoteDeviceMcpHandler({accessVerifier,deviceRegistry,trus
     res.once('close',abortOnDisconnect);
     let serialized;
     const requestId=randomUUID();
+    const requestStartedAt=performance.now();
+    const report=(phase,outcomeCode)=>{
+      if(!onDiagnostic)return;
+      try{onDiagnostic(Object.freeze({requestId,deviceId,route:'/mcp',phase,outcomeCode,
+        elapsedMs:Math.max(0,Math.round(performance.now()-requestStartedAt))}));}catch{}
+    };
     let authorizationContext;
     let responseFenceContext;
     try{
+      report('owner_dispatch','STARTED');
       const result=await router.callDevice({requestId,deviceId,name,arguments:arguments_,
         signal:controller.signal,beforeDispatch:async dispatch=>{
           if(!dispatch||dispatch.deviceId!==deviceId||dispatch.requestId!==requestId||
@@ -266,6 +274,7 @@ export function createRemoteDeviceMcpHandler({accessVerifier,deviceRegistry,trus
           }};
         }});
       if(res.destroyed)return;
+      report('owner_dispatch','RESULT_READY');
       serialized=JSON.stringify(result);
       if(typeof serialized!=='string'||Buffer.byteLength(serialized,'utf8')>MAX_RESPONSE_BYTES){
         return jsonError(res,502,message.id,-32004,'Remote response invalid or too large');
@@ -292,10 +301,12 @@ export function createRemoteDeviceMcpHandler({accessVerifier,deviceRegistry,trus
               {code:'DEVICE_AUTHORIZATION_CHANGED'});
           }
           send(res,200,{jsonrpc:'2.0',id:message.id,result:JSON.parse(serialized)});delivered=true;
+          report('owner_response','DELIVERED');
         }));
       }catch(error){
         if(res.destroyed)return;
         const code=error?.code==='DENIED'?'AMBIGUOUS_GRANT_REVOCATION':'AMBIGUOUS_AUTHORIZATION_FENCE';
+        report('owner_response',code);
         return send(res,503,{jsonrpc:'2.0',id:message.id,error:{code:-32005,
           message:'Remote result suppressed after dispatch; do not replay',data:{code}}});
       }
@@ -315,6 +326,7 @@ export function createRemoteDeviceMcpHandler({accessVerifier,deviceRegistry,trus
       }
       const code=typeof error?.code==='string'&&/^[A-Z_]{1,48}$/.test(error.code)
         ?error.code:'UNAVAILABLE';
+      report('owner_response',code);
       return send(res,503,{jsonrpc:'2.0',id:message.id,error:{
         code:-32005,message:code.startsWith('AMBIGUOUS_')
           ?'Remote operation outcome unknown; do not replay'

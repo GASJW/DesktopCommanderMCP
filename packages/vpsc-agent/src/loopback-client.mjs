@@ -27,7 +27,7 @@ export function createLoopbackAgentClient({url,identity,deviceId,fetchFn=fetch}=
       headers['x-vpsc-signature']=identity.signFrame(framed);
     }
     const res=await fetchFn(parsed.origin+pathname,{
-      method:'POST',headers,body:raw,redirect:'error',signal:AbortSignal.timeout(2000),
+      method:'POST',headers,body:raw,redirect:'error',signal:AbortSignal.timeout(15_000),
     });
     const data=await res.json();
     if(!res.ok)throw Error('Pilot request rejected: '+res.status);

@@ -24,6 +24,9 @@ const HOST='127.0.0.1';
 const OWNER_ORIGIN=/^https:\/\/[a-z0-9.-]+$/;
 const OWNER_TEST_ISSUER='https://g7-owner-staging.cloudflareaccess.com';
 const MACHINE_TEST_ISSUER='https://g7-machine-staging.cloudflareaccess.com';
+const requestDiagnostic=event=>{
+  try{process.stdout.write(JSON.stringify({event:'REQUEST_DIAGNOSTIC',...event})+'\n');}catch{}
+};
 export function isValidStagingIssuer(value,role){
   if(role==='owner')return value===OWNER_TEST_ISSUER;
   if(role==='machine')return value===MACHINE_TEST_ISSUER;
@@ -49,14 +52,16 @@ function validateConfig(c){
   const paths=c?.storage;
   if(process.platform!=='linux'||typeof process.getuid!=='function'||process.getuid()===0)
     throw new Error('G7 staging runtime requires a nonroot Linux user');
-  if(!exact(c,'hostname,listen,machine,owner,policy,storage,tls,version')||c.version!==1||
+  const machineV1=exact(c?.machine,'audience,clientId,issuer,jwks,serviceSecret,signingKeyPath');
+  const machineV2=exact(c?.machine,'audience,clients,issuer,jwks,signingKeyPath');
+  if(!exact(c,'hostname,listen,machine,owner,policy,storage,tls,version')||
+     !(c.version===1&&machineV1||c.version===2&&machineV2)||
      typeof c.hostname!=='string'||!/^[a-z0-9.-]{6,255}$/.test(c.hostname)||
      !c.hostname.includes('.')||c.hostname==='localhost'||c.hostname.endsWith('.local')||
      !exact(c.listen,'host,port')||c.listen.host!==HOST||!Number.isSafeInteger(c.listen.port)||
      c.listen.port<0||c.listen.port>65535||
      !exact(c.tls,'certificatePath,keyPath')||
      !exact(c.owner,'audience,controlToken,email,issuer,jwks,origin,subject')||
-     !exact(c.machine,'audience,clientId,issuer,jwks,serviceSecret,signingKeyPath')||
      !exact(c.policy,'directory,privateKeyPem,publicKeyPem')||
      !exact(paths,'auditDirectory,bindingDirectory,grantDirectory,trustDirectory')||
      ![paths.auditDirectory,paths.bindingDirectory,paths.grantDirectory,paths.trustDirectory,
@@ -71,12 +76,21 @@ function validateConfig(c){
      typeof c.owner.email!=='string'||!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(c.owner.email)||
      typeof c.owner.subject!=='string'||c.owner.subject.length<1||c.owner.subject.length>1024||
      typeof c.owner.controlToken!=='string'||!/^[a-f0-9]{64}$/.test(c.owner.controlToken)||
-     typeof c.machine.clientId!=='string'||!CLIENT.test(c.machine.clientId)||
-     typeof c.machine.serviceSecret!=='string'||c.machine.serviceSecret.length<24||
-     /[\r\n\0]/.test(c.machine.serviceSecret)||
      !Array.isArray(c.owner.jwks)||c.owner.jwks.length!==1||
      !Array.isArray(c.machine.jwks)||c.machine.jwks.length!==1||
      !c.owner.jwks[0]||!c.machine.jwks[0])throw new Error('Invalid or incomplete staging configuration');
+  const machineClients=c.version===1
+    ?[{clientId:c.machine.clientId,serviceSecret:c.machine.serviceSecret}]
+    :c.machine.clients;
+  if(!Array.isArray(machineClients)||machineClients.length<(c.version===2?2:1)||
+     machineClients.length>64||machineClients.some(item=>!exact(item,'clientId,serviceSecret')||
+       typeof item.clientId!=='string'||!CLIENT.test(item.clientId)||
+       typeof item.serviceSecret!=='string'||item.serviceSecret.length<24||
+       /[\r\n\0]/.test(item.serviceSecret))||
+     new Set(machineClients.map(item=>item.clientId)).size!==machineClients.length||
+     new Set(machineClients.map(item=>item.serviceSecret)).size!==machineClients.length){
+    throw new Error('Staging machine identities must use distinct Client-IDs and secrets');
+  }
   for(const jwk of [c.owner.jwks[0],c.machine.jwks[0]]){
     if(jwk.kty!=='RSA'||jwk.alg!=='RS256'||typeof jwk.kid!=='string'||
        typeof jwk.n!=='string'||typeof jwk.e!=='string'||'d' in jwk)throw new Error('Staging JWKS must contain public RSA keys only');
@@ -93,19 +107,20 @@ function validateConfig(c){
   if(policyPrivate.asymmetricKeyType!=='ed25519'||policyPublic.asymmetricKeyType!=='ed25519'||
      !createPublicKey(policyPrivate).export({type:'spki',format:'der'}).equals(
        policyPublic.export({type:'spki',format:'der'})))throw new Error('Gateway policy key pair is inconsistent');
-  return {tls:{key:tlsKey,cert:tlsCert},machineSigner:signer,policyPrivate,policyPublic};
+  return {tls:{key:tlsKey,cert:tlsCert},machineSigner:signer,policyPrivate,policyPublic,
+    machineClients};
 }
 async function readJson(req,maxBytes=32*1024){
   const chunks=[];let size=0;
   for await(const chunk of req){size+=chunk.length;if(size>maxBytes)throw Error('request too large');chunks.push(chunk);}
   return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(Buffer.concat(chunks,size)));
 }
-function mintMachineJwt(config,privateKey){
+function mintMachineJwt(config,privateKey,clientId){
   // This short-lived assertion is internal to the TLS Gateway composition;
   // the external edge rejects client-supplied assertions. Replay defense for
   // agent operations is the one-use challenge plus signed monotonic frame sequence.
   const now=Math.floor(Date.now()/1000),head=Buffer.from(JSON.stringify({alg:'RS256',kid:config.machine.jwks[0].kid})).toString('base64url');
-  const body=Buffer.from(JSON.stringify({type:'app',sub:'',common_name:config.machine.clientId,
+  const body=Buffer.from(JSON.stringify({type:'app',sub:'',common_name:clientId,
     iss:config.machine.issuer,aud:config.machine.audience,iat:now,exp:now+60})).toString('base64url');
   return `${head}.${body}.${sign('RSA-SHA256',Buffer.from(`${head}.${body}`),privateKey).toString('base64url')}`;
 }
@@ -129,7 +144,7 @@ export async function startG7StagingGateway(config){
     return principal?.subject===config.owner.subject?principal:null;
   }};
   const machineAccess=createMachineAccessVerifier({issuer:config.machine.issuer,
-    audience:config.machine.audience,allowedClientIds:[config.machine.clientId],
+    audience:config.machine.audience,allowedClientIds:keys.machineClients.map(item=>item.clientId),
     keyProvider:async()=>({keys:config.machine.jwks})});
   const storage=config.storage;
   const trustStore=createDurableDeviceTrustStore({directory:storage.trustDirectory});
@@ -144,6 +159,8 @@ export async function startG7StagingGateway(config){
     const expectedOwner={issuer:config.owner.issuer,subject:config.owner.subject};
     const expectedOwnerId=ownerPrincipalId(expectedOwner);
     const expectedOwnerDigest=ownerIdentityDigest(expectedOwner);
+    const bindingForDevice=deviceId=>keys.machineClients.map(item=>
+      machineBindingStore.resolve(item.clientId)).find(binding=>binding?.deviceId===deviceId)??null;
     machineBindingStore=createDurableMachineBindingStore({directory:storage.bindingDirectory,
       verifyApprovalReceipt:binding=>binding.ownerId===expectedOwnerId&&
         binding.ownerDigest===expectedOwnerDigest?readApprovalById(binding.ownerId,binding.deviceId):null,
@@ -153,7 +170,7 @@ export async function startG7StagingGateway(config){
     const bindingService=createOwnerMachineBindingService({accessVerifier:ownerAccess,
       auditWrite:audit.auditWrite,readApprovalReceipt,machineBindingStore});
     grantStore=createDurableToolGrantStore({directory:storage.grantDirectory});
-    router=createDeviceRouter({registry:trustStore.registry,timeoutMs:30_000});
+    router=createDeviceRouter({registry:trustStore.registry,timeoutMs:30_000,onDiagnostic:requestDiagnostic});
     const shouldCancelOperation=frame=>{
       const claims=frame?.authorization?.claims;
       if(!claims||claims.deviceId!==frame.deviceId||claims.requestId!==frame.requestId)return false;
@@ -171,7 +188,8 @@ export async function startG7StagingGateway(config){
       deviceRegistry:trustStore.registry,trustStore,router,
       authorizeDevice:createDurableOwnerDeviceAuthorizer({auditDirectory:storage.auditDirectory,
         trustDirectory:storage.trustDirectory}),grantStore,policySigningKey:keys.policyPrivate,
-      getTrustRevision:()=>trustStore.revision(),getDeviceApprovalReceipt:readApprovalReceipt});
+      getTrustRevision:()=>trustStore.revision(),getDeviceApprovalReceipt:readApprovalReceipt,
+      onDiagnostic:requestDiagnostic});
     const handle=async(req,res)=>{
       try{
         const url=new URL(req.url,'https://'+config.hostname);
@@ -196,14 +214,16 @@ export async function startG7StagingGateway(config){
           return await pairingHandler(req,res);
         if(url.pathname==='/mcp')return await mcpHandler(req,res);
         if(AGENT_PATHS.has(url.pathname)){
+          const machineClient=keys.machineClients.find(item=>item.clientId===
+            req.headers['cf-access-client-id']);
           if(req.method!=='POST'||req.headers.origin||req.headers.cookie||
              req.headers['cf-access-jwt-assertion']||
-             !secretMatches(config.machine.clientId,req.headers['cf-access-client-id'])||
-             !secretMatches(config.machine.serviceSecret,req.headers['cf-access-client-secret']))
+             !machineClient||!secretMatches(machineClient.serviceSecret,
+               req.headers['cf-access-client-secret']))
             return reply(res,403,{error:'Machine service token denied'});
           let body;try{body=await bodyBuffer(req,256*1024);}catch{return reply(res,413,{error:'Request too large'});}
           const headers={'content-type':'application/json','cf-access-jwt-assertion':
-            mintMachineJwt(config,keys.machineSigner)};
+            mintMachineJwt(config,keys.machineSigner,machineClient.clientId)};
           for(const name of ['x-vpsc-device-id','x-vpsc-session-id','x-vpsc-sequence','x-vpsc-signature']){
             if(typeof req.headers[name]==='string')headers[name]=req.headers[name];
           }
@@ -221,7 +241,8 @@ export async function startG7StagingGateway(config){
           const input=await readJson(req,64*1024);
           if(url.pathname==='/stage/bind'){
             if(!exact(input,'clientId,deviceId,expectedRevision')||
-               input.clientId!==config.machine.clientId)return reply(res,400,{error:'Invalid binding request'});
+               !keys.machineClients.some(item=>item.clientId===input.clientId))
+              return reply(res,400,{error:'Invalid binding request'});
             const result=await bindingService.bind({ownerAssertion:req.headers['cf-access-jwt-assertion'],
               clientId:input.clientId,deviceId:input.deviceId,expectedRevision:input.expectedRevision});
             return reply(res,200,{revision:result.revision,binding:result.binding,alreadyBound:result.alreadyBound===true});
@@ -229,7 +250,7 @@ export async function startG7StagingGateway(config){
           const deviceId=input.deviceId;
           if(!UUID.test(deviceId??''))return reply(res,400,{error:'Invalid device'});
           const receipt=readApprovalReceipt(owner,deviceId);
-          const binding=machineBindingStore.resolve(config.machine.clientId);
+          const binding=bindingForDevice(deviceId);
           if(!receipt||!binding||binding.deviceId!==deviceId||binding.ownerId!==ownerPrincipalId(owner)||
              binding.ownerDigest!==ownerIdentityDigest(owner)||binding.fingerprint!==receipt.fingerprint)
             return reply(res,403,{error:'Owner device binding is not current'});
@@ -253,7 +274,7 @@ export async function startG7StagingGateway(config){
             return reply(res,200,{revision:grantStore.revision(),grantId:revoked.grantId,active:revoked.active});
           }
           if(url.pathname==='/stage/revoke-device'){
-            if(!exact(input,'clientId,deviceId')||input.clientId!==config.machine.clientId)
+            if(!exact(input,'clientId,deviceId')||input.clientId!==binding.clientId)
               return reply(res,400,{error:'Invalid device revocation'});
             const revoked=trustStore.revokeDevice(deviceId);
             return reply(res,200,{deviceId,revoked,trustRevision:trustStore.revision()});
