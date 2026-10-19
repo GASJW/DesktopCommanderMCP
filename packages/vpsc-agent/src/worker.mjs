@@ -169,9 +169,16 @@ export function createAgentWorker({deviceId,client,executor,pollIntervalMs=250,o
         try{
           await Promise.resolve();
           while(!settled&&!controller.signal.aborted){
-            const currentHeartbeat=await client.heartbeat({signal:controller.signal});
-            if(!currentHeartbeat||currentHeartbeat.deviceId!==deviceId||currentHeartbeat.status!=='alive'){
-              throw fail('PROTOCOL','Gateway heartbeat did not confirm the active device session');
+            try{
+              const currentHeartbeat=await client.heartbeat({signal:controller.signal,
+                activeRequestId:frame.requestId});
+              if(!currentHeartbeat||currentHeartbeat.deviceId!==deviceId||currentHeartbeat.status!=='alive'){
+                throw fail('PROTOCOL','Gateway heartbeat did not confirm the active device session');
+              }
+            }catch(error){
+              if(error?.code!=='CONTROL_POLL_UNAVAILABLE')throw error;
+              report(frame.requestId,'/agent/heartbeat','active_control',
+                'CONTROL_POLL_UNAVAILABLE',requestStartedAt);
             }
             if(settled)break;
             let control;

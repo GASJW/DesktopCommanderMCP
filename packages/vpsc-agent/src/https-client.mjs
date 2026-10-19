@@ -62,9 +62,9 @@ export function createHttpsAgentClient({
   const gatewayNowMs=()=>Date.now()+gatewayClockOffsetMs;
   function ambiguousResponse(activeRequestId){
     if(UUID.test(activeRequestId??'')){
-      // An active operation blocks task dequeue; a larger signed sequence can
-      // safely submit its one result after this control response is lost.
-      throw fail('CONTROL_POLL_UNAVAILABLE','Active control poll response is unavailable');
+      // Keep the delivered session fenced to its one result/control path. The
+      // Gateway accepts only a strictly larger signed sequence after a lost reply.
+      throw fail('CONTROL_POLL_UNAVAILABLE','Active control response is unavailable');
     }
     // A route may have consumed a challenge, advanced a frame sequence, or
     // accepted a result before the response became unusable. Fence this client.
@@ -101,8 +101,8 @@ export function createHttpsAgentClient({
         cache:'no-store',credentials:'omit',signal:requestSignal,
       });
     }catch{
-      if(route==='/agent/poll'&&UUID.test(activeRequestId??'')){
-        throw fail('CONTROL_POLL_UNAVAILABLE','Active control poll transport is unavailable');
+      if((route==='/agent/poll'||route==='/agent/heartbeat')&&UUID.test(activeRequestId??'')){
+        throw fail('CONTROL_POLL_UNAVAILABLE','Active control transport is unavailable');
       }
       // Once the network request started, never assume the operation was not
       // delivered. No implicit replay after an uncertain outcome.
@@ -162,8 +162,12 @@ export function createHttpsAgentClient({
     closed=false;sequence=0;
     return connect({signal});
   }
-  async function heartbeat({signal}={}){
-    const answer=await request('/agent/heartbeat',{},true,signal);
+  async function heartbeat({signal,activeRequestId}={}){
+    if(activeRequestId!==undefined&&activeRequestId!==deliveredRequestId){
+      throw fail('STATE','Active heartbeat must match the delivered operation');
+    }
+    const safeActiveRequestId=activeRequestId===deliveredRequestId?activeRequestId:undefined;
+    const answer=await request('/agent/heartbeat',{},true,signal,safeActiveRequestId);
     if(!exactKeys(answer,'deviceId,status')||answer.deviceId!==deviceId||answer.status!=='alive'){
       return ambiguousResponse();
     }

@@ -31,7 +31,7 @@ function jwt(privateKey){
     aud:AUD,iss:ISSUER,iat:SEC-10,exp:SEC+3600})).toString('base64url');
   return a+'.'+b+'.'+sign('RSA-SHA256',Buffer.from(a+'.'+b),privateKey).toString('base64url');
 }
-async function harness({timeoutMs=30_000,beforeFetch,shouldCancelOperation}={}){
+async function harness({timeoutMs=30_000,beforeFetch,afterFetch,shouldCancelOperation}={}){
   const registry=createDeviceRegistry(),router=createDeviceRouter({registry,timeoutMs});
   const pairing=createPairingCoordinator({registry});
   const identity=createEphemeralPairingIdentity();
@@ -66,9 +66,10 @@ async function harness({timeoutMs=30_000,beforeFetch,shouldCancelOperation}={}){
     delete headers['cf-access-client-id'];
     delete headers['cf-access-client-secret'];
     headers['cf-access-jwt-assertion']=assertion;
-    return fetch(ingress.url+u.pathname,{
+    const response=await fetch(ingress.url+u.pathname,{
       ...opts,headers,redirect:'error',
     });
+    return afterFetch?await afterFetch({route:u.pathname,response}):response;
   };
   const client=createHttpsAgentClient({gatewayUrl:BASE_URL,expectedHostname:HOST,
     identity,deviceId,clientId:CLIENT,clientSecret:SECRET,fetchFn:fakeEdge});
@@ -264,6 +265,134 @@ test('a completed read submits its result without a post-commit control-poll rou
     await executor.close();
     await x.close();
     rmSync(tmp,{recursive:true,force:true});
+  }
+});
+
+for(const failure of ['request not delivered','dropped response','HTTP 503']){
+  test(`one Owner-dispatched result survives a delayed active-heartbeat ${failure}`,async()=>{
+    const requestId=randomUUID();let ledgerFile,activeHeartbeats=0,resultAttempts=0,
+      postCommitPolls=0,committedOutcome=false,worker;
+    let commitLedger,activeHeartbeatStarted,gatewayHeartbeatStatus=null;
+    const committed=new Promise(resolve=>{commitLedger=resolve;});
+    const heartbeatInFlight=new Promise(resolve=>{activeHeartbeatStarted=resolve;});
+    const x=await harness({timeoutMs:3000,
+      beforeFetch:async({route})=>{
+        if(route==='/agent/poll'&&committedOutcome)postCommitPolls++;
+        if(route!=='/agent/heartbeat'||++activeHeartbeats!==2||failure!=='request not delivered')return null;
+        activeHeartbeatStarted();
+        await committed;
+        await new Promise(resolve=>setImmediate(resolve));
+        return new Response('{"error":"synthetic heartbeat request unavailable"}',{
+          status:503,headers:{'content-type':'application/json'},
+        });
+      },
+      afterFetch:async({route,response})=>{
+        if(route!=='/agent/heartbeat'||activeHeartbeats!==2||failure==='request not delivered')return response;
+        activeHeartbeatStarted();
+        await committed;
+        await new Promise(resolve=>setImmediate(resolve));
+        gatewayHeartbeatStatus=response.status;
+        if(failure==='dropped response')throw Error('synthetic lost heartbeat response');
+        return new Response('{"error":"synthetic heartbeat response unavailable"}',{
+          status:503,headers:{'content-type':'application/json'},
+        });
+      }});
+    const tmp=mkdtempSync(path.join(os.tmpdir(),'vpsc-active-heartbeat-'));
+    ledgerFile=path.join(tmp,'i4-execution.jsonl');writeFileSync(ledgerFile,'');
+    let executions=0,onlineResolve;
+    const online=new Promise(resolve=>{onlineResolve=resolve;});
+    const diagnostics=[];
+    const executor={start:async()=>{},close:async()=>{},handle:async frame=>{
+      executions++;
+      appendFileSync(ledgerFile,JSON.stringify({requestId:frame.requestId,type:'intent'})+'\n');
+      appendFileSync(ledgerFile,JSON.stringify({requestId:frame.requestId,
+        type:'outcome',status:'success'})+'\n');
+      committedOutcome=true;
+      commitLedger();
+      return {content:[{type:'text',text:'synthetic active heartbeat result proof'}]};
+    }};
+    const client={
+      connect:(...values)=>x.client.connect(...values),
+      heartbeat:async(...values)=>{const value=await x.client.heartbeat(...values);onlineResolve();return value;},
+      poll:(...values)=>x.client.poll(...values),pollControl:(...values)=>x.client.pollControl(...values),
+      result:async(...values)=>{resultAttempts++;const value=await x.client.result(...values);worker.stop();return value;},
+      cancelAck:(...values)=>x.client.cancelAck(...values),
+      disconnect:(...values)=>x.client.disconnect(...values),close:(...values)=>x.client.close(...values),
+    };
+    let run;
+    try{
+      worker=createAgentWorker({deviceId:x.deviceId,client,executor,pollIntervalMs:25,
+        onDiagnostic:event=>diagnostics.push(event)});
+      run=worker.run();
+      await online;
+      const pending=x.router.callDevice({deviceId:x.deviceId,name:'read_file',
+        arguments:{path:'/approved/heartbeat-proof.txt'},requestId,
+        beforeDispatch:async()=>({authorization:{version:1,
+          claims:{ownerDigest:'a'.repeat(64)},signature:'A'.repeat(86)},release:()=>true})});
+      const finish=Promise.race([
+        pending.then(value=>({kind:'owner',value}),error=>({kind:'owner-error',code:error?.code??'UNKNOWN'})),
+        run.then(()=>({kind:'worker-stopped'}),error=>({kind:'worker-error',code:error?.code??'UNKNOWN'})),
+      ]);
+      await heartbeatInFlight;
+      const outcome=await finish;
+      assert.equal(outcome.kind,'owner',JSON.stringify({kind:outcome.kind,code:outcome.code}));
+      await run;
+      assert.equal(gatewayHeartbeatStatus,failure==='request not delivered'?null:200,
+        'the test distinguishes a lost request from a lost response after Gateway acceptance');
+      assert.match(JSON.stringify(outcome.value),/synthetic active heartbeat result proof/);
+      assert.equal(executions,1,'the delivered operation executes once');
+      assert.equal(resultAttempts,1,'the durable outcome is submitted once');
+      assert.equal(postCommitPolls,0,'a completed operation proceeds directly to its one result submission');
+      const records=readFileSync(ledgerFile,'utf8').trim().split(/\r?\n/).filter(Boolean).map(JSON.parse)
+        .filter(record=>record.requestId===requestId);
+      assert.deepEqual(records.map(record=>record.type),['intent','outcome']);
+      assert.equal(records[1].status,'success');
+      assert.ok(diagnostics.some(event=>event.requestId===requestId&&event.route==='/agent/heartbeat'&&
+        event.phase==='active_control'&&event.outcomeCode==='CONTROL_POLL_UNAVAILABLE'));
+      const signed=x.observed.filter(item=>item.headers['x-vpsc-sequence']);
+      const sequences=signed.map(item=>Number(item.headers['x-vpsc-sequence']));
+      assert.ok(sequences.every((value,index)=>index===0||value>sequences[index-1]),
+        'heartbeat loss preserves the signed sequence for result submission');
+      assert.equal(new Set(signed.map(item=>item.headers['x-vpsc-session-id'])).size,1,
+        'the in-flight operation keeps its original authenticated session');
+      assert.ok(diagnostics.some(event=>event.requestId===requestId&&event.route==='/agent/result'&&
+        event.phase==='acknowledgement'&&event.outcomeCode==='ACCEPTED'));
+    }finally{
+      worker?.stop();
+      await run?.catch(()=>{});
+      await executor.close().catch(()=>{});
+      await x.close();
+      rmSync(tmp,{recursive:true,force:true});
+    }
+  });
+}
+test('an explicit expired-session response remains a rejection during an active operation',async()=>{
+  let heartbeatCount=0;
+  const x=await harness({beforeFetch:async({route})=>{
+    if(route==='/agent/heartbeat'&&++heartbeatCount===2){
+      return new Response('{"error":"expired session"}',{
+        status:401,headers:{'content-type':'application/json'},
+      });
+    }
+    return null;
+  }});
+  const requestId=randomUUID();
+  let pending;
+  try{
+    await x.client.connect();
+    await x.client.heartbeat();
+    pending=x.router.callDevice({deviceId:x.deviceId,name:'read_file',
+      arguments:{path:'/approved/expired-session.txt'},requestId,
+      beforeDispatch:async()=>({authorization:{version:1,
+        claims:{ownerDigest:'b'.repeat(64)},signature:'A'.repeat(86)},release:()=>true})});
+    pending.catch(()=>{});
+    const frame=await x.client.poll();
+    assert.equal(frame.requestId,requestId);
+    await assert.rejects(x.client.heartbeat({activeRequestId:requestId}),
+      error=>error.code==='REJECTED');
+  }finally{
+    await x.close();
+    await pending?.catch(()=>{});
   }
 });
 test('HTTPS client closes fail-closed and prevents further messages',async()=>{
