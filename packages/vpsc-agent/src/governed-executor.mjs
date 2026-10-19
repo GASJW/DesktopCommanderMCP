@@ -583,10 +583,11 @@ export function analyzeI4ExecutionRecovery({ledgerDirectory}={}){
 
 export function createGovernedAgentExecutor({allowedRoot,entrypoint,nodeBin=process.execPath,
   ledgerDirectory,timeoutMs=8000,startupTimeoutMs=30_000,maxFileBytes=64*1024,
-  commandTimeoutMs=10_000,gatewayPolicyPublicKey,deviceId,fingerprint,testHooks}={}){
+  commandTimeoutMs=10_000,gatewayPolicyPublicKey,deviceId,fingerprint,testHooks,gatewayNowMs=Date.now}={}){
   if(typeof process.getuid==='function'&&process.getuid()===0)throw fail('PRIVILEGE','Agent must run as nonroot');
   if(!['linux','win32'].includes(process.platform))throw fail('UNSUPPORTED','I4 durable execution supports Linux or Windows');
   if(process.platform==='win32')try{assertNotElevatedWindows();}catch{throw fail('PRIVILEGE','Agent must run unelevated');}
+  if(typeof gatewayNowMs!=='function')throw fail('POLICY','Trusted Gateway clock provider is required');
   if(!Number.isSafeInteger(commandTimeoutMs)||commandTimeoutMs<100||commandTimeoutMs>30_000){
     throw fail('POLICY','Invalid fixed command timeout');
   }
@@ -670,7 +671,7 @@ export function createGovernedAgentExecutor({allowedRoot,entrypoint,nodeBin=proc
     checkedArguments(name,args);
     let grant;
     try{grant=verifyToolGrantCapability(authorization,gatewayPolicyPublicKey,{deviceId,
-      requestId:frame.requestId,fingerprint,tool:name,arguments:args,allowedRoot:root});}
+      requestId:frame.requestId,fingerprint,tool:name,arguments:args,allowedRoot:root,now:gatewayNowMs()});}
     catch{throw fail('DENIED','Operation lacks a valid Gateway signed tool grant');}
     const argumentHash=hash(JSON.stringify(canonical({tool:name,arguments:args})));
     let lockOwner;

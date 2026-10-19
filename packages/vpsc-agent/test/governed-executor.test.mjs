@@ -33,7 +33,7 @@ const POLICY_KEYS=generateKeyPairSync('ed25519');
 const roots=new WeakMap();
 const configuredExecutor=options=>createGovernedAgentExecutor({...options,
   gatewayPolicyPublicKey:POLICY_KEYS.publicKey,deviceId:DEVICE,fingerprint:FINGERPRINT});
-function authorizationFor(root,name,args,requestId){
+function authorizationFor(root,name,args,requestId,issuedAt=Date.now()){
   const constraints=name==='read_file'?{maxBytes:64*1024,maxLength:1000,maxOffset:100_000}:
     name==='list_directory'?{maxDepth:2,maxEntries:200}:
     name==='write_file'?{maxBytes:64*1024}:
@@ -43,7 +43,7 @@ function authorizationFor(root,name,args,requestId){
     ownerDigest:OWNER,deviceId:DEVICE,fingerprint:FINGERPRINT,tool:name,
     argumentsDigest:toolArgumentsDigest(name,args),policyRevision:1,approvalEventId:APPROVAL_EVENT,
     trustRevision:1,approvalTrustRevisionBefore:0,approvalTrustRevisionAfter:1,scope,constraints,
-    issuedAt:Date.now(),expiresAt:Date.now()+30_000};
+    issuedAt,expiresAt:issuedAt+30_000};
   return signToolGrantCapability(claims,POLICY_KEYS.privateKey);
 }
 const imported=await import('../src/governed-executor.mjs').catch(()=>null);
@@ -54,7 +54,7 @@ test('I4 governed executor module is implemented',()=>{
   assert.equal(available,true,'createGovernedAgentExecutor must export the governed executor');
 });
 
-async function sandbox(t,fn,{commandTimeoutMs=5000,testHooks}={}){
+async function sandbox(t,fn,{commandTimeoutMs=5000,testHooks,gatewayNowMs}={}){
   if(!available){t.skip('governed executor not implemented');return;}
   const directory=mkdtempSync(path.join(os.tmpdir(),'vpsc-i4-executor-'));
   const root=path.join(directory,'approved'),state=path.join(directory,'state');
@@ -62,7 +62,7 @@ async function sandbox(t,fn,{commandTimeoutMs=5000,testHooks}={}){
   if(process.platform==='win32')securePrivateWindowsDirectory(root);
   const file=path.join(root,'readme.txt');writeFileSync(file,'one\ntwo\nthree\n');
   const executor=configuredExecutor({allowedRoot:root,entrypoint:FIXTURE,
-    ledgerDirectory:state,commandTimeoutMs,testHooks,gatewayPolicyPublicKey:POLICY_KEYS.publicKey,
+    ledgerDirectory:state,commandTimeoutMs,testHooks,gatewayNowMs,gatewayPolicyPublicKey:POLICY_KEYS.publicKey,
     deviceId:DEVICE,fingerprint:FINGERPRINT});
   roots.set(executor,root);
   try{await executor.start();await fn({directory,root,state,file,executor});}
@@ -74,6 +74,16 @@ const call=(executor,name,args,{requestId=randomUUID(),signal}={})=>executor.han
 },{signal});
 const textOf=result=>result?.content?.find(item=>item.type==='text')?.text??'';
 
+test('verifies short-lived capabilities using the authenticated Gateway clock',async t=>{
+  const skewMs=18_000;
+  await sandbox(t,async({executor,root,file})=>{
+    const requestId=randomUUID(),args={path:file},issuedAt=Date.now()+skewMs;
+    const value=await executor.handle({version:1,method:'tools/call',deviceId:DEVICE,
+      sessionId:randomUUID(),requestId,authorization:authorizationFor(root,'read_file',args,requestId,issuedAt),
+      params:{name:'read_file',arguments:args}});
+    assert.match(textOf(value),/one/);
+  },{gatewayNowMs:()=>Date.now()+skewMs});
+});
 test('bounded list_directory iterates only the approved root and stops at the global entry cap',async t=>{
   await sandbox(t,async({root,executor})=>{
     for(let index=0;index<205;index++)writeFileSync(path.join(root,`entry-${index}.txt`),'x');

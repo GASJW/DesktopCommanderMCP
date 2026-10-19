@@ -134,7 +134,7 @@ try{
   const baseExecutor=createGovernedAgentExecutor({allowedRoot:config.allowedRoot,
     entrypoint:config.mcpEntrypoint,ledgerDirectory:config.ledgerDirectory,
     deviceId:config.deviceId,fingerprint:identity.fingerprint,
-    gatewayPolicyPublicKey:config.policyPublicKeyPem,
+    gatewayPolicyPublicKey:config.policyPublicKeyPem,gatewayNowMs:client.gatewayNowMs,
     ...(fixtureRequested?{testHooks:{sleepCommandForTimeout:true,
       onCommandSpawn:pid=>emitFixture('FIXTURE_JOB_STARTED',{pid,requestId:activeRequestId})}}:{})});
   const executor=fixtureRequested?{

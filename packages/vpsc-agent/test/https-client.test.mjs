@@ -78,6 +78,26 @@ function makeInvalid(overrides={}){
     deviceId:'f1a2b3c4-d5e6-4a9f-8abc-1bb9b99c0001',
     clientId:CLIENT,clientSecret:SECRET, ...overrides};
 }
+test('uses a bounded clock offset from successful Gateway Date responses',async()=>{
+  let requests=0;
+  const client=createHttpsAgentClient(makeInvalid({fetchFn:async input=>{
+    requests++;
+    const route=new URL(input).pathname;
+    const payload=route==='/agent/challenge'
+      ?{deviceId:DEVICE,nonce:'n'.repeat(43),expiresInMs:30_000}
+      :{deviceId:DEVICE,sessionId:SESSION};
+    const offset=requests===1?18_000:600_000;
+    return new Response(JSON.stringify(payload),{status:200,headers:{
+      'content-type':'application/json','date':new Date(Date.now()+offset).toUTCString(),
+    }});
+  }}));
+  try{
+    await client.connect();
+    const offset=client.gatewayNowMs()-Date.now();
+    assert.ok(offset>=16_000&&offset<=19_000,'trusted server time should follow the accepted offset');
+    assert.equal(requests,2);
+  }finally{client.close();}
+});
 test('reject HTTP, credentials in URL, other hosts, IP and untrusted port',()=>{
   for(const gatewayUrl of [
     'http://devices.example.test','https://evil.example.test/',

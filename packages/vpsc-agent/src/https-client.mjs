@@ -8,6 +8,7 @@ const ROUTES=new Set(['/agent/challenge','/agent/connect','/agent/heartbeat',
   '/agent/poll','/agent/result','/agent/cancel-ack','/agent/disconnect']);
 const MAX_BYTES=256*1024;
 const MAX_RESPONSE=512*1024;
+const MAX_CLOCK_OFFSET_MS=5*60_000;
 const NONCE=/^[A-Za-z0-9_-]{43}$/;
 export class HttpsAgentError extends Error{
   constructor(code,message){super(message);this.name='HttpsAgentError';this.code=code;}
@@ -57,6 +58,8 @@ export function createHttpsAgentClient({
     throw fail('CONFIG','HTTPS client identity differs from its durable approval binding');
   }
   let sessionId=null,sequence=0,closed=false,permanentlyClosed=false;
+  let gatewayClockOffsetMs=0;
+  const gatewayNowMs=()=>Date.now()+gatewayClockOffsetMs;
   function ambiguousResponse(){
     // A route may have consumed a challenge, advanced a frame sequence, or
     // accepted a result before the response became unusable. Fence this client.
@@ -107,6 +110,12 @@ export function createHttpsAgentClient({
         throw fail('REJECTED','Agent ingress denied request: '+response.status);
       }
       return ambiguousResponse();
+    }
+    // Trust Gateway time only after the configured HTTPS fetch verifies its certificate.
+    const gatewayDate=Date.parse(response.headers.get('date')??'');
+    const clockOffset=Number.isFinite(gatewayDate)?gatewayDate-Date.now():NaN;
+    if(Number.isFinite(clockOffset)&&Math.abs(clockOffset)<=MAX_CLOCK_OFFSET_MS){
+      gatewayClockOffsetMs=clockOffset;
     }
     let total=0;const chunks=[];
     try{
@@ -211,5 +220,5 @@ export function createHttpsAgentClient({
     return answer;
   }
   function close(){permanentlyClosed=true;closed=true;sessionId=null;sequence=0;}
-  return Object.freeze({connect,reconnect,heartbeat,poll,pollControl,result,cancelAck,disconnect,close});
+  return Object.freeze({connect,reconnect,heartbeat,poll,pollControl,result,cancelAck,disconnect,close,gatewayNowMs});
 }
