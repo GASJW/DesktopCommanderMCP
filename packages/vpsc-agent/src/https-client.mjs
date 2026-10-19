@@ -57,16 +57,21 @@ export function createHttpsAgentClient({
      identity.deviceBinding.fingerprint!==identity.fingerprint)){
     throw fail('CONFIG','HTTPS client identity differs from its durable approval binding');
   }
-  let sessionId=null,sequence=0,closed=false,permanentlyClosed=false;
+  let sessionId=null,sequence=0,closed=false,permanentlyClosed=false,deliveredRequestId=null;
   let gatewayClockOffsetMs=0;
   const gatewayNowMs=()=>Date.now()+gatewayClockOffsetMs;
-  function ambiguousResponse(){
+  function ambiguousResponse(activeRequestId){
+    if(UUID.test(activeRequestId??'')){
+      // An active operation blocks task dequeue; a larger signed sequence can
+      // safely submit its one result after this control response is lost.
+      throw fail('CONTROL_POLL_UNAVAILABLE','Active control poll response is unavailable');
+    }
     // A route may have consumed a challenge, advanced a frame sequence, or
     // accepted a result before the response became unusable. Fence this client.
     closed=true;sessionId=null;sequence=0;
     throw fail('AMBIGUOUS_TRANSPORT','Agent response invalid; request outcome unknown');
   }
-  async function request(route,data,authenticate=false,signal){
+  async function request(route,data,authenticate=false,signal,activeRequestId){
     if(closed)throw fail('CLOSED','Agent client closed');
     if(!ROUTES.has(route))throw fail('CONFIG','Unknown agent route');
     const body=JSON.stringify(data);
@@ -96,6 +101,9 @@ export function createHttpsAgentClient({
         cache:'no-store',credentials:'omit',signal:requestSignal,
       });
     }catch{
+      if(route==='/agent/poll'&&UUID.test(activeRequestId??'')){
+        throw fail('CONTROL_POLL_UNAVAILABLE','Active control poll transport is unavailable');
+      }
       // Once the network request started, never assume the operation was not
       // delivered. No implicit replay after an uncertain outcome.
       closed=true;sessionId=null;sequence=0;
@@ -103,13 +111,16 @@ export function createHttpsAgentClient({
     }
     if(!response||typeof response.status!=='number'||
        !response.headers?.get?.('content-type')?.toLowerCase().includes('application/json')){
-      return ambiguousResponse();
+      return ambiguousResponse(activeRequestId);
     }
     if(!response.ok){
       if(response.status>=400&&response.status<500){
+        if(route==='/agent/result'&&response.status===409){
+          throw fail('RESULT_NOT_ACCEPTED','Gateway no longer accepts this delivered result');
+        }
         throw fail('REJECTED','Agent ingress denied request: '+response.status);
       }
-      return ambiguousResponse();
+      return ambiguousResponse(activeRequestId);
     }
     // Trust Gateway time only after the configured HTTPS fetch verifies its certificate.
     const gatewayDate=Date.parse(response.headers.get('date')??'');
@@ -130,7 +141,7 @@ export function createHttpsAgentClient({
         throw Error('Invalid JSON response');
       }
       return parsed;
-    }catch{return ambiguousResponse();}
+    }catch{return ambiguousResponse(activeRequestId);}
   }
   async function connect({signal}={}){
     if(sessionId)throw fail('STATE','Already connected');
@@ -159,16 +170,27 @@ export function createHttpsAgentClient({
     return answer;
   }
   async function poll({signal}={}){
+    if(deliveredRequestId!==null)throw fail('STATE','Cannot dequeue while a delivered operation is active');
     const answer=await request('/agent/poll',{},true,signal);
     if(!exactKeys(answer,'frame')&& !exactKeys(answer,'cancel,frame'))return ambiguousResponse();
     if(!(answer.frame===null||
        answer.frame&&typeof answer.frame==='object'&&!Array.isArray(answer.frame))){
       return ambiguousResponse();
     }
+    if(answer.frame!==null){
+      if(!UUID.test(answer.frame?.requestId??'')||answer.frame.deviceId!==deviceId||
+         answer.frame.sessionId!==sessionId)return ambiguousResponse();
+      deliveredRequestId=answer.frame.requestId;
+    }
     return answer.frame;
   }
-  async function pollControl({signal}={}){
-    const answer=await request('/agent/poll',{},true,signal);
+  async function pollControl({signal,activeRequestId}={}){
+    if(activeRequestId!==undefined&&activeRequestId!==deliveredRequestId||
+       activeRequestId===undefined&&deliveredRequestId!==null){
+      throw fail('STATE','Control poll must match the current delivered operation');
+    }
+    const safeActiveRequestId=activeRequestId===deliveredRequestId?activeRequestId:undefined;
+    const answer=await request('/agent/poll',{},true,signal,safeActiveRequestId);
     if(!exactKeys(answer,'frame')&&!exactKeys(answer,'cancel,frame'))return ambiguousResponse();
     if(!(answer.frame===null||answer.frame&&typeof answer.frame==='object'&&!Array.isArray(answer.frame))||
        !(answer.cancel===undefined||answer.cancel===null||
@@ -180,7 +202,14 @@ export function createHttpsAgentClient({
         answer.cancel.version!==1||answer.cancel.type!=='cancel'||
         answer.cancel.deviceId!==deviceId||answer.cancel.sessionId!==sessionId||
         !UUID.test(answer.cancel.requestId??'')||!/^[a-f0-9]{64}$/.test(answer.cancel.ownerDigest??''))){
-      return ambiguousResponse();
+      return ambiguousResponse(activeRequestId);
+    }
+    if(answer.frame!==null){
+      if(deliveredRequestId!==null||!UUID.test(answer.frame?.requestId??'')||
+         answer.frame.deviceId!==deviceId||answer.frame.sessionId!==sessionId){
+        return ambiguousResponse();
+      }
+      deliveredRequestId=answer.frame.requestId;
     }
     return Object.freeze({frame:answer.frame,cancel:answer.cancel??null});
   }
@@ -189,7 +218,7 @@ export function createHttpsAgentClient({
     try{
       const result=await request('/agent/disconnect',{},true);
       if(!exactKeys(result,'disconnected')||result.disconnected!==true)return ambiguousResponse();
-      sessionId=null;sequence=0;
+      sessionId=null;sequence=0;deliveredRequestId=null;
       return Object.freeze({disconnected:true});
     }catch(error){
       // The disconnect may have reached the Gateway even if its response was
@@ -204,6 +233,7 @@ export function createHttpsAgentClient({
     }
     const answer=await request('/agent/result',{requestId,result:value},true,signal);
     if(!exactKeys(answer,'accepted')||answer.accepted!==true)return ambiguousResponse();
+    if(deliveredRequestId===requestId)deliveredRequestId=null;
     return answer;
   };
   async function cancelAck({requestId,ownerDigest,status,signal}={}){
@@ -217,8 +247,9 @@ export function createHttpsAgentClient({
        answer.status!==status&&answer.status!=='ambiguous'){
       return ambiguousResponse();
     }
+    if(deliveredRequestId===requestId)deliveredRequestId=null;
     return answer;
   }
-  function close(){permanentlyClosed=true;closed=true;sessionId=null;sequence=0;}
+  function close(){permanentlyClosed=true;closed=true;sessionId=null;sequence=0;deliveredRequestId=null;}
   return Object.freeze({connect,reconnect,heartbeat,poll,pollControl,result,cancelAck,disconnect,close,gatewayNowMs});
 }

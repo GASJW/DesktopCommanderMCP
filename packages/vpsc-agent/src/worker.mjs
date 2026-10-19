@@ -55,14 +55,20 @@ function combinedSignal(parent,operation){
   }};
 }
 
-export function createAgentWorker({deviceId,client,executor,pollIntervalMs=250}={}){
+export function createAgentWorker({deviceId,client,executor,pollIntervalMs=250,onDiagnostic}={}){
   if(typeof deviceId!=='string'||!UUID.test(deviceId)||
      !client||!['connect','heartbeat','poll','result','close'].every(name=>
        typeof client[name]==='function')||
      !executor||!['start','handle','close'].every(name=>typeof executor[name]==='function')||
-     !Number.isSafeInteger(pollIntervalMs)||pollIntervalMs<25||pollIntervalMs>5000){
+     !Number.isSafeInteger(pollIntervalMs)||pollIntervalMs<25||pollIntervalMs>5000||
+     onDiagnostic!==undefined&&typeof onDiagnostic!=='function'){
     throw new TypeError('Invalid remote agent worker configuration');
   }
+  const report=(requestId,route,phase,outcomeCode,startedAt)=>{
+    if(!onDiagnostic)return;
+    try{onDiagnostic(Object.freeze({requestId,deviceId,route,phase,outcomeCode,
+      elapsedMs:Math.max(0,Math.round(performance.now()-startedAt))}));}catch{}
+  };
   const controller=new AbortController();
   let started=false,closed=false,stopRequested=false,acknowledgementPending=false;
   let activeOperationController=null;
@@ -72,9 +78,9 @@ export function createAgentWorker({deviceId,client,executor,pollIntervalMs=250}=
     controller.abort();
     activeOperationController?.abort();
   };
-  async function readPoll(signal){
+  async function readPoll(signal,activeRequestId){
     if(typeof client.pollControl==='function'){
-      const value=await client.pollControl({signal});
+      const value=await client.pollControl({signal,...(activeRequestId?{activeRequestId}:{})});
       if(!value||typeof value!=='object'||Array.isArray(value)||
          Object.keys(value).sort().join(',')!=='cancel,frame'||
          !(value.frame===null||value.frame&&typeof value.frame==='object'&&!Array.isArray(value.frame))||
@@ -148,11 +154,16 @@ export function createAgentWorker({deviceId,client,executor,pollIntervalMs=250}=
         if(!validTask(frame,session,deviceId))throw fail('PROTOCOL','Gateway sent a task outside the authenticated device session');
         // The request is executed once. If result delivery is ambiguous, the
         // loop exits and deliberately does not poll or execute the task again.
+        const requestStartedAt=performance.now();
+        report(frame.requestId,'/agent/poll','delivery','DELIVERED',requestStartedAt);
         const operationController=new AbortController();
         activeOperationController=operationController;
         const signalPair=combinedSignal(controller.signal,operationController.signal);
         let settled=false,operationResult,operationError;
-        const execution=Promise.resolve().then(()=>executor.handle(frame,{signal:signalPair.signal}))
+        const execution=Promise.resolve().then(()=>{
+          report(frame.requestId,'local://mcp/tools/call','execution','STARTED',requestStartedAt);
+          return executor.handle(frame,{signal:signalPair.signal});
+        })
           .then(value=>{operationResult=value;settled=true;},error=>{operationError=error;settled=true;});
         let cancellationRequested=false,loopError=null;
         try{
@@ -163,7 +174,15 @@ export function createAgentWorker({deviceId,client,executor,pollIntervalMs=250}=
               throw fail('PROTOCOL','Gateway heartbeat did not confirm the active device session');
             }
             if(settled)break;
-            const control=await readPoll(controller.signal);
+            let control;
+            try{control=await readPoll(controller.signal,frame.requestId);}
+            catch(error){
+              if(error?.code!=='CONTROL_POLL_UNAVAILABLE')throw error;
+              if(settled)break;
+              if(!await wait(pollIntervalMs,controller.signal))break;
+              continue;
+            }
+            if(settled&&control.frame===null&&control.cancel===null)break;
             if(control.frame!==null){
               throw fail('PROTOCOL','Gateway delivered a second task while one operation was active');
             }
@@ -182,19 +201,9 @@ export function createAgentWorker({deviceId,client,executor,pollIntervalMs=250}=
           if(controller.signal.aborted){
             throw fail('AMBIGUOUS_CANCELLED','Operation was stopped after delivery; do not replay');
           }
-          if(!cancellationRequested&&typeof client.pollControl==='function'){
-            const finalControl=await readPoll(controller.signal);
-            if(finalControl.frame!==null){
-              throw fail('PROTOCOL','Gateway delivered a second task before the active result');
-            }
-            if(finalControl.cancel!==null){
-              if(!validCancel(finalControl.cancel,frame,session,deviceId)){
-                throw fail('INVALID_CANCEL_CONTROL',
-                  'Gateway cancellation does not match the completed owner/device/session/request');
-              }
-              cancellationRequested=true;
-            }
-          }
+          const executionOutcome=typeof operationError?.code==='string'&&/^[A-Z_]{1,48}$/.test(operationError.code)
+            ?operationError.code:operationError?'OPERATION_FAILED':'COMPLETED';
+          report(frame.requestId,'local://mcp/tools/call','execution',executionOutcome,requestStartedAt);
           if(cancellationRequested){
             if(typeof client.cancelAck!=='function'){
               throw fail('AMBIGUOUS_CANCEL_ACK','Cancellation acknowledgement is unavailable; do not replay');
@@ -211,6 +220,8 @@ export function createAgentWorker({deviceId,client,executor,pollIntervalMs=250}=
                acknowledgement.status!==status&&acknowledgement.status!=='ambiguous'){
               throw fail('AMBIGUOUS_CANCEL_ACK','Cancellation acknowledgement was not accepted; do not replay');
             }
+            report(frame.requestId,'/agent/cancel-ack','cancellation',
+              acknowledgement.status==='ambiguous'?'AMBIGUOUS_CANCELLED':'CANCELLED',requestStartedAt);
             continue;
           }
         }catch(error){
@@ -242,11 +253,42 @@ export function createAgentWorker({deviceId,client,executor,pollIntervalMs=250}=
         }
         acknowledgementPending=true;
         let acknowledgement;
+        report(frame.requestId,'/agent/result','submission','STARTED',requestStartedAt);
         try{acknowledgement=await client.result(frame.requestId,result,{signal:controller.signal});}
+        catch(error){
+          if(error?.code!=='RESULT_NOT_ACCEPTED'){
+            report(frame.requestId,'/agent/result','submission',
+              typeof error?.code==='string'&&/^[A-Z0-9_]{1,48}$/.test(error.code)
+                ?error.code:'UNKNOWN',requestStartedAt);
+            throw error;
+          }
+          report(frame.requestId,'/agent/result','submission','RESULT_NOT_ACCEPTED',requestStartedAt);
+          if(typeof client.pollControl!=='function')throw error;
+          const control=await readPoll(controller.signal,frame.requestId);
+          if(control.frame!==null)throw fail('PROTOCOL','Gateway delivered a second task while reconciling a rejected result');
+          if(!validCancel(control.cancel,frame,session,deviceId))throw error;
+          if(typeof client.cancelAck!=='function'){
+            throw fail('AMBIGUOUS_CANCEL_ACK','Cancellation acknowledgement is unavailable; do not replay');
+          }
+          const status=operationError
+            ?operationError.code==='CANCELLED'?'cancelled':'ambiguous':'completed';
+          let cancelAcknowledgement;
+          try{cancelAcknowledgement=await client.cancelAck({requestId:frame.requestId,
+            ownerDigest:frame.authorization.claims.ownerDigest,status,signal:controller.signal});}
+          finally{acknowledgementPending=false;}
+          if(!cancelAcknowledgement||cancelAcknowledgement.accepted!==true||
+             cancelAcknowledgement.status!==status&&cancelAcknowledgement.status!=='ambiguous'){
+            throw fail('AMBIGUOUS_CANCEL_ACK','Cancellation acknowledgement was not accepted; do not replay');
+          }
+          report(frame.requestId,'/agent/cancel-ack','cancellation',
+            cancelAcknowledgement.status==='ambiguous'?'AMBIGUOUS_CANCELLED':'CANCELLED',requestStartedAt);
+          continue;
+        }
         finally{acknowledgementPending=false;}
         if(!acknowledgement||acknowledgement.accepted!==true){
           throw fail('AMBIGUOUS_ACK','Result acknowledgement missing; do not replay the task');
         }
+        report(frame.requestId,'/agent/result','acknowledgement','ACCEPTED',requestStartedAt);
       }
       return Object.freeze({status:'stopped'});
     }finally{

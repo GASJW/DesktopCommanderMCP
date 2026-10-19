@@ -234,6 +234,24 @@ export function createAgentChannelTransport({registry,router,shouldCancelOperati
       if(!activeFrame||activeFrame.sessionId!==sessionId){
         return reject(res,409,'Result has no delivered operation');
       }
+      const cancellationPending=channel.cancelEvidence.has(body.requestId)||
+        channel.controls.some(control=>control.requestId===body.requestId);
+      let authorizationCurrent=true;
+      if(!cancellationPending&&shouldCancelOperation){
+        try{authorizationCurrent=shouldCancelOperation(Object.freeze({...activeFrame}))===true;}
+        catch{authorizationCurrent=false;}
+      }
+      if(cancellationPending||!authorizationCurrent){
+        const ownerDigest=activeFrame.authorization?.claims?.ownerDigest;
+        if(!cancellationPending&&DIGEST.test(ownerDigest??'')&&channel.controls.length<4){
+          channel.controls.push({version:1,type:'cancel',deviceId,sessionId,
+            requestId:body.requestId,ownerDigest});
+          channel.cancelEvidence.set(body.requestId,{ownerDigest,sessionId,routerSettled:false});
+          setOperationState(body.requestId,{requestId:body.requestId,deviceId,sessionId,
+            state:'cancel_requested'});
+        }
+        return reject(res,409,'Operation cancellation is pending');
+      }
       const accepted=router.acceptResponse({deviceId,sessionId,
         requestId:body.requestId,result:body.result});
       if(accepted){

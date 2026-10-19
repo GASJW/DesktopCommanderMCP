@@ -27,7 +27,7 @@ function makeJwt(privateKey,claims={}){
     iss:issuer,aud:audience,iat:nowSec-10,exp:nowSec+3600,...claims})).toString('base64url');
   return h+'.'+body+'.'+sign('RSA-SHA256',Buffer.from(h+'.'+body),privateKey).toString('base64url');
 }
-async function fixture(){
+async function fixture({shouldCancelOperation}={}){
   const {publicKey,privateKey}=generateKeyPairSync('rsa',{modulusLength:2048});
   const jwk={...publicKey.export({format:'jwk'}),kid:'kid1',alg:'RS256'};
   const verifyMachineToken=createMachineAccessVerifier({issuer,audience,allowedClientIds:[machine],
@@ -63,7 +63,8 @@ async function fixture(){
   decision={state:'COMPLETE',eventId:bindingEventId,intent,
     outcome:{...intent,phase:'outcome',outcome:'accepted',bindingRevisionAfter:1}};
   const ingress=await startMachineIngressLoopback({
-    registry,router,verifyMachineToken,machineBindingStore,getTrustRevision:()=>1,enableTestIngress:true,
+    registry,router,verifyMachineToken,machineBindingStore,getTrustRevision:()=>1,
+    shouldCancelOperation,enableTestIngress:true,
   });
   const jwt=makeJwt(privateKey);
   const signedFetch=(url,options)=>fetch(url,{...options,
@@ -167,6 +168,30 @@ test('signed M2M ingress routes a real local MCP read-only operation without RDC
     await x.client.result(frame.requestId,result);
     assert.match(JSON.stringify(await pending),/signed-machine-access-read/);
   }finally{agent.close();await x.close();rmSync(dir,{recursive:true,force:true});}
+});
+test('a result arriving after authorization revocation is rejected and reconciled by signed cancellation',async()=>{
+  let authorized=true;
+  const x=await fixture({shouldCancelOperation:()=>authorized});
+  try{
+    await x.client.connect();await x.client.heartbeat();
+    const pending=x.router.callDevice({deviceId:x.deviceId,name:'read_file',
+      arguments:{path:'/approved/synthetic-revoked-result.txt'},
+      beforeDispatch:async()=>({authorization:{version:1,
+        claims:{ownerDigest:'c'.repeat(64)},signature:'synthetic-test-signature'},release:()=>true})});
+    const frame=await x.client.poll();
+    assert.equal(frame.deviceId,x.deviceId);
+    authorized=false;
+    await assert.rejects(x.client.result(frame.requestId,{content:[{type:'text',text:'completed'}]}),
+      /409/);
+    const control=await x.client.pollControl();
+    assert.equal(control.frame,null);
+    assert.equal(control.cancel?.requestId,frame.requestId);
+    const pendingOutcome=assert.rejects(pending,error=>error.code==='AMBIGUOUS_CANCELLED');
+    const acknowledgement=await x.client.cancelAck({requestId:frame.requestId,
+      ownerDigest:frame.authorization.claims.ownerDigest,status:'completed'});
+    assert.deepEqual(acknowledgement,{accepted:true,status:'completed'});
+    await pendingOutcome;
+  }finally{await x.close();}
 });
 test('route and Origin restrictions apply before JWT verification',async()=>{
   const x=await fixture();

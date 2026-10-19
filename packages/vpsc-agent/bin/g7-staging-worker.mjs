@@ -157,7 +157,9 @@ try{
     close:(...args)=>baseExecutor.close(...args),
   }:baseExecutor;
   const worker=createAgentWorker({deviceId:config.deviceId,client:observedClient,executor,
-    pollIntervalMs:config.pollIntervalMs});
+    pollIntervalMs:config.pollIntervalMs,onDiagnostic:event=>{
+      try{process.stdout.write(JSON.stringify({event:'REQUEST_DIAGNOSTIC',...event})+'\n');}catch{}
+    }});
   const controller=new AbortController();
   const done=worker.run({signal:controller.signal});
   active={controller,done};

@@ -60,6 +60,37 @@ test('worker starts local MCP, authenticates, and dispatches one signed device t
   assert.ok(f.calls.includes('executor-close'));
 });
 
+test('a failed active cancellation poll after local completion cannot block result delivery',async()=>{
+  const f=fixture();let polls=0,worker,finishExecution,markPollStarted;const diagnostics=[];
+  const executionFinished=new Promise(resolve=>{finishExecution=resolve;});
+  const pollStarted=new Promise(resolve=>{markPollStarted=resolve;});
+  f.client.pollControl=async()=>{
+    f.calls.push('poll-control');
+    if(polls++===0)return {frame:{
+      version:1,method:'tools/call',deviceId:DEVICE,sessionId:SESSION,
+      requestId:f.requestId,authorization:AUTHORIZATION,
+      params:{name:'read_file',arguments:{path:'/approved/synthetic-result.txt'}},
+    },cancel:null};
+    markPollStarted();
+    await executionFinished;
+    throw Object.assign(Error('synthetic dropped control response'),{code:'CONTROL_POLL_UNAVAILABLE'});
+  };
+  const handle=f.executor.handle;
+  f.executor.handle=async(...args)=>{await pollStarted;const value=await handle(...args);finishExecution();return value;};
+  const result=f.client.result;
+  f.client.result=async(...args)=>{const acknowledgement=await result(...args);worker.stop();return acknowledgement;};
+  worker=createAgentWorker({deviceId:DEVICE,client:f.client,executor:f.executor,pollIntervalMs:25,
+    onDiagnostic:event=>diagnostics.push(event)});
+  await worker.run();
+  assert.equal(f.calls.filter(item=>item?.type==='handle').length,1);
+  assert.equal(f.calls.filter(item=>item?.type==='result').length,1);
+  assert.equal(polls,2,'the operation starts with one delivery poll and one active control poll');
+  assert.ok(diagnostics.some(event=>event.route==='/agent/result'&&event.outcomeCode==='ACCEPTED'));
+  assert.ok(diagnostics.every(event=>Object.keys(event).sort().join(',')===
+    'deviceId,elapsedMs,outcomeCode,phase,requestId,route'));
+  assert.equal(JSON.stringify(diagnostics).includes('synthetic-result.txt'),false);
+});
+
 test('worker skips a cancellation poll when execution settles during heartbeat',async()=>{
   const f=fixture();let heartbeats=0,polls=0,releaseHeartbeat,activeHeartbeat,handled,worker;
   const activeHeartbeatStarted=new Promise(resolve=>{activeHeartbeat=resolve;});
@@ -90,7 +121,7 @@ test('worker skips a cancellation poll when execution settles during heartbeat',
   await activeHeartbeatStarted;await executionStarted;
   await new Promise(resolve=>setTimeout(resolve,25));releaseHeartbeat();
   await running;
-  assert.equal(polls,2);
+  assert.equal(polls,1);
   assert.equal(f.calls.filter(item=>item?.type==='result').length,1);
 });
 
@@ -265,6 +296,38 @@ test('cancellation arriving after completion is acknowledged as completed withou
   assert.equal(executions,1,'completed work is never replayed');
   assert.equal(f.calls.filter(item=>item?.type==='result').length,0,
     'a late cancellation cannot convert completion into a result or rollback claim');
+});
+
+test('a rejected result is reconciled only with its matching authenticated cancellation',async()=>{
+  const f=fixture();let polls=0,resultAttempted=false,worker;
+  const ownerDigest='d'.repeat(64);
+  const frame={version:1,method:'tools/call',deviceId:DEVICE,sessionId:SESSION,
+    requestId:f.requestId,authorization:{version:1,claims:{ownerDigest},signature:'A'.repeat(86)},
+    params:{name:'read_file',arguments:{path:'/approved/synthetic-cancel-race.txt'}}};
+  f.client.pollControl=async()=>{
+    f.calls.push('poll-control');
+    if(polls++===0)return {frame,cancel:null};
+    if(!resultAttempted)return {frame:null,cancel:null};
+    return {frame:null,cancel:{version:1,type:'cancel',deviceId:DEVICE,sessionId:SESSION,
+      requestId:f.requestId,ownerDigest}};
+  };
+  f.client.result=async(id,value)=>{
+    f.calls.push({type:'result',id,value});
+    resultAttempted=true;
+    throw Object.assign(Error('synthetic Owner deadline won the race'),{code:'RESULT_NOT_ACCEPTED'});
+  };
+  f.client.cancelAck=async value=>{
+    f.calls.push({type:'cancel-ack',value});
+    worker.stop();
+    return {accepted:true,status:'ambiguous'};
+  };
+  worker=createAgentWorker({deviceId:DEVICE,client:f.client,executor:f.executor,pollIntervalMs:25});
+  await worker.run();
+  assert.equal(f.calls.filter(item=>item?.type==='handle').length,1);
+  assert.equal(f.calls.filter(item=>item?.type==='result').length,1);
+  const acknowledgement=f.calls.find(item=>item?.type==='cancel-ack').value;
+  assert.equal(acknowledgement.requestId,f.requestId);
+  assert.equal(acknowledgement.status,'completed');
 });
 
 test('mismatched cancellation control cannot abort or acknowledge another owner request',async()=>{

@@ -24,6 +24,9 @@ const HOST='127.0.0.1';
 const OWNER_ORIGIN=/^https:\/\/[a-z0-9.-]+$/;
 const OWNER_TEST_ISSUER='https://g7-owner-staging.cloudflareaccess.com';
 const MACHINE_TEST_ISSUER='https://g7-machine-staging.cloudflareaccess.com';
+const requestDiagnostic=event=>{
+  try{process.stdout.write(JSON.stringify({event:'REQUEST_DIAGNOSTIC',...event})+'\n');}catch{}
+};
 export function isValidStagingIssuer(value,role){
   if(role==='owner')return value===OWNER_TEST_ISSUER;
   if(role==='machine')return value===MACHINE_TEST_ISSUER;
@@ -167,7 +170,7 @@ export async function startG7StagingGateway(config){
     const bindingService=createOwnerMachineBindingService({accessVerifier:ownerAccess,
       auditWrite:audit.auditWrite,readApprovalReceipt,machineBindingStore});
     grantStore=createDurableToolGrantStore({directory:storage.grantDirectory});
-    router=createDeviceRouter({registry:trustStore.registry,timeoutMs:30_000});
+    router=createDeviceRouter({registry:trustStore.registry,timeoutMs:30_000,onDiagnostic:requestDiagnostic});
     const shouldCancelOperation=frame=>{
       const claims=frame?.authorization?.claims;
       if(!claims||claims.deviceId!==frame.deviceId||claims.requestId!==frame.requestId)return false;
@@ -185,7 +188,8 @@ export async function startG7StagingGateway(config){
       deviceRegistry:trustStore.registry,trustStore,router,
       authorizeDevice:createDurableOwnerDeviceAuthorizer({auditDirectory:storage.auditDirectory,
         trustDirectory:storage.trustDirectory}),grantStore,policySigningKey:keys.policyPrivate,
-      getTrustRevision:()=>trustStore.revision(),getDeviceApprovalReceipt:readApprovalReceipt});
+      getTrustRevision:()=>trustStore.revision(),getDeviceApprovalReceipt:readApprovalReceipt,
+      onDiagnostic:requestDiagnostic});
     const handle=async(req,res)=>{
       try{
         const url=new URL(req.url,'https://'+config.hostname);

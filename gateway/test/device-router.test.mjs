@@ -43,6 +43,27 @@ test('authenticated and live device dispatches to the exact device with an opaqu
     requestId:frame.requestId,result:{content:'duplicate'}}),false);
   s.router.close();
 });
+test('request diagnostics contain correlation metadata without operation arguments',async()=>{
+  const diagnostics=[],s=setup({onDiagnostic:event=>diagnostics.push(event)});
+  let frame;
+  const requestId='d0b7aabe-ec14-4e5e-9ab3-0c6eaeb2c53a';
+  s.router.attachTransport({deviceId:s.deviceId,sessionId:s.sessionId,send:value=>{frame=value;}});
+  const pending=s.router.callDevice({deviceId:s.deviceId,name:'read_file',requestId,
+    arguments:{path:'/synthetic/private-path.txt'}});
+  await s.sleep(2);
+  assert.equal(s.router.acceptResponse({deviceId:s.deviceId,sessionId:s.sessionId,
+    requestId,result:{content:'ok'}}),true);
+  await pending;
+  assert.ok(diagnostics.some(item=>item.phase==='router_queue'&&item.outcomeCode==='QUEUED'));
+  assert.ok(diagnostics.some(item=>item.route==='/agent/poll'&&item.phase==='delivery'));
+  assert.ok(diagnostics.some(item=>item.route==='/agent/result'&&item.outcomeCode==='ACCEPTED'));
+  assert.ok(diagnostics.every(item=>Object.keys(item).sort().join(',')===
+    'deviceId,elapsedMs,outcomeCode,phase,requestId,route'));
+  assert.ok(diagnostics.every(item=>item.requestId===requestId&&item.deviceId===s.deviceId));
+  assert.doesNotMatch(JSON.stringify(diagnostics),/synthetic|private-path|read_file/);
+  assert.equal(frame.requestId,requestId);
+  s.router.close();
+});
 test('stable request ids are preserved and duplicates cannot be in flight twice',async()=>{
   const s=setup();let sent=0;
   s.router.attachTransport({deviceId:s.deviceId,sessionId:s.sessionId,send:()=>{sent++;}});
