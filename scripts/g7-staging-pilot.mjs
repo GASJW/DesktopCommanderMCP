@@ -2,8 +2,8 @@
 import { spawn, execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { once } from 'node:events';
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
-  rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync,
+  openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { request as httpsRequest } from 'node:https';
@@ -28,10 +28,82 @@ const TEST_ACTIVE_JOB_SCENARIOS=new Set(['owner-cancel','grant-revoke','device-r
 const FIXTURE_COMMAND_TIMEOUT_MS=10_000;
 const trace=message=>{if(process.env.VPSC_STAGING_TRACE==='1')process.stderr.write(`[g7-staging] ${message}\n`);};
 function policyLockEvidence(directory){
-  return readdirSync(directory).filter(name=>name.endsWith('.lock')).map(name=>{
-    try{return {name,status:inspectDurableProcessLock(directory,name).status};}
-    catch(error){return {name,status:error?.code??'unverified'};}
+  const names=new Set(['.tool-grants-operation.lock','.tool-grants-writer.lock',
+    '.tool-grants-recovery.lock',...readdirSync(directory).filter(name=>name.endsWith('.lock'))]);
+  return [...names].sort().map(name=>{
+    try{
+      const evidence=inspectDurableProcessLock(directory,name);
+      if(!evidence.present)return {name,status:'absent',directory:evidence.directory,
+        lockPath:evidence.lockPath};
+      const lockStat=lstatSync(evidence.lockPath);
+      const owner=evidence.owner;
+      let ownerRecord=null,ownerProcess=null;
+      if(owner){
+        try{
+          const stat=lstatSync(path.join(evidence.lockPath,'owner.json'));
+          ownerRecord={uid:stat.uid,mode:stat.mode&0o7777,ageMs:Math.max(0,Date.now()-stat.mtimeMs)};
+        }catch{}
+        const row=processRows().find(item=>item.pid===owner.pid);
+        ownerProcess={pidPresent:Boolean(row),startIdentityMatches:row?.startTime===owner.startTicks,
+          live:Boolean(row&&row.startTime===owner.startTicks&&row.state!=='Z'&&row.state!=='X'),
+          processUid:row?.uid??null,processStartTicks:row?.startTime??null,
+          processParentPid:row?.ppid??null,state:row?.state??'missing'};
+      }
+      return {name,status:evidence.status,reason:evidence.reason,directory:evidence.directory,
+        lockPath:evidence.lockPath,digest:evidence.digest,
+        owner:owner?{kind:owner.kind,pid:owner.pid,uid:owner.uid,bootId:owner.bootId,
+          startTicks:owner.startTicks}:null,ownerProcess,ownerRecord,
+        lock:{uid:lockStat.uid,mode:lockStat.mode&0o7777,dev:lockStat.dev,ino:lockStat.ino,
+          ageMs:Math.max(0,Date.now()-lockStat.mtimeMs)}};
+    }
+    catch(error){return {name,status:'unverified',errorCode:error?.code??'LOCK_INSPECTION_FAILED'};}
   });
+}
+function policySnapshotEvidence(directory,expectedRevision){
+  const filename=path.join(directory,'tool-grants-v1.json');
+  let fd;
+  try{
+    const named=lstatSync(filename);
+    if(!named.isFile()||named.isSymbolicLink()||named.nlink!==1||
+       named.uid!==process.getuid()||(named.mode&0o7777)!==0o600){
+      return {status:'unsafe',expectedRevision};
+    }
+    fd=openSync(filename,constants.O_RDONLY|(constants.O_NOFOLLOW??0));
+    const opened=fstatSync(fd);
+    if(!opened.isFile()||opened.nlink!==1||opened.uid!==process.getuid()||
+       opened.dev!==named.dev||opened.ino!==named.ino||opened.size!==named.size||
+       (opened.mode&0o7777)!==0o600)return {status:'changed-during-read',expectedRevision};
+    const bytes=readFileSync(fd);
+    const snapshot=JSON.parse(bytes.toString('utf8'));
+    const records=Array.isArray(snapshot.records)?snapshot.records:[];
+    const last=records.at(-1);
+    return {status:'read',expectedRevision,
+      actualRevision:Number.isSafeInteger(snapshot.revision)?snapshot.revision:null,
+      revisionMatches:snapshot.revision===expectedRevision,recordCount:records.length,
+      lastSequence:Number.isSafeInteger(last?.sequence)?last.sequence:0,
+      lastHash:/^[a-f0-9]{64}$/i.test(last?.hash??'')?last.hash:null,
+      snapshotBytes:bytes.length,
+      snapshotSha256:createHash('sha256').update(bytes).digest('hex'),
+      temporaryFileCount:readdirSync(directory).filter(name=>name.startsWith('.tool-grants-')&&
+        name.endsWith('.tmp')).length};
+  }catch(error){return {status:'unavailable',expectedRevision,errorCode:error?.code??'POLICY_EVIDENCE_UNAVAILABLE'};}
+  finally{if(fd!==undefined)closeSync(fd);}
+}
+function policyRecoveryFailureEvidence({phase,scenario,requestId,operationPhase,executorPid,
+  expectedRevision,error,processes,timeline,directory,injectedLockName}){
+  return {schemaVersion:1,testName:'standalone Gateway grant revocation fences a live job and its result',
+    scenario,phase,recoveryState:'failed',error:{name:error?.name??'Error',
+      code:/^[A-Z_]{1,48}$/.test(error?.code??'')?error.code:'POLICY_RECOVERY_FAILED',
+      message:String(error?.message??'policy recovery failed').replace(/[\r\n]/g,' ').slice(0,240),
+      stack:String(error?.stack??'').split('\n').slice(0,12)},
+    faultInjection:injectedLockName?{lockName:injectedLockName,kind:'legacy-empty-permit-lock'}:null,
+    inFlightOperation:{present:Boolean(requestId),requestId:requestId??null,
+      phase:operationPhase,executorPid:executorPid??null},
+    policy:policySnapshotEvidence(directory,expectedRevision),locks:policyLockEvidence(directory),
+    processes:processes.map(proc=>({role:proc.role??'unknown',pid:proc.child.pid,
+      exitCode:proc.exitCode??proc.child.exitCode??null,
+      signal:proc.signal??proc.child.signalCode??null,stopVerified:proc.stopVerified===true})),
+    teardownOrder:timeline};
 }
 function ensure(condition,message){if(!condition)throw Error(message);}
 function modeDir(dir){mkdirSync(dir,{recursive:true,mode:0o700});chmodSync(dir,0o700);}
@@ -239,8 +311,15 @@ async function runPilot(){
     throw Error('Run the staging pilot as a nonroot Linux user');
   const fixtureRequested=process.env.VPSC_STAGING_TEST_ACTIVE_JOB==='1';
   const activeJobScenario=process.env.VPSC_STAGING_TEST_SCENARIO;
+  const capturePolicyRecoveryFailure=process.env.VPSC_STAGING_CAPTURE_LOCK_FAILURE==='1';
+  const injectStalePolicyLock=process.env.VPSC_STAGING_TEST_INJECT_STALE_LOCK==='1';
   if(fixtureRequested&&(!process.env.NODE_TEST_CONTEXT||!TEST_ACTIVE_JOB_SCENARIOS.has(activeJobScenario)))
     throw Error('Active-job scenarios are available only to the Node test runner');
+  if(capturePolicyRecoveryFailure&&(!process.env.NODE_TEST_CONTEXT||!fixtureRequested||
+     activeJobScenario!=='grant-revoke'))throw Error('Lock failure diagnostics are restricted to the grant-revoke test fixture');
+  if(injectStalePolicyLock&&(!process.env.NODE_TEST_CONTEXT||!fixtureRequested||
+     activeJobScenario!=='grant-revoke'||!capturePolicyRecoveryFailure))
+    throw Error('Stale lock injection is restricted to the diagnostic grant-revoke test fixture');
   if(!fixtureRequested&&activeJobScenario!==undefined)throw Error('Staging test scenario denied');
   const mcpEntrypoint=process.env.VPSC_STAGING_MCP_ENTRYPOINT;
   if(!mcpEntrypoint||!path.isAbsolute(mcpEntrypoint)||path.normalize(mcpEntrypoint)!==mcpEntrypoint||
@@ -263,8 +342,16 @@ async function runPilot(){
   for(const dir of [gatewayHome,agentHome,agentHome2,ownerClientHome,gatewayTmp,agentTmp,agentTmp2,ownerClientTmp])modeDir(dir);
   let gatewayProc,agentProc,agent2Proc,agentRestartProc,gatewayRestartProc;
   const allProcesses=[];
+  const diagnosticStarted=process.hrtime.bigint(),diagnosticTimeline=[];
+  let activeRequestId=null,activeOperationPhase='not-dispatched',activeExecutorPid=null;
+  let injectedLockName=null;
+  const markPhase=phase=>{
+    diagnosticTimeline.push({phase,elapsedMs:Number(process.hrtime.bigint()-diagnosticStarted)/1_000_000});
+  };
   const launchProcess=(script,args,options)=>{
-    const proc=startProcess(script,args,options);allProcesses.push(proc);return proc;
+    const proc=startProcess(script,args,options);
+    proc.role=`${path.basename(script)}#${allProcesses.length+1}`;
+    allProcesses.push(proc);return proc;
   };
   let gatewayPort=null,report;
   try{
@@ -272,6 +359,21 @@ async function runPilot(){
     for(const name of ['audit','trust','bindings','grants','policy','identity','identity2','ledger','ledger2']){
       dirs[name]=path.join(scratch,name);modeDir(dirs[name]);
     }
+    const recoverPolicyLocks=(phase,expectedRevision)=>{
+      markPhase(phase);
+      try{return clearStaleDurableToolGrantLocks({directory:dirs.grants,
+        operatorConfirmedNoActiveWriters:true,operatorConfirmedNoActiveRecovery:true});}
+      catch(error){
+        if(capturePolicyRecoveryFailure){
+          const evidence=policyRecoveryFailureEvidence({phase,scenario:activeJobScenario,
+            requestId:activeRequestId,operationPhase:activeOperationPhase,executorPid:activeExecutorPid,
+            expectedRevision,error,processes:allProcesses,timeline:diagnosticTimeline,directory:dirs.grants,
+            injectedLockName});
+          process.stderr.write(`G7_POLICY_RECOVERY_FAILURE ${JSON.stringify(evidence)}\n`);
+        }
+        throw error;
+      }
+    };
     dirs['allowed-root']=path.join(scratch,'g7-staging-approved-root');modeDir(dirs['allowed-root']);
     dirs['allowed-root-2']=path.join(scratch,'g7-staging-approved-root-2');modeDir(dirs['allowed-root-2']);
     const inputFile=path.join(dirs['allowed-root'],'approved.txt');
@@ -548,11 +650,16 @@ async function runPilot(){
       'read after agent restart');
     ensure(JSON.stringify(readAfterAgentRestart).includes(DISPLAYED_READ.trim()),'agent restart lost real MCP access');
 
+    markPhase('agent-restart-stop-requested-before-graceful-recovery');
     await stopProcess(agentRestartProc,'SIGTERM');agentRestartProc=null;
+    markPhase('agent-restart-stop-verified-before-graceful-recovery');
     await stopProcess(agent2Proc,'SIGTERM');agent2Proc=null;
+    markPhase('second-agent-stop-verified-before-graceful-recovery');
     trace(`policy lock evidence before graceful Gateway stop ${JSON.stringify(policyLockEvidence(dirs.grants))}`);
+    markPhase('gateway-graceful-stop-requested');
     const gatewayStopped=waitForEvent(gatewayProc,'STOPPED');
     await stopProcess(gatewayProc,'SIGTERM');await gatewayStopped;gatewayProc=null;
+    markPhase('gateway-graceful-stop-verified');
     trace(`policy lock evidence after graceful Gateway stop ${JSON.stringify(policyLockEvidence(dirs.grants))}`);
     ensure(allProcesses.every(proc=>proc.stopVerified===true),
       'a known writer remained live during graceful policy lock recovery');
@@ -562,8 +669,7 @@ async function runPilot(){
       'RECONCILED_CONSISTENT','RECONCILED_LEGACY_UNBOUND'].includes(gracefulTrustRecovery.state),
       `graceful Gateway shutdown left trust state requiring review: ${gracefulTrustRecovery.state}`);
     trace(`graceful trust recovery ${gracefulTrustRecovery.state}`);
-    const gracefulPolicyLockRecovery=clearStaleDurableToolGrantLocks({directory:dirs.grants,
-      operatorConfirmedNoActiveWriters:true,operatorConfirmedNoActiveRecovery:true});
+    const gracefulPolicyLockRecovery=recoverPolicyLocks('graceful-policy-lock-recovery',policyRevision);
     ensure(gracefulPolicyLockRecovery.temporaryFileCount===0,
       'graceful Gateway shutdown left temporary policy evidence requiring review');
     trace(`graceful policy recovery cleared=${gracefulPolicyLockRecovery.cleared}`);
@@ -600,11 +706,17 @@ async function runPilot(){
       'Gateway restart lost second device grants');
     trace('new session passed post-restart real MCP read');
 
+    markPhase('agent-restart-stop-requested-before-sigkill-recovery');
     await stopProcess(agentRestartProc,'SIGTERM');agentRestartProc=null;
+    markPhase('agent-restart-stop-verified-before-sigkill-recovery');
     await stopProcess(agent2Proc,'SIGTERM');agent2Proc=null;
+    markPhase('second-agent-stop-verified-before-sigkill-recovery');
+    markPhase('gateway-sigkill-stop-requested');
     await stopProcess(gatewayRestartProc,'SIGKILL');gatewayRestartProc=null;
+    markPhase('gateway-sigkill-stop-verified');
     ensure(allProcesses.every(proc=>proc.stopVerified===true),
       'a known Gateway or agent process group remained live at reconciliation time');
+    markPhase('all-process-groups-verified-stopped-before-sigkill-recovery');
     trace('idle Gateway process stopped by SIGKILL');
     const crashEvidence=analyzeOwnerPairingRecovery({auditDirectory:dirs.audit,trustDirectory:dirs.trust});
     ensure(crashEvidence.state==='CONSISTENT_LOCK_HELD'&&crashEvidence.auditLockPresent===true&&
@@ -617,8 +729,13 @@ async function runPilot(){
       trustDirectory:dirs.trust,operatorConfirmedNoActiveWriters:true});
     ensure(crashRecovery.state==='RECONCILED_CONSISTENT',
       `Gateway SIGKILL recovery did not reconcile consistently: ${crashRecovery.state}`);
-    const policyLockRecovery=clearStaleDurableToolGrantLocks({directory:dirs.grants,
-      operatorConfirmedNoActiveWriters:true,operatorConfirmedNoActiveRecovery:true});
+    if(injectStalePolicyLock){
+      injectedLockName=`.tool-grant-permit-${randomUUID()}.lock`;
+      const lockPath=path.join(dirs.grants,injectedLockName);
+      mkdirSync(lockPath,{mode:0o700});chmodSync(lockPath,0o700);
+      markPhase('test-injected-legacy-unknown-policy-lock');
+    }
+    const policyLockRecovery=recoverPolicyLocks('sigkill-policy-lock-recovery',policyRevision);
     ensure(policyLockRecovery.temporaryFileCount===0,
       'Gateway SIGKILL left temporary policy evidence requiring operator review');
     trace(`policy recovery cleared=${policyLockRecovery.cleared} remaining=${JSON.stringify(policyLockEvidence(dirs.grants))}`);
@@ -681,8 +798,12 @@ async function runPilot(){
       const ownerController=activeJobScenario==='owner-cancel'?new AbortController():null;
       const pending=ownerCall('run_command',{path:cancelledPath,profile:'count_lines'},
         ownerController?{signal:ownerController.signal}:{}).then(response=>({response}),error=>({error}));
+      activeOperationPhase='owner-dispatched';
+      markPhase('active-operation-owner-dispatched');
       const started=await waitForMatchingEvent(agentRestartProc,'FIXTURE_JOB_STARTED',event=>
         typeof event.requestId==='string'&&Number.isSafeInteger(event.pid));
+      activeRequestId=started.requestId;activeExecutorPid=started.pid;activeOperationPhase='executor-started';
+      markPhase('active-executor-started');
       const liveProcess=fixedSleepProcess(started.pid,agentAfterGatewaySigkill.pid);
       ensure(liveProcess,'executor start event did not match a live /usr/bin/sleep 30 child');
       const ledgerPath=path.join(dirs.ledger,'i4-execution.jsonl');
@@ -691,6 +812,7 @@ async function runPilot(){
       const intent=ledgerRecords().find(record=>record.type==='intent'&&record.requestId===started.requestId);
       ensure(intent?.tool==='run_command'&&intent.deviceId===deviceId,
         'active process has no matching durable I4 intent');
+      activeOperationPhase='durable-intent-confirmed';
 
       let acknowledgement=null;
       if(activeJobScenario==='owner-cancel'){
@@ -707,6 +829,7 @@ async function runPilot(){
         ensure(revoked.status===200&&revoked.json.active===false,
           'active run_command grant was not durably revoked');
         policyRevision=revoked.json.revision;
+        activeOperationPhase='grant-revoked-waiting-cancel-ack';
         const jobStartedNs=BigInt(started.monotonicNs);
         const commitElapsedMs=Number(revocationResponseNs-jobStartedNs)/1_000_000;
         const commitBeforeCommandTimeout=commitElapsedMs<FIXTURE_COMMAND_TIMEOUT_MS-500;
@@ -714,6 +837,7 @@ async function runPilot(){
           'grant revocation did not commit before the fixed command timeout safety margin');
         acknowledgement=await waitForMatchingEvent(agentRestartProc,'FIXTURE_CANCEL_ACK',event=>
           event.requestId===started.requestId);
+        activeOperationPhase='cancellation-acknowledged';
         const acknowledgementNs=BigInt(acknowledgement.monotonicNs);
         const acknowledgementElapsedMs=Number(acknowledgementNs-jobStartedNs)/1_000_000;
         const acknowledgementAfterRevocationRequest=acknowledgementNs>=revocationRequestNs;
@@ -751,6 +875,7 @@ async function runPilot(){
           commandTimeoutMs:FIXTURE_COMMAND_TIMEOUT_MS};
       }
       const callOutcome=await pending;
+      activeOperationPhase='owner-response-received';
       if(activeJobScenario==='owner-cancel'){
         ensure(callOutcome.error instanceof Error,'Owner HTTP cancellation returned a result');
       }else{
@@ -768,6 +893,7 @@ async function runPilot(){
       const outcomes=matchingRecords.filter(record=>record.type==='outcome');
       ensure(intents.length===1&&outcomes.length===1&&outcomes[0].status==='ambiguous',
         'active operation lacks one ambiguous durable outcome without replay');
+      activeOperationPhase='ambiguous-outcome-committed';
       activeExecution={scenario:activeJobScenario,requestId:started.requestId,
         startProven:true,processWasLiveAtCancel:true,processPid:started.pid,
         cancelAcknowledged:acknowledgement?.accepted===true,

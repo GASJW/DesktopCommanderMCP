@@ -103,7 +103,8 @@ function approvalFields(approval) {
       !Number.isSafeInteger(approval.expiresAt) || approval.expiresAt <= approval.issuedAt ||
       approval.expiresAt - approval.issuedAt > MAX_APPROVAL_AGE_SECONDS ||
       !KEY_ID.test(approval.keyId ?? '') ||
-      !['bootstrap', 'revoke', 'owner.recover'].includes(approval.operation) ||
+      !['bootstrap', 'revoke', 'owner.recover', 'device.approve', 'device.revoke',
+        'binding.create', 'grant.issue', 'grant.revoke'].includes(approval.operation) ||
       !HEX64.test(approval.ownerDigest ?? '') || !UUID.test(approval.realmId ?? '') ||
       typeof approval.signature !== 'string' || !/^[A-Za-z0-9_-]{86}$/.test(approval.signature) ||
       !HEX64.test(approval.targetDigest ?? '')) {
@@ -213,6 +214,30 @@ export function createDurableOwnerAuthority({
     const signature = Buffer.from(approval.signature, 'base64url');
     return signature.length === 64 && signature.toString('base64url') === approval.signature &&
       verifySignature(null, ownerAuthorityApprovalSigningBytes(approval), key, signature);
+  }
+
+  function verifyStoredAdministrativeApproval(approval, { operation, eventId,
+    expectedRevision, ownerDigest, targetDigest, verifiedAt = Math.floor(now() / 1000) } = {}) {
+    const state = requireState();
+    return state.status === 'active' && state.owner?.ownerDigest === ownerDigest &&
+      verifyApproval(approval, { operation, eventId, expectedRevision, ownerDigest, targetDigest,
+        at: verifiedAt });
+  }
+
+  function verifyAdministrativeApproval({ accessToken, approval, operation,
+    expectedRevision, target } = {}) {
+    const principal = verifier.verifyAdminPrincipal(accessToken);
+    const verifiedAt = Math.floor(now() / 1000);
+    if (!isAuth0OwnerPrincipal(principal) || principal.issuer !== issuer ||
+        !verifyStoredAdministrativeApproval(approval, { operation,
+          eventId: approval?.eventId, expectedRevision,
+          ownerDigest: principal.ownerDigest,
+          targetDigest: ownerAuthorityTargetDigest(operation, target), verifiedAt })) {
+      throw Object.assign(new Error('Verified active Owner and independent signed approval are required'), {
+        code: 'OWNER_APPROVAL_REQUIRED',
+      });
+    }
+    return Object.freeze({ principal, verifiedAt });
   }
 
   function requireState() {
@@ -400,7 +425,7 @@ export function createDurableOwnerAuthority({
 
   return Object.freeze({ directory, realmId, issuer, resource: verifier.resource,
     authorizedClientIds: verifier.authorizedClientIds, inspect, bootstrap, revoke,
-    recover,
+    recover, verifyAdministrativeApproval, verifyStoredAdministrativeApproval,
     isCurrentReadPrincipal(principal) {
       if (!isAuth0OwnerPrincipal(principal) || principal.issuer !== issuer ||
           !principal.scopes.includes('g7.read') || principal.expiresAt <= Math.floor(now() / 1000)) return false;

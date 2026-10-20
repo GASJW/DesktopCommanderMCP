@@ -667,6 +667,17 @@ export function createDurableToolGrantStore({directory,now=Date.now}={}){
   };
   function revision(){return readCurrent(directory).revision;}
   function list(){return freezeDeep(readCurrent(directory).grants.map(grant=>canonical(grant)));}
+  function inspect(){
+    const snapshot=parseSnapshot(directory);
+    const locks=lockNames(directory).filter(name=>name===GATE||name===WRITER||
+      name===RECOVERY_LOCK||name.startsWith(PERMIT_PREFIX)).map(name=>{
+      const evidence=inspectLock(directory,name);
+      return Object.freeze({name,status:evidence.status,digest:evidence.digest});
+    });
+    return Object.freeze({revision:snapshot.revision,
+      grants:freezeDeep(snapshot.grants.map(grant=>canonical(grant))),
+      locks:Object.freeze(locks)});
+  }
   function grant(input,options){
     const normalized=validateGrantInput(input);validateMutationOptions(options);
     const gateOwner=acquireGate(directory);
@@ -761,7 +772,7 @@ export function createDurableToolGrantStore({directory,now=Date.now}={}){
       throw error;
     }
   }
-  return Object.freeze({revision,list,grant,revoke,authorizeAndPermit,withCurrentAuthorization});
+  return Object.freeze({directory,revision,list,inspect,grant,revoke,authorizeAndPermit,withCurrentAuthorization});
 }
 
 // Offline operator recovery: a private recovery lock fences every new store

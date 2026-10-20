@@ -11,6 +11,7 @@ import { createDurableProcessLock, inspectDurableProcessLock,
 const FILE='machine-bindings-v2.json';
 const LEGACY_FILE='machine-bindings-v1.json';
 const GATE='.machine-bindings-writer.lock';
+const RECOVERY_LOCK='.owner-pairing-reconciliation.lock';
 const TEMP_PREFIX='.machine-bindings-';
 const DOMAIN='VPSC-G7-MACHINE-BINDINGS-v2\n';
 const MAX_BYTES=512*1024;
@@ -201,6 +202,9 @@ export function createDurableMachineBindingStore({directory,verifyApprovalReceip
   let closed=false,blocked=false;
   const assertUsable=()=>{
     if(closed||blocked)throw fail('BINDING_UNAVAILABLE','Machine binding store is unavailable');
+    if(inspectDurableProcessLock(directory,RECOVERY_LOCK).present){
+      throw fail('BINDING_BUSY','Machine binding reconciliation is active');
+    }
   };
   const acquire=()=>{
     assertUsable();
@@ -239,10 +243,11 @@ export function createDurableMachineBindingStore({directory,verifyApprovalReceip
         throw fail('BINDING_OUTCOME_UNKNOWN','An unresolved Owner binding intent requires reconciliation');
       }
     }
-    if(history.completed.length!==snapshot.bindings.length){
+    const accepted=history.completed.filter(value=>value.outcome?.outcome==='accepted');
+    if(accepted.length!==snapshot.bindings.length){
       throw fail('BINDING_CORRUPT','Machine binding snapshot and Owner audit history have different revisions');
     }
-    const decisions=new Map(history.completed.map(value=>[value.eventId,value]));
+    const decisions=new Map(accepted.map(value=>[value.eventId,value]));
     for(const record of snapshot.bindings){
       const decision=decisions.get(record.bindingEventId);
       if(!decision||!matchesDecision(record,decision,true)){
@@ -270,7 +275,7 @@ export function createDurableMachineBindingStore({directory,verifyApprovalReceip
         const history=bindingHistory();
         if(history.pending.length)throw fail('BINDING_OUTCOME_UNKNOWN',
           'An unresolved Owner binding intent requires reconciliation');
-        if(history.completed.length)throw fail('BINDING_HISTORY_MISSING',
+        if(history.completed.some(value=>value.outcome?.outcome==='accepted'))throw fail('BINDING_HISTORY_MISSING',
           'Machine binding snapshot is missing despite accepted Owner audit history');
         initial=persistSnapshot(directory,[]);
       }else{
@@ -387,6 +392,22 @@ export function createDurableMachineBindingStore({directory,verifyApprovalReceip
     }
   }
   function revision(){return checkedSnapshot().revision;}
+  function list(){
+    const snapshot=checkedSnapshot();
+    return Object.freeze(snapshot.bindings.map(record=>resolve(record.clientId))
+      .filter(Boolean));
+  }
   function close(){closed=true;}
-  return Object.freeze({bind,resolve,revision,close});
+  return Object.freeze({directory,bind,resolve,revision,list,close});
+}
+
+// Read-only snapshot access for the explicit cross-store recovery coordinator.
+// A temporary snapshot or malformed file is reported as an error, never removed.
+export function inspectDurableMachineBindingSnapshot({directory}={}){
+  validateDirectory(directory);
+  const snapshot=readSnapshot(directory);
+  const lock=inspectDurableProcessLock(directory,GATE);
+  return Object.freeze({revision:snapshot?.revision??0,digest:snapshot?.digest??null,
+    bindings:Object.freeze((snapshot?.bindings??[]).map(value=>Object.freeze({...value}))),
+    lockPresent:lock.present,lockStatus:lock.status,lockDigest:lock.digest});
 }

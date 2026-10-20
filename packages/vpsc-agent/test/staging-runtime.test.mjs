@@ -41,13 +41,15 @@ test('staging configuration reader rejects symlinks and writable parent director
   }finally{rmSync(parent,{recursive:true,force:true});}
 });
 
-async function runPilot(scenario){
+async function runPilot(scenario,{injectStaleLock=false}={}){
   const env={PATH:process.env.PATH??'/usr/bin:/bin',TMPDIR:process.env.TMPDIR??'',
     VPSC_STAGING_MCP_ENTRYPOINT:MCP_ENTRYPOINT};
   if(scenario!==undefined){
     env.NODE_TEST_CONTEXT=process.env.NODE_TEST_CONTEXT;
     env.VPSC_STAGING_TEST_ACTIVE_JOB='1';
     env.VPSC_STAGING_TEST_SCENARIO=scenario;
+    if(scenario==='grant-revoke')env.VPSC_STAGING_CAPTURE_LOCK_FAILURE='1';
+    if(injectStaleLock)env.VPSC_STAGING_TEST_INJECT_STALE_LOCK='1';
   }
   const child=spawn(NODE,[PILOT,'--json'],{cwd:ROOT,stdio:['ignore','pipe','pipe'],
     ...(typeof process.getuid==='function'&&process.getuid()===0?{uid:65534,gid:65534}:{}),
@@ -56,6 +58,7 @@ async function runPilot(scenario){
   child.stdout.setEncoding('utf8').on('data',chunk=>{stdout+=chunk;});
   child.stderr.setEncoding('utf8').on('data',chunk=>{stderr+=chunk;});
   const [code]=await once(child,'exit');
+  if(injectStaleLock)return {code,stdout,stderr};
   assert.equal(code,0,stderr||stdout);
   return JSON.parse(stdout.trim().split('\n').at(-1));
 }
@@ -153,6 +156,45 @@ test('standalone Gateway grant revocation fences a live job and its result',linu
   assert.equal(report.cancellation.activeExecution.responseFenced,true);
   assert.ok(report.cancellation.activeExecution.ownerResponseStatus>=400);
 });
+
+test('standalone grant recovery captures sanitized evidence before rejecting an unknown lock',
+  linuxPilotOnly,async t=>{
+    const outcome=await runPilot('grant-revoke',{injectStaleLock:true});
+    assert.equal(outcome.code,1,outcome.stdout||outcome.stderr);
+    const line=outcome.stderr.split('\n').find(value=>value.startsWith('G7_POLICY_RECOVERY_FAILURE '));
+    assert.ok(line,outcome.stderr);
+    const evidence=JSON.parse(line.slice('G7_POLICY_RECOVERY_FAILURE '.length));
+    t.diagnostic(JSON.stringify(evidence));
+    assert.equal(evidence.testName,
+      'standalone Gateway grant revocation fences a live job and its result');
+    assert.equal(evidence.scenario,'grant-revoke');
+    assert.equal(evidence.phase,'sigkill-policy-lock-recovery');
+    assert.equal(evidence.recoveryState,'failed');
+    assert.ok(['STALE_LOCK','POLICY_BUSY'].includes(evidence.error.code),JSON.stringify(evidence));
+    assert.equal(evidence.faultInjection.kind,'legacy-empty-permit-lock');
+    assert.match(evidence.faultInjection.lockName,/^\.tool-grant-permit-[0-9a-f-]+\.lock$/i);
+    assert.equal(evidence.inFlightOperation.present,false);
+    assert.equal(evidence.inFlightOperation.requestId,null);
+    assert.equal(evidence.inFlightOperation.phase,'not-dispatched');
+    assert.equal(evidence.policy.status,'read');
+    assert.equal(evidence.policy.revisionMatches,true);
+    assert.equal(evidence.policy.actualRevision,evidence.policy.expectedRevision);
+    assert.equal(evidence.policy.lastSequence,evidence.policy.recordCount);
+    assert.match(evidence.policy.lastHash,/^[0-9a-f]{64}$/i);
+    const lock=evidence.locks.find(value=>value.name===evidence.faultInjection.lockName);
+    assert.equal(lock.status,'unknown');
+    assert.equal(lock.reason,'legacy lock has no owner record');
+    assert.equal(lock.owner,null);
+    assert.ok(Number.isFinite(lock.lock.ageMs)&&lock.lock.ageMs>=0);
+    assert.equal(lock.lock.mode,0o700);
+    const lockStates=new Map(evidence.locks.map(value=>[value.name,value.status]));
+    assert.equal(lockStates.get('.tool-grants-writer.lock'),'absent');
+    assert.equal(lockStates.get('.tool-grants-recovery.lock'),'absent');
+    assert.ok(evidence.processes.length>0&&evidence.processes.every(value=>value.stopVerified));
+    assert.ok(evidence.teardownOrder.some(value=>
+      value.phase==='all-process-groups-verified-stopped-before-sigkill-recovery'));
+    assert.doesNotMatch(line,/"token"|clientSecret|controlToken|serviceSecret/i);
+  });
 
 test('standalone device trust revocation fences a live job and its result',linuxPilotOnly,async t=>{
   const report=await runPilot('device-revoke');

@@ -15,7 +15,7 @@ function fixture() {
   mkdirSync(legacyRoot);
   const paths = { storageRoot, configFile: path.join(storageRoot, 'config.json') };
   for (const name of ['auditDirectory', 'bindingDirectory', 'grantDirectory', 'ledgerDirectory',
-    'ownerAuthorityDirectory', 'policyDirectory', 'runtimeDirectory', 'trustDirectory']) {
+    'ownerAuthorityDirectory', 'policyDirectory', 'provisioningDirectory', 'runtimeDirectory', 'trustDirectory']) {
     paths[name] = path.join(storageRoot, name);
     mkdirSync(paths[name]);
   }
@@ -33,6 +33,7 @@ function fixture() {
     verifyReadPrincipal: () => null, verifyAdminPrincipal: () => null };
   const storeInspectors = Object.fromEntries(['audit', 'binding', 'grant', 'ledger', 'policy', 'trust']
     .map(name => [name, () => ({ healthy: true, pending: 0, revision: 0 })]));
+  storeInspectors.provisioning = () => ({ healthy: true, pending: 0, revision: 0, readyDeviceCount: 1 });
   return { home, config, ownerAuthority, storeInspectors, storageRoot, legacyRoot,
     cleanup: () => rmSync(home, { recursive: true, force: true }) };
 }
@@ -60,6 +61,7 @@ test('isolated realm activation is fail-closed and starts only loopback read_fil
   let storeReady = false;
   const inspectors = Object.fromEntries(Object.keys(f.storeInspectors).map(name => [name, () => ({
     healthy: storeReady, pending: 0, revision: 0,
+    ...(name==='provisioning'?{readyDeviceCount:storeReady?1:0}:{}),
   })]));
   const realm = createIsolatedG7Realm({ config: f.config, ownerAuthority, storeInspectors: inspectors,
     startLoopback: async options => { started++; return { ...options, close: () => {} }; } });
@@ -95,4 +97,45 @@ test('Owner revocation during listener startup closes the listener before activa
   await assert.rejects(realm.activate(), error => error.code === 'REALM_ACTIVATION_BLOCKED');
   assert.equal(closed, true);
   assert.equal(realm.inspectActivation().ready, false);
+});
+
+test('activation remains closed without a read grant and closes if provisioning changes during startup',async t=>{
+  const f=fixture();t.after(f.cleanup);
+  let readyDeviceCount=0,closed=false,started=0;
+  const inspectors={...f.storeInspectors,
+    provisioning:()=>({healthy:true,pending:0,revision:0,readyDeviceCount})};
+  const realm=createIsolatedG7Realm({config:f.config,ownerAuthority:f.ownerAuthority,
+    storeInspectors:inspectors,startLoopback:async options=>{
+      started++;readyDeviceCount=1;
+      return {...options,close:()=>{closed=true;}};
+    }});
+  await assert.rejects(realm.activate(),error=>error.code==='REALM_ACTIVATION_BLOCKED'&&
+    error.blockers.includes('NO_APPROVED_READ_ONLY_DEVICE'));
+  assert.equal(started,0);
+  readyDeviceCount=1;
+  const later=createIsolatedG7Realm({config:f.config,ownerAuthority:f.ownerAuthority,
+    storeInspectors:inspectors,startLoopback:async options=>{
+      started++;readyDeviceCount=0;
+      return {...options,close:()=>{closed=true;}};
+    }});
+  await assert.rejects(later.activate(),error=>error.code==='REALM_ACTIVATION_BLOCKED'&&
+    error.blockers.includes('NO_APPROVED_READ_ONLY_DEVICE'));
+  assert.equal(closed,true);
+});
+
+test('an interrupted activation attempt leaves no cached listener and rechecks the barrier on retry',async t=>{
+  const f=fixture();t.after(f.cleanup);
+  let attempts=0,closed=false;
+  const realm=createIsolatedG7Realm({config:f.config,ownerAuthority:f.ownerAuthority,
+    storeInspectors:f.storeInspectors,startLoopback:async options=>{
+      attempts++;
+      if(attempts===1)throw Error('injected activation interruption');
+      return {...options,close:()=>{closed=true;}};
+    }});
+  await assert.rejects(realm.activate(),/injected activation interruption/);
+  assert.equal(realm.inspectActivation().ready,true);
+  const server=await realm.activate();
+  assert.equal(server.host,'127.0.0.1');
+  assert.equal(attempts,2);
+  assert.equal(closed,false);
 });
