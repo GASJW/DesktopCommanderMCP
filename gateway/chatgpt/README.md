@@ -276,6 +276,15 @@ payload cannot distinguish a retry from a new identical read. Such a caller
 must use a fresh JSON-RPC ID for each new invocation; duplicates remain
 fail-closed at the existing durable device ledger and are never replayed.
 
+## I8E Owner transition decision
+
+The synthetic staging Owner cannot be transferred to Auth0 by editing its
+bindings or grants. I8E selects a separate isolated Owner realm with fresh
+pairing and least-privilege grants; it deliberately leaves I7 state untouched.
+The required activation journal and Owner-management API do not exist yet, so
+the bridge remains fail-closed. See the [Owner transition and activation
+runbook](./OWNER_TRANSITION_RUNBOOK.md).
+
 ## Local synthetic certification
 
 `gateway/test/chatgpt-read-only-bridge.test.mjs` creates short-lived test keys,
