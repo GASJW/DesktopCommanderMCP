@@ -276,18 +276,26 @@ payload cannot distinguish a retry from a new identical read. Such a caller
 must use a fresh JSON-RPC ID for each new invocation; duplicates remain
 fail-closed at the existing durable device ledger and are never replayed.
 
-## I8E Owner transition decision
+## I8F isolated Auth0 Owner realm
 
 The synthetic staging Owner cannot be transferred to Auth0 by editing its
-bindings or grants. I8E selects a separate isolated Owner realm with fresh
-pairing and least-privilege grants; it deliberately leaves I7 state untouched.
-The required activation journal and Owner-management API do not exist yet, so
-the bridge remains fail-closed. See the [Owner transition and activation
-runbook](./OWNER_TRANSITION_RUNBOOK.md).
+bindings or grants. I8F adds an offline Auth0 principal verifier, a separate
+hash-chained Owner authority journal with signed bootstrap/recovery approvals,
+and an inert loopback realm activation barrier. The bridge can resolve only an
+active Owner from that authority and rechecks it before dispatch and result
+delivery. I7 state and its Cloudflare path remain untouched.
+
+I8F does not enable live administration: the Auth0 tenant has no verified
+`g7.owner` scope/client, grant and pairing stores are not coordinated by a
+cross-store transaction, and the device agent supports one binding/ledger per
+identity. No production key or device enrollment is included. See the [Owner
+transition and activation runbook](./OWNER_TRANSITION_RUNBOOK.md).
 
 ## Local synthetic certification
 
-`gateway/test/chatgpt-read-only-bridge.test.mjs` creates short-lived test keys,
-a loopback-only HTTP server and mock G7 policy dependencies. It does not use
+`gateway/test/chatgpt-read-only-bridge.test.mjs`,
+`gateway/test/isolated-chatgpt-owner.test.mjs`, and
+`gateway/test/durable-owner-authority.test.mjs` use short-lived synthetic keys,
+disposable stores, and loopback-only mock policy dependencies. They do not use
 the VPS, real Owner credentials, Cloudflare, an OpenAI tunnel, or ChatGPT
-plugin configuration. Removing this test config returns the feature to 404.
+plugin configuration. The isolated realm is not imported by the live server.

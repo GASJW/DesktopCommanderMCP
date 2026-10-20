@@ -25,7 +25,11 @@ const EXACT_INTENT_V2 = 'at,event,eventId,fingerprint,operation,ownerId,phase,re
 const EXACT_OUTCOME_V2 = 'at,deviceId,event,eventId,fingerprint,operation,outcome,ownerId,phase,requestId,trustRevisionAfter,trustRevisionBefore,version';
 const EXACT_INTENT_V3 = 'approvalEventId,at,bindingRevisionBefore,clientId,deviceId,event,eventId,fingerprint,operation,ownerDigest,ownerId,phase,trustRevision,trustRevisionAfter,trustRevisionBefore,version';
 const EXACT_OUTCOME_V3 = 'approvalEventId,at,bindingRevisionAfter,bindingRevisionBefore,clientId,deviceId,event,eventId,fingerprint,operation,outcome,ownerDigest,ownerId,phase,trustRevision,trustRevisionAfter,trustRevisionBefore,version';
+const EXACT_AUTHORITY_INTENT = 'actorClientId,actorKeyId,actorScope,approval,at,event,eventId,expectedRevision,operation,ownerDigest,ownerId,ownerIssuer,phase,version';
+const EXACT_AUTHORITY_OUTCOME = 'actorClientId,actorKeyId,actorScope,approval,at,event,eventId,expectedRevision,operation,outcome,ownerDigest,ownerId,ownerIssuer,phase,recoveryApproval,revisionAfter,version';
+const EXACT_AUTHORITY_APPROVAL = 'eventId,expectedRevision,expiresAt,issuedAt,keyId,operation,ownerDigest,realmId,signature,targetDigest,version';
 const MACHINE_CLIENT = /^[A-Za-z0-9_.-]{8,256}$/;
+const AUTHORITY_KEY_ID = /^[A-Za-z0-9_.-]{1,128}$/;
 
 function validTimestamp(at) {
   return typeof at==='string'&&
@@ -146,6 +150,61 @@ function canonicalEvent(e) {
     return e.phase==='intent'?base:{...base,outcome:e.outcome,
       bindingRevisionAfter:e.bindingRevisionAfter};
   }
+  if(e.event==='g7_owner_authority'&&e.version===1){
+    const approval=e.approval;
+    const validApproval=value=>value===null||value&&typeof value==='object'&&
+      !Array.isArray(value)&&Object.keys(value).sort().join(',')===EXACT_AUTHORITY_APPROVAL&&
+      value.version===1&&UUID.test(value.eventId??'')&&
+      Number.isSafeInteger(value.expectedRevision)&&value.expectedRevision>=0&&
+      Number.isSafeInteger(value.issuedAt)&&Number.isSafeInteger(value.expiresAt)&&
+      value.expiresAt>value.issuedAt&&value.expiresAt-value.issuedAt<=300&&
+      AUTHORITY_KEY_ID.test(value.keyId??'')&&
+      ['bootstrap','revoke','owner.recover'].includes(value.operation)&&
+      HEX64.test(value.ownerDigest??'')&&UUID.test(value.realmId??'')&&
+      typeof value.signature==='string'&&/^[A-Za-z0-9_-]{86}$/.test(value.signature)&&
+      HEX64.test(value.targetDigest??'');
+    if(Object.keys(e).sort().join(',')!==
+       (e.phase==='intent'?EXACT_AUTHORITY_INTENT:EXACT_AUTHORITY_OUTCOME)||
+       !UUID.test(e.eventId??'')||!['bootstrap','revoke'].includes(e.operation)||
+       !HEX24.test(e.ownerId??'')||!HEX64.test(e.ownerDigest??'')||
+       e.ownerId!==e.ownerDigest.slice(0,24)||
+       typeof e.ownerIssuer!=='string'||e.ownerIssuer.length>2048||
+       !/^https:\/\//.test(e.ownerIssuer)||/[\0\r\n]/.test(e.ownerIssuer)||
+       !MACHINE_CLIENT.test(e.actorClientId??'')||!AUTHORITY_KEY_ID.test(e.actorKeyId??'')||
+       !['g7.read','g7.owner'].includes(e.actorScope)||
+       !Number.isSafeInteger(e.expectedRevision)||e.expectedRevision<0||
+       !['intent','outcome'].includes(e.phase)||!validApproval(approval)||
+       approval.operation!==e.operation||approval.eventId!==e.eventId||
+       approval.expectedRevision!==e.expectedRevision||approval.ownerDigest!==e.ownerDigest||
+       !validTimestamp(e.at)||
+       e.phase==='outcome'&&(e.outcome!=='accepted'||
+         !Number.isSafeInteger(e.revisionAfter)||e.revisionAfter!==e.expectedRevision+1||
+         !validApproval(e.recoveryApproval)||
+         e.recoveryApproval!==null&&e.recoveryApproval.operation!=='owner.recover')||
+       e.phase==='intent'&&e.operation==='bootstrap'&&e.actorScope!=='g7.read'||
+       e.phase==='intent'&&e.operation==='revoke'&&e.actorScope!=='g7.owner'){
+      throw new TypeError('Invalid Owner authority audit event');
+    }
+    const base={event:'g7_owner_authority',version:1,at:e.at,
+      eventId:e.eventId.toLowerCase(),operation:e.operation,ownerId:e.ownerId,
+      ownerDigest:e.ownerDigest,ownerIssuer:e.ownerIssuer,actorClientId:e.actorClientId,
+      actorKeyId:e.actorKeyId,actorScope:e.actorScope,expectedRevision:e.expectedRevision,
+      approval:{version:1,eventId:approval.eventId.toLowerCase(),
+        operation:approval.operation,realmId:approval.realmId.toLowerCase(),
+        ownerDigest:approval.ownerDigest,expectedRevision:approval.expectedRevision,
+        targetDigest:approval.targetDigest,issuedAt:approval.issuedAt,
+        expiresAt:approval.expiresAt,keyId:approval.keyId,signature:approval.signature},
+      phase:e.phase};
+    return e.phase==='intent'?base:{...base,outcome:e.outcome,
+      revisionAfter:e.revisionAfter,recoveryApproval:e.recoveryApproval===null?null:{
+        version:1,eventId:e.recoveryApproval.eventId.toLowerCase(),
+        operation:e.recoveryApproval.operation,realmId:e.recoveryApproval.realmId.toLowerCase(),
+        ownerDigest:e.recoveryApproval.ownerDigest,
+        expectedRevision:e.recoveryApproval.expectedRevision,
+        targetDigest:e.recoveryApproval.targetDigest,issuedAt:e.recoveryApproval.issuedAt,
+        expiresAt:e.recoveryApproval.expiresAt,keyId:e.recoveryApproval.keyId,
+        signature:e.recoveryApproval.signature}};
+  }
   if(e.event!=='g7_owner_pairing'||e.version!==2||
      keys!==(e.phase==='intent'?EXACT_INTENT_V2:EXACT_OUTCOME_V2)||
      !UUID.test(e.eventId)||!HEX24.test(e.ownerId)||
@@ -185,6 +244,43 @@ function digest(seq, previous, event,version=event.version) {
     .digest('hex');
 }
 function advance(state, event) {
+  if(event.event==='g7_owner_authority'){
+    if(event.phase==='intent'){
+      const owner=state.ownerAuthority;
+      const valid=event.expectedRevision===owner.revision&&
+        (event.operation==='bootstrap'?owner.status==='empty'&&owner.revision===0:
+          owner.status==='active'&&owner.ownerId===event.ownerId&&
+          owner.ownerDigest===event.ownerDigest&&owner.ownerIssuer===event.ownerIssuer);
+      if(!valid||state.pending.size!==0||state.completed.has(event.eventId)){
+        throw new Error('Owner authority revision conflict or unresolved transition');
+      }
+      state.pending.set(event.eventId,event);
+      return;
+    }
+    const prior=state.pending.get(event.eventId);
+    if(!prior||prior.event!=='g7_owner_authority'||prior.version!==1||
+       prior.operation!==event.operation||prior.ownerId!==event.ownerId||
+       prior.ownerDigest!==event.ownerDigest||prior.ownerIssuer!==event.ownerIssuer||
+       prior.expectedRevision!==event.expectedRevision||
+       JSON.stringify(prior.approval)!==JSON.stringify(event.approval)||
+       state.pending.size!==1||event.revisionAfter!==event.expectedRevision+1){
+      throw new Error('Owner authority outcome without matching intent');
+    }
+    const owner=state.ownerAuthority;
+    if(event.operation==='bootstrap'&&owner.status!=='empty'||
+       event.operation==='revoke'&&(owner.status!=='active'||
+         owner.ownerDigest!==event.ownerDigest||owner.ownerId!==event.ownerId)){
+      throw new Error('Owner authority transition does not match current state');
+    }
+    owner.revision=event.revisionAfter;
+    owner.status=event.operation==='bootstrap'?'active':'revoked';
+    owner.ownerIssuer=event.ownerIssuer;
+    owner.ownerId=event.ownerId;
+    owner.ownerDigest=event.ownerDigest;
+    state.pending.delete(event.eventId);
+    state.completed.add(event.eventId);
+    return;
+  }
   if (event.phase === 'intent') {
     if (state.pending.size !== 0 || state.completed.has(event.eventId)) {
       throw new Error('Unresolved or duplicate pairing audit intent');
@@ -227,7 +323,8 @@ function readExact(fd, size) {
 }
 function replay(bytes) {
   if (bytes.length > MAX_BYTES) throw new Error('Audit WAL capacity exceeded');
-  const state = { seq: 0, hash: '0'.repeat(64), pending: new Map(), completed: new Set(),events:[] };
+  const state = { seq: 0, hash: '0'.repeat(64), pending: new Map(), completed: new Set(),
+    events:[],ownerAuthority:{revision:0,status:'empty',ownerIssuer:null,ownerId:null,ownerDigest:null} };
   if (bytes.length === 0) return state;
   if (bytes.at(-1) !== 10) throw new Error('Truncated audit WAL tail');
   const lines = bytes.toString('utf8').split('\n');
@@ -293,6 +390,7 @@ export function createDurableOwnerAudit({ directory } = {}) {
       const candidate = {
         seq: state.seq, hash: state.hash,
         pending: new Map(state.pending), completed: new Set(state.completed),
+        ownerAuthority: { ...state.ownerAuthority },
       };
       advance(candidate, event);
       if (state.seq === Number.MAX_SAFE_INTEGER) throw new Error('Audit sequence exhausted');
@@ -357,10 +455,13 @@ export function createDurableOwnerAudit({ directory } = {}) {
 
 // Read-only audit evidence inspection. A persistent writer lock is reported,
 // never cleared or interpreted as proof that its owner is dead.
-export function inspectDurableOwnerAudit({directory}={}){
+export function inspectDurableOwnerAudit({directory,includeOwnerAuthority=false}={}){
+  if(typeof includeOwnerAuthority!=='boolean')throw new TypeError('includeOwnerAuthority must be boolean');
   const exists=privateDirectory(directory,{create:false});
   if(!exists)return Object.freeze({exists:false,sequence:0,hash:'0'.repeat(64),
-    bytes:0,events:Object.freeze([]),pending:Object.freeze([]),lockPresent:false});
+    bytes:0,events:Object.freeze([]),pending:Object.freeze([]),lockPresent:false,
+    ...(includeOwnerAuthority?{ownerAuthority:Object.freeze({revision:0,status:'empty',
+      ownerIssuer:null,ownerId:null,ownerDigest:null})}:{})});
   const file=path.join(directory,LOG);
   let bytes=Buffer.alloc(0),logExists=false;
   try{
@@ -374,7 +475,8 @@ export function inspectDurableOwnerAudit({directory}={}){
   return Object.freeze({exists:logExists,sequence:state.seq,hash:state.hash,bytes:bytes.length,
     events:Object.freeze(state.events.slice()),
     pending:Object.freeze(Array.from(state.pending.values())),lockPresent:lock.present,
-    lockStatus:lock.status,lockReason:lock.reason,lockDigest:lock.digest});
+    lockStatus:lock.status,lockReason:lock.reason,lockDigest:lock.digest,
+    ...(includeOwnerAuthority?{ownerAuthority:Object.freeze({...state.ownerAuthority})}:{})});
 }
 
 // Read a binding decision only after replay has validated the complete WAL
@@ -421,6 +523,11 @@ export function appendRecoveredOwnerOutcome({directory,intent,outcome,
   operatorConfirmedNoActiveWriters}={}){
   if(operatorConfirmedNoActiveWriters!==true){
     throw Error('Operator confirmation that no writers are active is required');
+  }
+  if(intent?.event==='g7_owner_authority'&&
+     (outcome?.recoveryApproval?.operation!=='owner.recover'||
+      !/^[A-Za-z0-9_-]{86}$/.test(outcome?.recoveryApproval?.signature??''))){
+    throw Error('Owner authority recovery requires its signed recovery approval');
   }
   privateDirectory(directory);
   requireRecoveryLock(directory);
