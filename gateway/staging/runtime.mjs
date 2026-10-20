@@ -9,7 +9,8 @@ import { createOwnerPairingHttp } from '../dashboard/owner-pairing-http.mjs';
 import { createDurableOwnerDeviceApprovalReader, createDurableOwnerDeviceApprovalByIdReader,
   createDurableOwnerDeviceAuthorizer } from '../dashboard/durable-owner-device-authorization.mjs';
 import { createOwnerMachineBindingService } from '../dashboard/owner-machine-binding.mjs';
-import { ownerIdentityDigest, ownerPrincipalId, isOwnerPrincipal } from '../dashboard/owner-identity.mjs';
+import { ownerIdentityDigest, ownerPrincipalId, isOwnerPrincipal,
+  STAGING_OWNER_ISSUER } from '../dashboard/owner-identity.mjs';
 import { createDurableDeviceTrustStore } from '../devices/durable-trust.mjs';
 import { createPairingCoordinator } from '../devices/pairing.mjs';
 import { createMachineAccessVerifier } from '../devices/machine-access.mjs';
@@ -18,17 +19,18 @@ import { createDeviceRouter } from '../devices/router.mjs';
 import { createRemoteDeviceMcpHandler } from '../devices/remote-mcp-handler.mjs';
 import { createDurableToolGrantStore } from '../devices/durable-tool-grants.mjs';
 import { createDurableMachineBindingStore } from '../devices/durable-machine-bindings.mjs';
+import { CHATGPT_MCP_ROUTE, getChatGptResourceMetadataPath,
+  createChatGptReadOnlyBridge, validateChatGptBridgeConfig } from '../chatgpt/read-only-bridge.mjs';
 import { readPrivateStagingFile } from './private-file.mjs';
 
 const HOST='127.0.0.1';
 const OWNER_ORIGIN=/^https:\/\/[a-z0-9.-]+$/;
-const OWNER_TEST_ISSUER='https://g7-owner-staging.cloudflareaccess.com';
 const MACHINE_TEST_ISSUER='https://g7-machine-staging.cloudflareaccess.com';
 const requestDiagnostic=event=>{
   try{process.stdout.write(JSON.stringify({event:'REQUEST_DIAGNOSTIC',...event})+'\n');}catch{}
 };
 export function isValidStagingIssuer(value,role){
-  if(role==='owner')return value===OWNER_TEST_ISSUER;
+  if(role==='owner')return value===STAGING_OWNER_ISSUER;
   if(role==='machine')return value===MACHINE_TEST_ISSUER;
   return false;
 }
@@ -54,7 +56,9 @@ function validateConfig(c){
     throw new Error('G7 staging runtime requires a nonroot Linux user');
   const machineV1=exact(c?.machine,'audience,clientId,issuer,jwks,serviceSecret,signingKeyPath');
   const machineV2=exact(c?.machine,'audience,clients,issuer,jwks,signingKeyPath');
-  if(!exact(c,'hostname,listen,machine,owner,policy,storage,tls,version')||
+  const validRoot=exact(c,'hostname,listen,machine,owner,policy,storage,tls,version')||
+    exact(c,'chatgptBridge,hostname,listen,machine,owner,policy,storage,tls,version');
+  if(!validRoot||
      !(c.version===1&&machineV1||c.version===2&&machineV2)||
      typeof c.hostname!=='string'||!/^[a-z0-9.-]{6,255}$/.test(c.hostname)||
      !c.hostname.includes('.')||c.hostname==='localhost'||c.hostname.endsWith('.local')||
@@ -95,6 +99,8 @@ function validateConfig(c){
     if(jwk.kty!=='RSA'||jwk.alg!=='RS256'||typeof jwk.kid!=='string'||
        typeof jwk.n!=='string'||typeof jwk.e!=='string'||'d' in jwk)throw new Error('Staging JWKS must contain public RSA keys only');
   }
+  if(Object.hasOwn(c,'chatgptBridge'))
+    validateChatGptBridgeConfig(c.chatgptBridge,{issuer:c.owner.issuer,subject:c.owner.subject});
   const tlsKey=assertPrivateFile(c.tls.keyPath);
   const tlsCert=assertPrivateFile(c.tls.certificatePath,{privateOnly:false});
   const machineSigningKey=assertPrivateFile(c.machine.signingKeyPath);
@@ -148,7 +154,7 @@ export async function startG7StagingGateway(config){
     keyProvider:async()=>({keys:config.machine.jwks})});
   const storage=config.storage;
   const trustStore=createDurableDeviceTrustStore({directory:storage.trustDirectory});
-  let audit,machineBindingStore,ingress,server,router,grantStore;
+  let audit,machineBindingStore,ingress,server,router,grantStore,chatgptBridgeHandler;
   try{
     audit=createDurableOwnerAudit({directory:storage.auditDirectory});
     const coordinator=createPairingCoordinator({registry:trustStore});
@@ -190,6 +196,14 @@ export async function startG7StagingGateway(config){
         trustDirectory:storage.trustDirectory}),grantStore,policySigningKey:keys.policyPrivate,
       getTrustRevision:()=>trustStore.revision(),getDeviceApprovalReceipt:readApprovalReceipt,
       onDiagnostic:requestDiagnostic});
+    if(config.chatgptBridge){
+      chatgptBridgeHandler=createChatGptReadOnlyBridge({oauth:config.chatgptBridge,
+        owner:expectedOwner,deviceRegistry:trustStore.registry,trustStore,router,
+        authorizeDevice:createDurableOwnerDeviceAuthorizer({auditDirectory:storage.auditDirectory,
+          trustDirectory:storage.trustDirectory}),grantStore,policySigningKey:keys.policyPrivate,
+        getTrustRevision:()=>trustStore.revision(),getDeviceApprovalReceipt:readApprovalReceipt,
+        onDiagnostic:requestDiagnostic});
+    }
     const handle=async(req,res)=>{
       try{
         const url=new URL(req.url,'https://'+config.hostname);
@@ -212,6 +226,9 @@ export async function startG7StagingGateway(config){
         }
         if(url.pathname.startsWith('/dashboard/api/g7/pairing/'))
           return await pairingHandler(req,res);
+        if(chatgptBridgeHandler&&(url.pathname===CHATGPT_MCP_ROUTE||
+           url.pathname===getChatGptResourceMetadataPath(config.chatgptBridge.resource)))
+          return await chatgptBridgeHandler(req,res);
         if(url.pathname==='/mcp')return await mcpHandler(req,res);
         if(AGENT_PATHS.has(url.pathname)){
           const machineClient=keys.machineClients.find(item=>item.clientId===

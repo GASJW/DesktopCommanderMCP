@@ -108,10 +108,21 @@ async function readRequest(req){
   try{return JSON.parse(text);}
   catch{throw Object.assign(Error('Invalid JSON'),{code:'BAD_JSON'});}
 }
+function accepts(accept,mediaType){
+  return typeof accept==='string'&&accept.split(',').some(part=>{
+    const [type,...parameters]=part.trim().split(';');
+    if(type.trim().toLowerCase()!==mediaType)return false;
+    const quality=parameters.find(parameter=>/^\s*q=/i.test(parameter));
+    return !quality||Number(quality.split('=')[1])>0;
+  });
+}
 
-export function createRemoteDeviceMcpHandler({accessVerifier,deviceRegistry,trustStore,router,
-  authorizeDevice,grantStore,policySigningKey,getTrustRevision,getDeviceApprovalReceipt,onDiagnostic}={}){
-  if(!accessVerifier||typeof accessVerifier.verifyPrincipal!=='function'||
+export function createRemoteDeviceMcpHandler({accessVerifier,resolveOwner,deviceRegistry,trustStore,router,
+  authorizeDevice,grantStore,policySigningKey,getTrustRevision,getDeviceApprovalReceipt,onDiagnostic,
+  route='/mcp',allowedTools=Object.keys(TOOL_SCHEMAS),supportedProtocolVersions=[MCP_PROTOCOL_VERSION],
+  toolMetadata={},unauthenticatedMethods=[],onAuthenticationRequired,requestIdFactory,
+  requireStreamableAccept=false,validateProtocolVersionHeader=false}={}){
+  if(!(accessVerifier&&typeof accessVerifier.verifyPrincipal==='function'||typeof resolveOwner==='function')||
      !deviceRegistry||typeof deviceRegistry.listDevices!=='function'||
      typeof deviceRegistry.isLiveSession!=='function'||
      typeof trustStore?.acquireDispatchPermit!=='function'||
@@ -120,13 +131,34 @@ export function createRemoteDeviceMcpHandler({accessVerifier,deviceRegistry,trus
      !grantStore||typeof grantStore.authorizeAndPermit!=='function'||
      typeof grantStore.withCurrentAuthorization!=='function'||!policySigningKey||
      typeof getTrustRevision!=='function'||typeof getDeviceApprovalReceipt!=='function'||
-     onDiagnostic!==undefined&&typeof onDiagnostic!=='function'){
+     onDiagnostic!==undefined&&typeof onDiagnostic!=='function'||
+     typeof route!=='string'||!/^\/[A-Za-z0-9._/-]+$/.test(route)||
+     !Array.isArray(allowedTools)||allowedTools.length===0||
+       allowedTools.some(name=>typeof name!=='string'||!Object.hasOwn(TOOL_SCHEMAS,name))||
+       new Set(allowedTools).size!==allowedTools.length||
+     !Array.isArray(supportedProtocolVersions)||supportedProtocolVersions.length===0||
+       supportedProtocolVersions.some(version=>typeof version!=='string'||version.length>64)||
+       new Set(supportedProtocolVersions).size!==supportedProtocolVersions.length||
+     !toolMetadata||typeof toolMetadata!=='object'||Array.isArray(toolMetadata)||
+     !Array.isArray(unauthenticatedMethods)||unauthenticatedMethods.some(method=>typeof method!=='string')||
+     onAuthenticationRequired!==undefined&&typeof onAuthenticationRequired!=='function'||
+     requestIdFactory!==undefined&&typeof requestIdFactory!=='function'||
+     typeof requireStreamableAccept!=='boolean'||typeof validateProtocolVersionHeader!=='boolean'){
     throw new TypeError('Owner verifier, durable trust and approval receipt, router, durable tool grant store and Gateway signing key are required');
   }
+  const allowedToolSet=new Set(allowedTools),unauthenticatedMethodSet=new Set(unauthenticatedMethods);
+  const makeRequestId=requestIdFactory??randomUUID;
   return async function handleRemoteDeviceMcp(req,res){
-    if(req.url!=='/mcp')return send(res,404,{error:'Not found'});
+    if(req.url!==route)return send(res,404,{error:'Not found'});
     if(req.method!=='POST')return send(res,405,{error:'Method not allowed'});
     if(req.headers.origin)return send(res,403,{error:'Browser origin denied'});
+    if(requireStreamableAccept&&(!accepts(req.headers.accept,'application/json')||
+       !accepts(req.headers.accept,'text/event-stream')))
+      return send(res,406,{error:'Streamable HTTP Accept types required'});
+    const protocolHeader=req.headers['mcp-protocol-version'];
+    if(validateProtocolVersionHeader&&protocolHeader!==undefined&&
+       !supportedProtocolVersions.includes(protocolHeader))
+      return send(res,400,{error:'Unsupported MCP protocol version'});
     if(!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type']??'')){
       return send(res,415,{error:'JSON required'});
     }
@@ -153,24 +185,30 @@ export function createRemoteDeviceMcpHandler({accessVerifier,deviceRegistry,trus
       return jsonError(res,400,null,-32600,'Invalid MCP request');
     }
     let owner;
-    try{
-      owner=await accessVerifier.verifyPrincipal(req.headers['cf-access-jwt-assertion']);
-    }catch{return jsonError(res,401,message.id,-32001,'Owner authentication required');}
+    try{owner=resolveOwner
+      ?await resolveOwner(req)
+      :await accessVerifier.verifyPrincipal(req.headers['cf-access-jwt-assertion']);}
+    catch{owner=null;}
     if(res.destroyed)return;
-    if(!owner||typeof owner.issuer!=='string'||typeof owner.subject!=='string'||
-       owner.subject.length===0){
-      return jsonError(res,401,message.id,-32001,'Owner authentication required');
+    if(!owner||typeof owner.issuer!=='string'||typeof owner.subject!=='string'||owner.subject.length===0){
+      if(unauthenticatedMethodSet.has(message.method))owner=null;
+      else{
+        let handled=false;
+        try{handled=await onAuthenticationRequired?.(req,res,message)===true;}catch{}
+        if(handled||res.destroyed)return;
+        return jsonError(res,401,message.id,-32001,'Owner authentication required');
+      }
     }
     if(initializedNotification)return acknowledge(res);
     if(message.method==='initialize'){
       if(!keysAre(message.params,'capabilities,clientInfo,protocolVersion','_meta')||
-         message.params.protocolVersion!==MCP_PROTOCOL_VERSION||
+         !supportedProtocolVersions.includes(message.params.protocolVersion)||
          !message.params.capabilities||typeof message.params.capabilities!=='object'||
          !message.params.clientInfo||typeof message.params.clientInfo!=='object'){
         return jsonError(res,400,message.id,-32602,'Unsupported protocol version or invalid initialize parameters');
       }
       return send(res,200,{jsonrpc:'2.0',id:message.id,result:{
-        protocolVersion:MCP_PROTOCOL_VERSION,capabilities:{tools:{}},
+        protocolVersion:message.params.protocolVersion,capabilities:{tools:{}},
         serverInfo:{name:'vpsc-g7-device-gateway',version:'0.0.0-dev'},
       }});
     }
@@ -180,17 +218,20 @@ export function createRemoteDeviceMcpHandler({accessVerifier,deviceRegistry,trus
            message.params.cursor.length>512))){
         return jsonError(res,400,message.id,-32602,'Invalid tool list parameters');
       }
-      return send(res,200,{jsonrpc:'2.0',id:message.id,result:{tools:Object.entries(TOOL_SCHEMAS).map(([name,schema])=>({
+      return send(res,200,{jsonrpc:'2.0',id:message.id,result:{tools:[...allowedToolSet].map(name=>{
+        const schema=TOOL_SCHEMAS[name];
+        return {
         name,description:schema.description,
         inputSchema:{type:'object',additionalProperties:false,required:schema.required,
           properties:schema.properties},
-      }))}});
+        ...(toolMetadata[name]??{}),
+      };})}});
     }
     if(message.method!=='tools/call'){
       return jsonError(res,400,message.id,-32601,'Unsupported MCP method');
     }
     if(!keysAre(message.params,'arguments,name','_meta')||
-       typeof message.params.name!=='string'||!Object.hasOwn(TOOL_SCHEMAS,message.params.name)||
+       typeof message.params.name!=='string'||!allowedToolSet.has(message.params.name)||
        !validToolArguments(message.params.name,message.params.arguments)){
       return jsonError(res,400,message.id,-32602,'Invalid remote tool parameters');
     }
@@ -210,11 +251,13 @@ export function createRemoteDeviceMcpHandler({accessVerifier,deviceRegistry,trus
     const abortOnDisconnect=()=>{if(!res.writableEnded)controller.abort();};
     res.once('close',abortOnDisconnect);
     let serialized;
-    const requestId=randomUUID();
+    let requestId;
+    try{requestId=makeRequestId({req,owner,message,deviceId,name,arguments:arguments_});}catch{}
+    if(!UUID.test(requestId??''))return jsonError(res,503,message.id,-32002,'Request identity unavailable');
     const requestStartedAt=performance.now();
     const report=(phase,outcomeCode)=>{
       if(!onDiagnostic)return;
-      try{onDiagnostic(Object.freeze({requestId,deviceId,route:'/mcp',phase,outcomeCode,
+      try{onDiagnostic(Object.freeze({requestId,deviceId,route,phase,outcomeCode,
         elapsedMs:Math.max(0,Math.round(performance.now()-requestStartedAt))}));}catch{}
     };
     let authorizationContext;
