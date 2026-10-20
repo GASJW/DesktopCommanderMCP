@@ -46,9 +46,11 @@ cannot be met, calls fail closed.
 The staging Gateway's Owner is a synthetic test identity. It must never be
 used as production authentication. A future live integration must map the
 external IdP subject to the real, already-bound G7 Owner and deploy only after
-separate approval. The pinned JWKS keys in runtime configuration are public;
-their rotation must be coordinated with the IdP before new signing keys are
-used.
+separate approval. The bridge uses only the public JWKS keys pinned in its
+configuration; it does not fetch or refresh JWKS. Rotate by deploying the new
+public key alongside the current key before the IdP starts signing with it,
+then retain the old key until its last token is past the one-hour token limit
+plus the 30-second clock tolerance. Unknown `kid` values fail closed.
 
 ## Secure MCP Tunnel prerequisites
 
@@ -68,12 +70,77 @@ Running `tunnel-client` and selecting the tunnel in ChatGPT requires **Tunnels
 Read + Use** plus the appropriate ChatGPT workspace permission. Use the
 supported client and verify its profile with
 `tunnel-client doctor --profile <profile> --explain`; confirm the client is
-ready and actively polling before testing discovery. The service currently
-limits each serialized tunnel request or response to 10 MiB and gives the
-complete queued request 120 seconds from queue entry through final response.
-The tunnel host needs outbound HTTPS only; do not open inbound Gateway ports.
-The existing `omb-tunnel-client.service` was observed active for OpenMausBot,
-but it has not been verified as an OpenAI tunnel and was left untouched.
+ready and actively polling before testing discovery. The tunnel host needs
+outbound HTTPS to `api.openai.com:443` and local reachability to the Gateway;
+it needs no inbound Gateway port. Preserve TLS verification: the configured
+target hostname must match the certificate SAN, and the tunnel host must trust
+the staging CA. OpenAI documents custom CA bundles for tunnel-client. OAuth
+discovery for the MCP resource can pass through the tunnel, but the OAuth
+authorization server itself must be reachable independently. The documented
+request envelope limit is 10 MiB and deadline 120 seconds.
+
+### Read-only readiness evidence (2026-10-20)
+
+- Platform UI showed the personal organization and an existing tunnel named
+  `OpenMausBot Owner MCP`, associated with one workspace. The signed-in user
+  appeared as organization owner, but the UI did not expose a separate
+  `Tunnels Read + Use` grant and the ChatGPT plugin-to-tunnel association was
+  not confirmed.
+- The VPS `omb-tunnel-client.service` was active, but its binary/profile was
+  not verified as OpenAI's supported client. `tunnel-client` was not on the
+  Gui-PC PATH. No client was installed or changed. The official release page
+  showed v0.0.16 as latest at inspection time.
+- A read-only TLS handshake to Gateway loopback `127.0.0.1:18443` returned a
+  certificate with subject/issuer `CN=g7-staging.test` and SANs
+  `DNS:g7-staging.test` and `IP:127.0.0.1`. A future tunnel profile must use a
+  matching SAN and explicitly trust the staging certificate/CA; the current
+  CA bundle path/profile was not inspected or changed.
+- ChatGPT showed an existing legacy `Commander` app with broad “Allow all”
+  permissions. It is not the I8A read-only app; no I8A plugin was configured.
+- OpenAI's current help article lists full custom MCP support for
+  Business/Enterprise/Edu and read/fetch access for Pro; Plus is not listed.
+  Because the signed-in account is Plus, plugin eligibility remains unverified
+  and requires a supported account/workspace before integration.
+- The only configured IdP located in the project/live metadata was Cloudflare
+  Access Managed OAuth at `https://plain-block-9a74.cloudflareaccess.com`.
+  Read-only discovery advertised authorization code, refresh-token grant,
+  PKCE S256, public-client authentication (`none`) and DCR. It did not
+  advertise `scopes_supported`; the published OIDC JWKS endpoint returned two
+  RS256 keys with a four-hour cache lifetime. No token was requested and no
+  client was registered.
+- Cloudflare Managed OAuth issues opaque access tokens. For Cloudflare MCP
+  applications, Cloudflare expects the origin to validate its signed
+  `Cf-Access-Jwt-Assertion`; the loopback Secure MCP Tunnel path currently
+  bypasses that Access edge, while I8A validates a locally verifiable JWT.
+  The assertion must never be trusted merely because a caller supplied its
+  header. Consequently, this IdP is not directly compatible with the current
+  loopback bridge, and an audience containing the I8A resource plus `g7.read`
+  was not demonstrated.
+- The current G7 Owner is synthetic staging identity. Its production mapping
+  is therefore unavailable. The exact stable `iss` + `sub` of a real G7 Owner
+  must be verified independently and explicitly mapped; email alone is not a
+  sufficient mapping key.
+
+The minimal safe path for a loopback-only tunnel is an authorized human-user
+OAuth/OIDC issuer that returns a signed JWT validated by the bridge, supports
+authorization code + PKCE S256, DCR/CIMD or an approved public client,
+`g7.read`, the exact MCP resource as `aud`, public JWKS with a documented
+overlap/rotation process, and refresh tokens (`offline_access` where required
+by ChatGPT). Bind its verified stable subject to the real existing G7 Owner.
+No such compatible issuer or mapping was verified here. An alternative
+Cloudflare route would require the MCP origin to be reached through the
+existing Access edge and to cryptographically validate the edge assertion;
+that route is not part of this inert bridge and would need separate design and
+approval.
+
+Official references checked for this snapshot:
+
+- [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
+- [ChatGPT custom MCP connections](https://help.openai.com/en/articles/12584461-connecting-custom-mcp-servers-in-chatgpt)
+- [ChatGPT OAuth requirements](https://developers.openai.com/plugins/build/auth)
+- [ChatGPT MCP request metadata](https://developers.openai.com/plugins/reference)
+- [tunnel-client releases](https://github.com/openai/tunnel-client/releases)
+- [Cloudflare Access Managed OAuth](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/managed-oauth/)
 
 The bridge supports stateless Streamable HTTP JSON-RPC, protocol versions
 `2025-03-26`, `2025-06-18` and `2025-11-25`, and the standard protected-resource
@@ -84,13 +151,14 @@ with 400; absent headers retain the protocol's 2025-03-26 compatibility rule.
 `read_file` declares OAuth `g7.read` and read-only annotations.
 Unauthenticated discovery exposes only that schema; unauthenticated or invalid
 `tools/call` requests receive the OAuth challenge metadata and never reach the
-device router. The generated request ID is stable for a retry with the same
-Owner, JSON-RPC ID, device, tool and arguments, so reconnects and OAuth token
-refreshes cannot turn the same MCP call into a new device operation. Since the
-bridge is stateless, the same Owner and JSON-RPC ID/payload are treated as one
-call across sessions; callers should use a new JSON-RPC ID for a distinct
-read. The existing durable device ledger remains the final at-most-once
-execution fence.
+device router. The generated request ID hashes the verified Owner, ChatGPT's
+anonymized `openai/session`, JSON-RPC ID, device, tool and arguments. The
+session field is correlation only, never authentication. Token refresh and
+transport retries keep the ID stable; a different conversation or different
+arguments produce a new ID. Exact reuse of the same session, JSON-RPC ID and
+payload cannot distinguish a retry from a new identical read. Such a caller
+must use a fresh JSON-RPC ID for each new invocation; duplicates remain
+fail-closed at the existing durable device ledger and are never replayed.
 
 ## Local synthetic certification
 

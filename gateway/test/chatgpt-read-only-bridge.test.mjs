@@ -13,7 +13,7 @@ const APPROVAL='b7e92caf-f591-44c4-8fb7-6c489ea573f6';
 const FINGERPRINT='b'.repeat(64);
 const GRANT='b7e92caf-f591-44c4-8fb7-6c489ea573f7';
 
-async function setup(t){
+async function setup(t,{onExecute}={}){
   const {publicKey,privateKey}=generateKeyPairSync('rsa',{modulusLength:2048});
   const config={issuer:'https://auth.i8a.example.test',
     resource:'https://g7-tunnel.example.test/chatgpt/mcp',
@@ -37,7 +37,7 @@ async function setup(t){
       calls.push({...frame,owner:OWNER});
       if(executions.has(frame.requestId))throw Object.assign(Error('duplicate delivery'),{code:'DUPLICATE_DELIVERY'});
       executions.add(frame.requestId);
-      return {content:[{type:'text',text:'synthetic approved file'}]};
+      return onExecute?await onExecute(frame):{content:[{type:'text',text:'synthetic approved file'}]};
     }finally{permit.release();}
   }};
   const deviceRegistry={listDevices:()=>[{deviceId:DEVICE}],isLiveSession:(_id,sessionId)=>sessionId===SESSION};
@@ -77,8 +77,8 @@ async function setup(t){
 }
 
 function rpc(id,method,params){return {jsonrpc:'2.0',id,method,...(params===undefined?{}:{params})};}
-function readCall(id,path='/approved/proof.txt',deviceId=DEVICE){
-  return rpc(id,'tools/call',{name:'read_file',arguments:{deviceId,path}});
+function readCall(id,path='/approved/proof.txt',deviceId=DEVICE,session='chat-session-i8a'){
+  return rpc(id,'tools/call',{name:'read_file',arguments:{deviceId,path},_meta:{'openai/session':session}});
 }
 
 test('I8A exposes unauthenticated MCP discovery, one read-only tool and protected-resource metadata',async t=>{
@@ -167,17 +167,72 @@ test('I8A keeps device, grant-root and tool authorization in the existing G7 pol
   assert.equal(x.calls.length,0);
 });
 
-test('I8A assigns a stable at-most-once agent request ID to a retried MCP request',async t=>{
+test('I8A keeps the same request identity across a transport retry and OAuth token refresh',async t=>{
   const x=await setup(t);
   const message=readCall('stable-jsonrpc-id');
-  const options={headers:{'mcp-session-id':'same-session'}};
-  const first=await x.call(message,{...options,accessToken:x.token({jti:'first-token'})});
-  const retry=await x.call(message,{...options,accessToken:x.token({jti:'refreshed-token'})});
+  const first=await x.call(message,{accessToken:x.token({jti:'first-token'})});
+  const retry=await x.call(message,{accessToken:x.token({jti:'refreshed-token'})});
   assert.equal(first.status,200,JSON.stringify({body:first.body,calls:x.calls.length,diagnostics:x.diagnostics}));
   assert.equal(retry.status,503);
   assert.equal(x.calls.length,2);
   assert.equal(x.executions.size,1);
   assert.equal(x.calls[0].requestId,x.calls[1].requestId);
+});
+
+test('I8A allows a new call that reuses a JSON-RPC ID for different read arguments',async t=>{
+  const x=await setup(t);
+  const first=await x.call(readCall('reused-jsonrpc-id','/approved/first.txt'));
+  const second=await x.call(readCall('reused-jsonrpc-id','/approved/second.txt'));
+  assert.equal(first.status,200);
+  assert.equal(second.status,200);
+  assert.notEqual(x.calls[0].requestId,x.calls[1].requestId);
+  assert.equal(x.executions.size,2);
+});
+
+test('I8A scopes identical calls to the ChatGPT conversation so a new conversation is a new invocation',async t=>{
+  const x=await setup(t);
+  const first=await x.call(readCall('conversation-local-id','/approved/same.txt',DEVICE,'conversation-one'));
+  const second=await x.call(readCall('conversation-local-id','/approved/same.txt',DEVICE,'conversation-two'));
+  assert.equal(first.status,200);
+  assert.equal(second.status,200);
+  assert.notEqual(x.calls[0].requestId,x.calls[1].requestId);
+  assert.equal(x.executions.size,2);
+  assert.doesNotMatch(JSON.stringify(x.diagnostics),/conversation-one|conversation-two/);
+});
+
+test('I8A fails closed without a ChatGPT conversation identity',async t=>{
+  const x=await setup(t);
+  const reply=await x.call(rpc('missing-session','tools/call',{name:'read_file',arguments:{
+    deviceId:DEVICE,path:'/approved/proof.txt'}}));
+  assert.equal(reply.status,503);
+  assert.equal(x.calls.length,0);
+  assert.equal(x.executions.size,0);
+});
+
+test('I8A does not replay an ambiguous remote execution on a retry',async t=>{
+  let executionCount=0;
+  const x=await setup(t,{onExecute:async()=>{
+    executionCount++;
+    throw Object.assign(Error('synthetic response lost after execution'),{code:'AMBIGUOUS_TIMEOUT'});
+  }});
+  const message=readCall('ambiguous-retry');
+  const first=await x.call(message);
+  const retry=await x.call(message);
+  assert.equal(first.status,503);
+  assert.equal(retry.status,503);
+  assert.equal(executionCount,1);
+  assert.equal(x.executions.size,1);
+  assert.equal(x.calls[0].requestId,x.calls[1].requestId);
+});
+
+test('I8A treats an exact reused ID and payload in the same conversation as an ambiguous retry',async t=>{
+  const x=await setup(t);
+  const message=readCall('same-session-same-invocation');
+  const first=await x.call(message);
+  const repeated=await x.call(message);
+  assert.equal(first.status,200);
+  assert.equal(repeated.status,503);
+  assert.equal(x.executions.size,1);
 });
 
 test('I8A rejects a principal map to any Owner other than the current G7 Owner',()=>{

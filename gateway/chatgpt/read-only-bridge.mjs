@@ -122,10 +122,13 @@ function canonicalJson(value){
   return JSON.stringify(value);
 }
 
+// shortcut: identical RPC ID/payload within one conversation is ambiguous; use a fresh ID for every new invocation.
 function stableRequestId({owner,message,deviceId,name,arguments:args}){
-  // shortcut: reused Owner/JSON-RPC IDs with identical calls fail closed as duplicates; use a new ID for a new read.
-  const digest=createHash('sha256').update('VPSC-I8A-REQUEST-v1\n').update(canonicalJson([
-    ownerIdentityDigest(owner),message.id,deviceId,name,args,
+  const session=message.params?._meta?.['openai/session'];
+  if(typeof session!=='string'||session.length===0||Buffer.byteLength(session,'utf8')>1024||
+     /[\u0000-\u001f\u007f]/.test(session))throw new Error('ChatGPT conversation identity unavailable');
+  const digest=createHash('sha256').update('VPSC-I8A-REQUEST-v2\n').update(canonicalJson([
+    ownerIdentityDigest(owner),session,message.id,deviceId,name,args,
   ])).digest('hex').slice(0,32).split('');
   digest[12]='4';
   digest[16]=(parseInt(digest[16],16)&3|8).toString(16);
