@@ -18,7 +18,7 @@ import { createDeviceRouter } from '../devices/router.mjs';
 import { createRemoteDeviceMcpHandler } from '../devices/remote-mcp-handler.mjs';
 import { createDurableToolGrantStore } from '../devices/durable-tool-grants.mjs';
 import { createDurableMachineBindingStore } from '../devices/durable-machine-bindings.mjs';
-import { CHATGPT_MCP_ROUTE, CHATGPT_RESOURCE_METADATA_PATH,
+import { CHATGPT_MCP_ROUTE, getChatGptResourceMetadataPath,
   createChatGptReadOnlyBridge, validateChatGptBridgeConfig } from '../chatgpt/read-only-bridge.mjs';
 import { readPrivateStagingFile } from './private-file.mjs';
 
@@ -227,7 +227,8 @@ export async function startG7StagingGateway(config){
         if(url.pathname.startsWith('/dashboard/api/g7/pairing/'))
           return await pairingHandler(req,res);
         if(chatgptBridgeHandler&&(url.pathname===CHATGPT_MCP_ROUTE||
-           url.pathname===CHATGPT_RESOURCE_METADATA_PATH))return await chatgptBridgeHandler(req,res);
+           url.pathname===getChatGptResourceMetadataPath(config.chatgptBridge.resource)))
+          return await chatgptBridgeHandler(req,res);
         if(url.pathname==='/mcp')return await mcpHandler(req,res);
         if(AGENT_PATHS.has(url.pathname)){
           const machineClient=keys.machineClients.find(item=>item.clientId===

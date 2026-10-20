@@ -79,6 +79,72 @@ discovery for the MCP resource can pass through the tunnel, but the OAuth
 authorization server itself must be reachable independently. The documented
 request envelope limit is 10 MiB and deadline 120 seconds.
 
+For a resource at `/chatgpt/mcp`, RFC 9728 derives its metadata path as
+`/.well-known/oauth-protected-resource/chatgpt/mcp`. The bridge validates this
+path against `resource` and serves the metadata there; the root-only path is
+not used for a path-qualified resource. Set `resourceMetadataUrl` to the
+externally reachable HTTPS URL for that derived path.
+
+### Auth0 read-only verification (2026-10-20)
+
+Public GET requests to the tenant's OIDC discovery document, OAuth
+authorization-server metadata, JWKS, and ChatGPT's supplied CIMD document did
+not start an authorization flow or expose a token. The issuer exactly matches
+the configured trailing-slash issuer. Both Auth0 metadata documents advertise
+`client_id_metadata_document_supported: true`,
+`authorization_response_iss_parameter_supported: true`, PKCE S256, and token
+endpoint methods `none` and `private_key_jwt`. They advertise
+`authorization_code` and `refresh_token`; `offline_access` is listed in
+`scopes_supported`, and no DCR registration endpoint is published. The current
+public JWKS contains two RSA-2048 RS256 signing keys. No key material is stored
+in this report.
+
+The public ChatGPT CIMD document uses its own HTTPS URL as `client_id`, declares
+`private_key_jwt` and the authorization-code/refresh-token grants, and publishes
+a public JWKS URL. OpenAI documents that ChatGPT uses the CIMD URL as the OAuth
+`client_id`; Auth0 documents that its default access-token profile represents
+the client in `azp`, while RFC 9068 uses `client_id`, and that CIMD's
+`external_client_id` is the alternate identifier used during authorization.
+Therefore the CIMD URL is the expected allowlist value, but the actual
+Auth0-issued `azp`/`client_id` was not observed because token exchange is out of
+scope. The bridge accepts either claim dialect, but rejects a token if both are
+present with different values.
+
+The Auth0 CIMD Management API operation is a `POST` create/update upsert keyed
+by `external_client_id`, not a read-only client lookup. It was not called, so
+the tenant's internal Auth0 `client_id` and mapped redirect/authentication
+fields remain unknown. `g7.read` is not an OIDC discovery scope; its actual API
+grant is not proven by the public discovery response.
+
+The configured API Identifier equals the bridge resource identifier. The
+operator reports Resource Parameter Compatibility enabled; Auth0 documents
+that setting as the mechanism that maps the OAuth `resource` request parameter
+to the token audience. No access token was requested, so the actual `aud`,
+`g7.read` issuance, API's Allow Offline Access state, the third-party client's
+explicit API grant, and the ChatGPT redirect URI allowlist remain unverified.
+Auth0 requires explicit API grants for third-party applications; the
+`g7.read` grant must be confirmed before any authorized OAuth flow.
+
+`google-oauth2` identifies the configured login connection, not a specific
+user. The exact Google user's Auth0 `sub` cannot be derived from public
+discovery or JWKS. Verify it from an authorized Auth0 user record or a
+separately approved OAuth flow, then bind that exact `iss` + `sub` to the
+already-existing, real G7 Owner principal. Do not map a production token to
+the synthetic staging Owner and do not change the canonical G7 Owner: existing
+device bindings and grants are keyed to its owner identity digest. Keep the
+staging Owner and its stores isolated; a change of canonical Owner would need
+an audited, additive migration through supported store APIs, not edits or
+resets of the durable files.
+
+Auth0 currently publishes two signing keys; the JWKS response does not identify
+which key is current or queued for rotation. The bridge pins public keys in
+deployment configuration and fails closed on an unknown `kid`; before a key
+cutover, include the next key, retain the prior key until its tokens expire,
+then remove it. Automatic JWKS retrieval/rotation is not implemented. Auth0's
+actual access-token profile, API grant, refresh-token policy, subject, redirect
+registration, and claim values still require read-only Dashboard evidence or a
+separately approved OAuth flow.
+
 ### Read-only readiness evidence (2026-10-20)
 
 - Platform UI showed the personal organization and an existing tunnel named
@@ -141,13 +207,19 @@ Official references checked for this snapshot:
 - [ChatGPT MCP request metadata](https://developers.openai.com/plugins/reference)
 - [tunnel-client releases](https://github.com/openai/tunnel-client/releases)
 - [Cloudflare Access Managed OAuth](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/managed-oauth/)
+- [Auth0 third-party application controls](https://auth0.com/docs/get-started/applications/third-party-applications/security-controls)
+- [Auth0 access-token profiles](https://auth0.com/docs/secure/tokens/access-tokens/access-token-profiles)
+- [Auth0 CIMD registration API](https://auth0.com/docs/api/management/v2/clients/register-or-update-a-cimd-client-via-metadata-uri)
+- [MCP authorization specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
+- [RFC 9728 Protected Resource Metadata](https://datatracker.ietf.org/doc/html/rfc9728)
 
 The bridge supports stateless Streamable HTTP JSON-RPC, protocol versions
-`2025-03-26`, `2025-06-18` and `2025-11-25`, and the standard protected-resource
-metadata route. POST requires both JSON and event-stream media types in
-`Accept`; the endpoint returns JSON and rejects GET with 405 because it has no
-server-initiated event stream. Unsupported `MCP-Protocol-Version` values fail
-with 400; absent headers retain the protocol's 2025-03-26 compatibility rule.
+`2025-03-26`, `2025-06-18` and `2025-11-25`, and the RFC 9728 path-derived
+protected-resource metadata route. POST requires both JSON and event-stream
+media types in `Accept`; the endpoint returns JSON and rejects GET with 405
+because it has no server-initiated event stream. Unsupported
+`MCP-Protocol-Version` values fail with 400; absent headers retain the
+protocol's 2025-03-26 compatibility rule.
 `read_file` declares OAuth `g7.read` and read-only annotations.
 Unauthenticated discovery exposes only that schema; unauthenticated or invalid
 `tools/call` requests receive the OAuth challenge metadata and never reach the

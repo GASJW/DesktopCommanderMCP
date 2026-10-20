@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { generateKeyPairSync, sign } from 'node:crypto';
 import { createChatGptReadOnlyBridge, CHATGPT_MCP_ROUTE,
-  CHATGPT_RESOURCE_METADATA_PATH, validateChatGptBridgeConfig } from '../chatgpt/read-only-bridge.mjs';
+  CHATGPT_RESOURCE_METADATA_PATH, getChatGptResourceMetadataPath,
+  validateChatGptBridgeConfig } from '../chatgpt/read-only-bridge.mjs';
 
 const OWNER={issuer:'https://g7-owner-staging.cloudflareaccess.com',subject:'synthetic-owner'};
 const DEVICE='b7e92caf-f591-44c4-8fb7-6c489ea573f4';
@@ -17,13 +18,13 @@ async function setup(t,{onExecute}={}){
   const {publicKey,privateKey}=generateKeyPairSync('rsa',{modulusLength:2048});
   const config={issuer:'https://auth.i8a.example.test',
     resource:'https://g7-tunnel.example.test/chatgpt/mcp',
-    resourceMetadataUrl:'https://g7-tunnel.example.test/.well-known/oauth-protected-resource',
+    resourceMetadataUrl:'https://g7-tunnel.example.test/.well-known/oauth-protected-resource/chatgpt/mcp',
     clientIds:['chatgpt-client-i8a'],jwks:[{...publicKey.export({format:'jwk'}),
       kid:'i8a-test-key',alg:'RS256',use:'sig'}],
     principalMapping:{subject:'chatgpt-user-i8a',ownerIssuer:OWNER.issuer,ownerSubject:OWNER.subject}};
-  const token=(claims={})=>{
+  const token=(claims={},headerClaims={})=>{
     const now=Math.floor(Date.now()/1000);
-    const header=Buffer.from(JSON.stringify({alg:'RS256',kid:'i8a-test-key',typ:'at+jwt'})).toString('base64url');
+    const header=Buffer.from(JSON.stringify({alg:'RS256',kid:'i8a-test-key',typ:'at+jwt',...headerClaims})).toString('base64url');
     const payload=Buffer.from(JSON.stringify({iss:config.issuer,aud:config.resource,
       sub:config.principalMapping.subject,client_id:config.clientIds[0],scope:'g7.read',
       iat:now-2,exp:now+300,...claims})).toString('base64url');
@@ -100,10 +101,30 @@ test('I8A exposes unauthenticated MCP discovery, one read-only tool and protecte
   assert.deepEqual(listed.body.result.tools[0].securitySchemes,[{type:'oauth2',scopes:['g7.read']}]);
   assert.deepEqual(listed.body.result.tools[0].annotations,
     {readOnlyHint:true,destructiveHint:false,openWorldHint:false});
-  const metadata=await fetch(x.endpoint+CHATGPT_RESOURCE_METADATA_PATH);
+  const metadataPath=getChatGptResourceMetadataPath(x.config.resource);
+  assert.equal(metadataPath,`${CHATGPT_RESOURCE_METADATA_PATH}/chatgpt/mcp`);
+  const metadata=await fetch(x.endpoint+metadataPath);
   assert.equal(metadata.status,200);
   assert.deepEqual(await metadata.json(),{resource:x.config.resource,
     authorization_servers:[x.config.issuer],scopes_supported:['g7.read'],bearer_methods_supported:['header']});
+  assert.notEqual((await fetch(x.endpoint+CHATGPT_RESOURCE_METADATA_PATH)).status,200);
+});
+
+test('I8C accepts Auth0 default azp and RFC 9068 client_id access-token profiles',async t=>{
+  const x=await setup(t);
+  for(const [claims,header] of [
+    [{client_id:undefined,azp:x.config.clientIds[0]},{typ:'JWT'}],
+    [{azp:undefined,client_id:x.config.clientIds[0]},{typ:'at+jwt'}],
+  ]){
+    const reply=await x.call(readCall(`auth0-profile-${x.calls.length}`),
+      {accessToken:x.token(claims,header)});
+    assert.equal(reply.status,200,JSON.stringify(reply.body));
+  }
+  assert.equal(x.calls.length,2);
+  const mismatched=await x.call(readCall('auth0-profile-mismatch'),
+    {accessToken:x.token({client_id:x.config.clientIds[0],azp:'another-client'})});
+  assert.equal(mismatched.body.result.isError,true);
+  assert.equal(x.calls.length,2);
 });
 
 test('I8A validates OAuth JWT and maps only the configured subject to the existing G7 Owner',async t=>{
@@ -238,11 +259,16 @@ test('I8A treats an exact reused ID and payload in the same conversation as an a
 test('I8A rejects a principal map to any Owner other than the current G7 Owner',()=>{
   const {publicKey}=generateKeyPairSync('rsa',{modulusLength:2048});
   const config={issuer:'https://auth.i8a.example.test',resource:'https://g7.example.test/chatgpt/mcp',
-    resourceMetadataUrl:'https://g7.example.test/.well-known/oauth-protected-resource',
+    resourceMetadataUrl:'https://g7.example.test/.well-known/oauth-protected-resource/chatgpt/mcp',
     clientIds:['chatgpt-client-i8a'],jwks:[{...publicKey.export({format:'jwk'}),kid:'test',alg:'RS256'}],
     principalMapping:{subject:'user',ownerIssuer:'https://unrelated.example.test',ownerSubject:'other'}};
   assert.throws(()=>validateChatGptBridgeConfig(config,OWNER),/Invalid ChatGPT read-only bridge OAuth configuration/);
-  assert.throws(()=>validateChatGptBridgeConfig({...config,
+  const validMapping={...config,principalMapping:{...config.principalMapping,
+    ownerIssuer:OWNER.issuer,ownerSubject:OWNER.subject}};
+  assert.throws(()=>validateChatGptBridgeConfig({...validMapping,
+    resourceMetadataUrl:'https://g7.example.test/.well-known/oauth-protected-resource'},OWNER),
+  /Invalid ChatGPT read-only bridge OAuth configuration/);
+  assert.throws(()=>validateChatGptBridgeConfig({...validMapping,
     resourceMetadataUrl:'https://g7.example.test/not-protected-resource'},OWNER),
   /Invalid ChatGPT read-only bridge OAuth configuration/);
 });

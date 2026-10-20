@@ -22,10 +22,15 @@ function httpsUrl(value){
   }catch{return false;}
 }
 
+export function getChatGptResourceMetadataPath(resource){
+  const path=new URL(resource).pathname;
+  return path==='/'?CHATGPT_RESOURCE_METADATA_PATH:`${CHATGPT_RESOURCE_METADATA_PATH}${path}`;
+}
+
 export function validateChatGptBridgeConfig(config,owner){
   if(!exact(config,'clientIds,issuer,jwks,principalMapping,resource,resourceMetadataUrl')||
      !httpsUrl(config.issuer)||!httpsUrl(config.resource)||!httpsUrl(config.resourceMetadataUrl)||
-     new URL(config.resourceMetadataUrl).pathname!==CHATGPT_RESOURCE_METADATA_PATH||
+     new URL(config.resourceMetadataUrl).pathname!==getChatGptResourceMetadataPath(config.resource)||
      !exact(config.principalMapping,'ownerIssuer,ownerSubject,subject')||
      config.principalMapping.ownerIssuer!==owner?.issuer||
      config.principalMapping.ownerSubject!==owner?.subject||
@@ -37,6 +42,7 @@ export function validateChatGptBridgeConfig(config,owner){
      !Array.isArray(config.jwks)||config.jwks.length<1||config.jwks.length>32){
     throw new Error('Invalid ChatGPT read-only bridge OAuth configuration');
   }
+  // shortcut: JWKS stays deployment-pinned; automate refresh if rotations cannot be coordinated with an overlapping key update.
   const keys=new Map();
   for(const jwk of config.jwks){
     if(!jwk||jwk.kty!=='RSA'||jwk.alg!=='RS256'||jwk.use&&jwk.use!=='sig'||
@@ -149,6 +155,7 @@ function sendJson(res,status,body,headers={}){
 
 export function createChatGptReadOnlyBridge({oauth,owner,...gateway}={}){
   const {keys,clientIds}=validateChatGptBridgeConfig(oauth,owner);
+  const resourceMetadataPath=getChatGptResourceMetadataPath(oauth.resource);
   const resolveOwner=async req=>validAccessToken(bearerToken(req),oauth,{keys,clientIds});
   const challenge=authChallenge(oauth);
   const mcpHandler=createRemoteDeviceMcpHandler({...gateway,resolveOwner,
@@ -172,7 +179,7 @@ export function createChatGptReadOnlyBridge({oauth,owner,...gateway}={}){
   const metadata=Object.freeze({resource:oauth.resource,authorization_servers:[oauth.issuer],
     scopes_supported:[SCOPE],bearer_methods_supported:['header']});
   return async function handleChatGptReadOnlyBridge(req,res){
-    if(req.url===CHATGPT_RESOURCE_METADATA_PATH){
+    if(req.url===resourceMetadataPath){
       if(req.method!=='GET')return sendJson(res,405,{error:'Method not allowed'});
       if(req.headers.origin)return sendJson(res,403,{error:'Browser origin denied'});
       return sendJson(res,200,metadata);
