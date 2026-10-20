@@ -2,11 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { generateKeyPairSync, sign } from 'node:crypto';
+import { ownerIdentityDigest } from '../dashboard/owner-identity.mjs';
 import { createChatGptReadOnlyBridge, CHATGPT_MCP_ROUTE,
   CHATGPT_RESOURCE_METADATA_PATH, getChatGptResourceMetadataPath,
   validateChatGptBridgeConfig } from '../chatgpt/read-only-bridge.mjs';
 
-const OWNER={issuer:'https://g7-owner-staging.cloudflareaccess.com',subject:'synthetic-owner'};
+const OWNER={issuer:'https://g7-owner-test.cloudflareaccess.com',subject:'test-owner-subject'};
+const STAGING_OWNER={issuer:'https://g7-owner-staging.cloudflareaccess.com',subject:'synthetic-owner'};
 const DEVICE='b7e92caf-f591-44c4-8fb7-6c489ea573f4';
 const OTHER_DEVICE='b7e92caf-f591-44c4-8fb7-6c489ea573f5';
 const SESSION='ab000000-0000-4000-8000-000000000001';
@@ -14,24 +16,28 @@ const APPROVAL='b7e92caf-f591-44c4-8fb7-6c489ea573f6';
 const FINGERPRINT='b'.repeat(64);
 const GRANT='b7e92caf-f591-44c4-8fb7-6c489ea573f7';
 
-async function setup(t,{onExecute}={}){
-  const {publicKey,privateKey}=generateKeyPairSync('rsa',{modulusLength:2048});
+async function setup(t,{onExecute,includeNextKey=false}={}){
+  const activeKey=generateKeyPairSync('rsa',{modulusLength:2048});
+  const nextKey=includeNextKey?generateKeyPairSync('rsa',{modulusLength:2048}):null;
   const config={issuer:'https://auth.i8a.example.test',
     resource:'https://g7-tunnel.example.test/chatgpt/mcp',
     resourceMetadataUrl:'https://g7-tunnel.example.test/.well-known/oauth-protected-resource/chatgpt/mcp',
-    clientIds:['chatgpt-client-i8a'],jwks:[{...publicKey.export({format:'jwk'}),
-      kid:'i8a-test-key',alg:'RS256',use:'sig'}],
+    clientIds:['chatgpt-client-i8a'],jwks:[{...activeKey.publicKey.export({format:'jwk'}),
+      kid:'i8a-test-key',alg:'RS256',use:'sig'},...(nextKey?[{...nextKey.publicKey.export({format:'jwk'}),
+      kid:'i8a-next-key',alg:'RS256',use:'sig'}]:[])],
     principalMapping:{subject:'chatgpt-user-i8a',ownerIssuer:OWNER.issuer,ownerSubject:OWNER.subject}};
-  const token=(claims={},headerClaims={})=>{
+  const token=(claims={},headerClaims={},signingKey='i8a-test-key')=>{
     const now=Math.floor(Date.now()/1000);
-    const header=Buffer.from(JSON.stringify({alg:'RS256',kid:'i8a-test-key',typ:'at+jwt',...headerClaims})).toString('base64url');
+    const header=Buffer.from(JSON.stringify({alg:'RS256',kid:signingKey,typ:'at+jwt',...headerClaims})).toString('base64url');
     const payload=Buffer.from(JSON.stringify({iss:config.issuer,aud:config.resource,
       sub:config.principalMapping.subject,client_id:config.clientIds[0],scope:'g7.read',
       iat:now-2,exp:now+300,...claims})).toString('base64url');
     const input=`${header}.${payload}`;
+    const privateKey=signingKey==='i8a-next-key'&&nextKey?nextKey.privateKey:activeKey.privateKey;
     return `${input}.${sign('RSA-SHA256',Buffer.from(input),privateKey).toString('base64url')}`;
   };
-  const executions=new Set(),calls=[],diagnostics=[];
+  const executions=new Set(),calls=[],diagnostics=[],ownerDigests=[],approvalOwners=[];
+  let grantActive=true;
   const router={callDevice:async({beforeDispatch,...frame})=>{
     const permit=await beforeDispatch({deviceId:frame.deviceId,requestId:frame.requestId,sessionId:SESSION});
     try{
@@ -45,20 +51,25 @@ async function setup(t,{onExecute}={}){
   const trustStore={acquireDispatchPermit:()=>({release:()=>true}),
     withCurrentSession:(_context,callback)=>callback({sessionId:SESSION})};
   const grantStore={
-    authorizeAndPermit:async({deviceId,fingerprint,tool,arguments:args})=>{
+    authorizeAndPermit:async({ownerDigest,deviceId,fingerprint,tool,arguments:args})=>{
+      if(!grantActive)throw Object.assign(Error('grant revoked'),{code:'DENIED'});
+      ownerDigests.push(ownerDigest);
       if(deviceId!==DEVICE||fingerprint!==FINGERPRINT||tool!=='read_file'||
          typeof args.path!=='string'||!args.path.startsWith('/approved/'))
         throw Object.assign(Error('grant scope denied'),{code:'GRANT_SCOPE_DENIED'});
       return {grantId:GRANT,policyRevision:2,authorization:{claims:{tool,deviceId}},release:()=>true};
     },
-    withCurrentAuthorization:(_context,callback)=>callback(),
+    withCurrentAuthorization:(_context,callback)=>{
+      if(!grantActive)throw Object.assign(Error('grant revoked'),{code:'DENIED'});
+      return callback();
+    },
   };
   const gateway={deviceRegistry,trustStore,router,
     authorizeDevice:async(owner,deviceId)=>owner.issuer===OWNER.issuer&&owner.subject===OWNER.subject&&deviceId===DEVICE,
     grantStore,policySigningKey:generateKeyPairSync('ed25519').privateKey,
     getTrustRevision:()=>3,
-    getDeviceApprovalReceipt:()=>({eventId:APPROVAL,deviceId:DEVICE,fingerprint:FINGERPRINT,
-      trustRevisionBefore:2,trustRevisionAfter:3,trustRevision:3}),
+    getDeviceApprovalReceipt:owner=>{approvalOwners.push(owner);return {eventId:APPROVAL,deviceId:DEVICE,
+      fingerprint:FINGERPRINT,trustRevisionBefore:2,trustRevisionAfter:3,trustRevision:3};},
     onDiagnostic:event=>diagnostics.push(event)};
   const handler=createChatGptReadOnlyBridge({oauth:config,owner:OWNER,...gateway});
   const server=createServer(handler);
@@ -74,7 +85,8 @@ async function setup(t,{onExecute}={}){
     },body:JSON.stringify(message)});
     return {status:response.status,headers:response.headers,body:await response.json()};
   };
-  return {config,token,call,calls,executions,diagnostics,endpoint};
+  return {config,token,call,calls,executions,diagnostics,ownerDigests,approvalOwners,
+    revokeGrant:()=>{grantActive=false;},endpoint};
 }
 
 function rpc(id,method,params){return {jsonrpc:'2.0',id,method,...(params===undefined?{}:{params})};}
@@ -127,6 +139,19 @@ test('I8C accepts Auth0 default azp and RFC 9068 client_id access-token profiles
   assert.equal(x.calls.length,2);
 });
 
+test('I8D accepts overlapping Auth0 signing keys and rejects an unknown kid',async t=>{
+  const x=await setup(t,{includeNextKey:true});
+  for(const [id,key] of [['rotation-old','i8a-test-key'],['rotation-next','i8a-next-key']]){
+    const reply=await x.call(readCall(id),{accessToken:x.token({}, {}, key)});
+    assert.equal(reply.status,200,JSON.stringify(reply.body));
+  }
+  const unknown=await x.call(readCall('rotation-unknown'),
+    {accessToken:x.token({}, {kid:'not-published'})});
+  assert.equal(unknown.body.result.isError,true);
+  assert.equal(x.calls.length,2);
+  assert.equal(x.executions.size,2);
+});
+
 test('I8A validates OAuth JWT and maps only the configured subject to the existing G7 Owner',async t=>{
   const x=await setup(t);
   const accessToken=x.token();
@@ -139,6 +164,16 @@ test('I8A validates OAuth JWT and maps only the configured subject to the existi
   assert.equal(reply.body.result.content[0].text,'synthetic approved file');
   assert.ok(x.diagnostics.some(event=>event.route===CHATGPT_MCP_ROUTE&&event.phase==='owner_dispatch'));
   assert.equal(JSON.stringify(x.diagnostics).includes(accessToken),false);
+});
+
+test('I8D preserves the canonical Owner digest through approval and grant authorization',async t=>{
+  const x=await setup(t);
+  const reply=await x.call(readCall('owner-continuity'));
+  assert.equal(reply.status,200);
+  assert.equal(x.approvalOwners.length,2);
+  assert.ok(x.approvalOwners.every(owner=>owner.issuer===OWNER.issuer&&owner.subject===OWNER.subject));
+  assert.deepEqual(x.ownerDigests,[ownerIdentityDigest(OWNER)]);
+  assert.deepEqual(x.calls.map(call=>call.owner),[OWNER]);
 });
 
 test('I8A rejects missing, forged, stale, wrong-audience, wrong-client and insufficient-scope tokens',async t=>{
@@ -186,6 +221,15 @@ test('I8A keeps device, grant-root and tool authorization in the existing G7 pol
     deviceId:DEVICE,path:'/approved/new.txt',content:'no',mode:'create'}}));
   assert.equal(escalated.status,400);
   assert.equal(x.calls.length,0);
+});
+
+test('I8D denies a revoked grant before another device dispatch',async t=>{
+  const x=await setup(t);
+  x.revokeGrant();
+  const reply=await x.call(readCall('revoked-grant'));
+  assert.equal(reply.status,403);
+  assert.equal(x.calls.length,0);
+  assert.equal(x.executions.size,0);
 });
 
 test('I8A keeps the same request identity across a transport retry and OAuth token refresh',async t=>{
@@ -270,5 +314,20 @@ test('I8A rejects a principal map to any Owner other than the current G7 Owner',
   /Invalid ChatGPT read-only bridge OAuth configuration/);
   assert.throws(()=>validateChatGptBridgeConfig({...validMapping,
     resourceMetadataUrl:'https://g7.example.test/not-protected-resource'},OWNER),
+  /Invalid ChatGPT read-only bridge OAuth configuration/);
+});
+
+test('I8D refuses the synthetic staging Owner and unsupported Auth0 canonical Owner',()=>{
+  const {publicKey}=generateKeyPairSync('rsa',{modulusLength:2048});
+  const config={issuer:'https://auth.i8d.example.test',resource:'https://g7.example.test/chatgpt/mcp',
+    resourceMetadataUrl:'https://g7.example.test/.well-known/oauth-protected-resource/chatgpt/mcp',
+    clientIds:['chatgpt-client-i8d'],jwks:[{...publicKey.export({format:'jwk'}),kid:'test',alg:'RS256'}],
+    principalMapping:{subject:'google-oauth2|test-subject',ownerIssuer:OWNER.issuer,ownerSubject:OWNER.subject}};
+  assert.throws(()=>validateChatGptBridgeConfig(config,STAGING_OWNER),
+    /Invalid ChatGPT read-only bridge OAuth configuration/);
+  const auth0Owner={issuer:'https://dev-r1u56lfz1csuqyjc.us.auth0.com/',
+    subject:'google-oauth2|test-subject'};
+  assert.throws(()=>validateChatGptBridgeConfig({...config,principalMapping:{...config.principalMapping,
+    ownerIssuer:auth0Owner.issuer,ownerSubject:auth0Owner.subject}},auth0Owner),
   /Invalid ChatGPT read-only bridge OAuth configuration/);
 });

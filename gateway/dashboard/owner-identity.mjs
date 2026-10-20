@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 
+export const STAGING_OWNER_ISSUER='https://g7-owner-staging.cloudflareaccess.com';
+
 function validOwner(value){
   return value&&typeof value.issuer==='string'&&
     /^https:\/\/[a-z0-9-]+\.cloudflareaccess\.com$/.test(value.issuer)&&
@@ -17,3 +19,4 @@ export function ownerIdentityDigest(owner){
   return sha256('VPSC-I4-OWNER-v1\n'+JSON.stringify([owner.issuer,owner.subject]));
 }
 export function isOwnerPrincipal(owner){return validOwner(owner);}
+export function isSyntheticStagingOwner(owner){return owner?.issuer===STAGING_OWNER_ISSUER;}

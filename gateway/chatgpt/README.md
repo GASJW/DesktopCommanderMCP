@@ -105,45 +105,89 @@ a public JWKS URL. OpenAI documents that ChatGPT uses the CIMD URL as the OAuth
 `client_id`; Auth0 documents that its default access-token profile represents
 the client in `azp`, while RFC 9068 uses `client_id`, and that CIMD's
 `external_client_id` is the alternate identifier used during authorization.
-Therefore the CIMD URL is the expected allowlist value, but the actual
-Auth0-issued `azp`/`client_id` was not observed because token exchange is out of
-scope. The bridge accepts either claim dialect, but rejects a token if both are
-present with different values.
+The read-only Dashboard shows both the external CIMD URL and internal Auth0
+client ID. The exact value emitted in `azp` was not observed because token
+exchange is out of scope. The bridge accepts either claim dialect, but rejects
+a token if both are present with different values; deployment must allowlist
+only the exact value verified in a separately authorized test.
 
 The Auth0 CIMD Management API operation is a `POST` create/update upsert keyed
-by `external_client_id`, not a read-only client lookup. It was not called, so
-the tenant's internal Auth0 `client_id` and mapped redirect/authentication
-fields remain unknown. `g7.read` is not an OIDC discovery scope; its actual API
-grant is not proven by the public discovery response.
+by `external_client_id`, not a read-only client lookup, and was not called.
+The Dashboard independently shows internal client ID
+`tpc_8Gh7siSu4HFHVqNQBHgZAA` and the ChatGPT callback URL. `g7.read` is not an
+OIDC discovery scope; its application grant was confirmed separately in the
+API's Application Access table.
 
 The configured API Identifier equals the bridge resource identifier. The
-operator reports Resource Parameter Compatibility enabled; Auth0 documents
-that setting as the mechanism that maps the OAuth `resource` request parameter
-to the token audience. No access token was requested, so the actual `aud`,
-`g7.read` issuance, API's Allow Offline Access state, the third-party client's
-explicit API grant, and the ChatGPT redirect URI allowlist remain unverified.
-Auth0 requires explicit API grants for third-party applications; the
-`g7.read` grant must be confirmed before any authorized OAuth flow.
+operator reports Resource Parameter Compatibility enabled; this read-only
+Dashboard inspection independently confirmed the API uses the `Auth0`
+access-token profile with RS256 signing.
+Auth0's default profile uses `azp`; RFC 9068 would instead use `client_id`. The
+tenant's internal CIMD client ID and external metadata URL are different. The
+Dashboard and public CIMD metadata do not show which value the authorization
+server will place in `azp`, so do not allowlist both as a guess; the exact claim
+value remains unverified without an authorized read-only issuance observation.
 
-`google-oauth2` identifies the configured login connection, not a specific
-user. The exact Google user's Auth0 `sub` cannot be derived from public
-discovery or JWKS. Verify it from an authorized Auth0 user record or a
-separately approved OAuth flow, then bind that exact `iss` + `sub` to the
-already-existing, real G7 Owner principal. Do not map a production token to
-the synthetic staging Owner and do not change the canonical G7 Owner: existing
-device bindings and grants are keyed to its owner identity digest. Keep the
-staging Owner and its stores isolated; a change of canonical Owner would need
-an audited, additive migration through supported store APIs, not edits or
-resets of the durable files.
+The API Dashboard currently shows `Allow Offline Access` disabled, despite the
+application's refresh-token rotation setting. Therefore a ChatGPT refresh
+token for this API is not ready: Auth0 requires both `offline_access` and this
+API setting for offline refresh tokens. The API's Application Access page
+shows the ChatGPT CIMD application has 1/1 user-delegated permission granted
+(`g7.read`); Client Access is 0/1. The API Identifier is
+`https://g7-staging.test/chatgpt/mcp`, and the active tunnel profile's local
+upstream is `https://127.0.0.1:18443/chatgpt/mcp`. The former is the canonical
+OAuth resource; the latter is only the tunnel client's upstream URL. OpenAI
+documents that OAuth discovery is forwarded through the tunnel, but the tunnel
+is stopped, so the resource metadata has not yet been observed end-to-end.
+
+The authorized Auth0 user record is a Google identity and its stable `sub` was
+read from the Dashboard without requesting or exchanging a token. Its value is
+kept out of this repository. The record identifies the candidate subject, but
+it is not an approved Owner transition by itself.
+
+The existing G7 Owner model accepts Cloudflare Access principals only. The
+staging runtime fixes that principal to
+`https://g7-owner-staging.cloudflareaccess.com`; the ChatGPT bridge now rejects
+that synthetic issuer at startup. Bindings store both the 24-hex Owner ID and
+the Owner identity digest, the binding snapshot must reconcile to the append-
+only Owner audit history, and grants are keyed to the digest. No supported API
+currently transfers or aliases those records to an Auth0 `iss` + `sub`, and
+there is no cross-store transaction/recovery protocol for changing the
+canonical Owner. A direct config remap would either preserve a synthetic
+identity or orphan existing binding/grant authorization. Do not perform that
+remap or rewrite/reset durable stores.
+
+The safe next implementation is an explicit Owner-approved identity-transition
+protocol with append-only intent/outcome audit, authenticated proof of the
+Auth0 subject, conflict/revocation rules, and a store API that preserves the
+existing binding/grant references and revisions. This protocol is not present
+in I8A/I8C and was not invented in this preactivation patch. The read-only
+Dashboard `user_id` is the candidate `sub`; before any authorized token test,
+the Owner must approve the transition semantics and the migration API must be
+implemented and certified.
 
 Auth0 currently publishes two signing keys; the JWKS response does not identify
 which key is current or queued for rotation. The bridge pins public keys in
-deployment configuration and fails closed on an unknown `kid`; before a key
-cutover, include the next key, retain the prior key until its tokens expire,
-then remove it. Automatic JWKS retrieval/rotation is not implemented. Auth0's
-actual access-token profile, API grant, refresh-token policy, subject, redirect
-registration, and claim values still require read-only Dashboard evidence or a
-separately approved OAuth flow.
+deployment configuration and fails closed on an unknown `kid`; the added
+synthetic suite verifies overlapping old/new keys and unknown-key denial.
+Before a real key cutover, include the next key, retain the prior key until its
+tokens expire, then remove it. Automatic JWKS retrieval/rotation is not
+implemented.
+
+### I8D read-only Auth0 evidence (2026-10-20)
+
+- The `ChatGPT` client is shown as Third-party CIMD, with external ID
+  `https://chatgpt.com/oauth/client.json` and internal Auth0 client ID
+  `tpc_8Gh7siSu4HFHVqNQBHgZAA`.
+- The API settings show token profile `Auth0`, signing `RS256`, JWE off,
+  `Allow Offline Access` off, and per-application access policies.
+- The API access table shows 1/1 user-delegated permissions for ChatGPT and
+  0/1 Client Access permissions. No access token was requested, so actual
+  `aud`, `scope`, and `azp` claim values were not inspected.
+- The Auth0 user record showed one `google-oauth2` identity and a recent login.
+  The exact subject is deliberately excluded from versioned evidence.
+- A read-only SSH query confirmed the tunnel profile upstream is the loopback
+  MCP URL above; the daemon and bridge remain inactive.
 
 ### Read-only readiness evidence (2026-10-20)
 

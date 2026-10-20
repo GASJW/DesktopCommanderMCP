@@ -1,5 +1,6 @@
 import { createHash, createPublicKey, verify as verifySignature } from 'node:crypto';
-import { ownerIdentityDigest } from '../dashboard/owner-identity.mjs';
+import { ownerIdentityDigest, isOwnerPrincipal, isSyntheticStagingOwner }
+  from '../dashboard/owner-identity.mjs';
 import { createRemoteDeviceMcpHandler } from '../devices/remote-mcp-handler.mjs';
 
 export const CHATGPT_MCP_ROUTE='/chatgpt/mcp';
@@ -28,7 +29,8 @@ export function getChatGptResourceMetadataPath(resource){
 }
 
 export function validateChatGptBridgeConfig(config,owner){
-  if(!exact(config,'clientIds,issuer,jwks,principalMapping,resource,resourceMetadataUrl')||
+  if(!isOwnerPrincipal(owner)||isSyntheticStagingOwner(owner)||
+     !exact(config,'clientIds,issuer,jwks,principalMapping,resource,resourceMetadataUrl')||
      !httpsUrl(config.issuer)||!httpsUrl(config.resource)||!httpsUrl(config.resourceMetadataUrl)||
      new URL(config.resourceMetadataUrl).pathname!==getChatGptResourceMetadataPath(config.resource)||
      !exact(config.principalMapping,'ownerIssuer,ownerSubject,subject')||

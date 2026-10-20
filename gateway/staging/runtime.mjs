@@ -9,7 +9,8 @@ import { createOwnerPairingHttp } from '../dashboard/owner-pairing-http.mjs';
 import { createDurableOwnerDeviceApprovalReader, createDurableOwnerDeviceApprovalByIdReader,
   createDurableOwnerDeviceAuthorizer } from '../dashboard/durable-owner-device-authorization.mjs';
 import { createOwnerMachineBindingService } from '../dashboard/owner-machine-binding.mjs';
-import { ownerIdentityDigest, ownerPrincipalId, isOwnerPrincipal } from '../dashboard/owner-identity.mjs';
+import { ownerIdentityDigest, ownerPrincipalId, isOwnerPrincipal,
+  STAGING_OWNER_ISSUER } from '../dashboard/owner-identity.mjs';
 import { createDurableDeviceTrustStore } from '../devices/durable-trust.mjs';
 import { createPairingCoordinator } from '../devices/pairing.mjs';
 import { createMachineAccessVerifier } from '../devices/machine-access.mjs';
@@ -24,13 +25,12 @@ import { readPrivateStagingFile } from './private-file.mjs';
 
 const HOST='127.0.0.1';
 const OWNER_ORIGIN=/^https:\/\/[a-z0-9.-]+$/;
-const OWNER_TEST_ISSUER='https://g7-owner-staging.cloudflareaccess.com';
 const MACHINE_TEST_ISSUER='https://g7-machine-staging.cloudflareaccess.com';
 const requestDiagnostic=event=>{
   try{process.stdout.write(JSON.stringify({event:'REQUEST_DIAGNOSTIC',...event})+'\n');}catch{}
 };
 export function isValidStagingIssuer(value,role){
-  if(role==='owner')return value===OWNER_TEST_ISSUER;
+  if(role==='owner')return value===STAGING_OWNER_ISSUER;
   if(role==='machine')return value===MACHINE_TEST_ISSUER;
   return false;
 }
