@@ -162,6 +162,12 @@ function validateHistory(obj){
         throw Error('Invalid or duplicated trust decision binding');
       }
       events.add(transition.eventId);requests.add(transition.requestId);
+    }else if(transition.operation==='revoke'){
+      if(transition.eventId!==null&&(!UUID.test(transition.eventId)||events.has(transition.eventId))||
+         transition.requestId!==null){
+        throw Error('Invalid or duplicated trust revocation binding');
+      }
+      if(transition.eventId!==null)events.add(transition.eventId);
     }else if(transition.eventId!==null||transition.requestId!==null){
       throw Error('Invalid trust transition history');
     }
@@ -415,12 +421,21 @@ export function createDurableDeviceTrustStore({directory,maxDevices=32,now=Date.
     commit(candidate,transition);
     return trusted;
   }
-  function revokeDevice(deviceId) {
+  function revokeDevice(deviceId,options) {
     requireHealthy();
+    if(options!==undefined&&(!options||typeof options!=='object'||Array.isArray(options)||
+       Object.keys(options).sort().join(',')!=='eventId,expectedRevision'||
+       !UUID.test(options.eventId??'')||!Number.isSafeInteger(options.expectedRevision)||
+       options.expectedRevision<0)){
+      throw trustError('TRUST_INVALID','Governed revocation requires an event ID and expected revision');
+    }
+    if(options&&options.expectedRevision!==snapshot.revision){
+      throw trustError('TRUST_CHANGED','Trust revision changed before revocation');
+    }
     const candidate=createDeviceRegistry({maxDevices,now,initialTrustedDevices:snapshot.devices});
     if(!candidate.revokeDevice(deviceId))return false;
     const prior=snapshot.devices.find(device=>device.deviceId===deviceId);
-    commit(candidate,{operation:'revoke',eventId:null,requestId:null,
+    commit(candidate,{operation:'revoke',eventId:options?.eventId??null,requestId:null,
       fingerprint:prior.fingerprint,deviceId});
     return true;
   }
@@ -498,7 +513,7 @@ export function createDurableDeviceTrustStore({directory,maxDevices=32,now=Date.
     closed=true;
     closeSync(directoryFd);
   }
-  return Object.freeze({registry,trustDevice,revokeDevice,revision,acquireDispatchPermit,
+  return Object.freeze({directory,registry,trustDevice,revokeDevice,revision,acquireDispatchPermit,
     withCurrentSession,close});
 }
 

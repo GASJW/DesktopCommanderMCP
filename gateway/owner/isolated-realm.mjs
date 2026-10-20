@@ -3,9 +3,9 @@ import { lstatSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 
 const ROOT_KEYS = 'controlIdentity,listen,paths,protectedKeyFingerprints,protectedPaths,realmId,version';
-const PATH_KEYS = 'auditDirectory,bindingDirectory,configFile,grantDirectory,ledgerDirectory,ownerAuthorityDirectory,policyDirectory,runtimeDirectory,storageRoot,trustDirectory';
+const PATH_KEYS = 'auditDirectory,bindingDirectory,configFile,grantDirectory,ledgerDirectory,ownerAuthorityDirectory,policyDirectory,provisioningDirectory,runtimeDirectory,storageRoot,trustDirectory';
 const DIRECTORY_KEYS = ['auditDirectory','bindingDirectory','grantDirectory','ledgerDirectory',
-  'ownerAuthorityDirectory','policyDirectory','runtimeDirectory','trustDirectory'];
+  'ownerAuthorityDirectory','policyDirectory','provisioningDirectory','runtimeDirectory','trustDirectory'];
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[0-9a-f]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 const HEX64 = /^[a-f0-9]{64}$/;
 const KEY_ID = /^[A-Za-z0-9_.-]{1,128}$/;
@@ -177,7 +177,7 @@ export function createIsolatedG7Realm({ config, ownerAuthority, storeInspectors,
   if (path.resolve(ownerAuthority.directory) !== path.resolve(config.paths.ownerAuthorityDirectory)) {
     throw new Error('Owner authority is outside the isolated realm state root');
   }
-  const requiredStores = ['audit', 'binding', 'grant', 'ledger', 'policy', 'trust'];
+  const requiredStores = ['audit', 'binding', 'grant', 'ledger', 'policy', 'provisioning', 'trust'];
   if (requiredStores.some(name => typeof storeInspectors[name] !== 'function')) {
     throw new TypeError('Every isolated realm store must have a read-only health inspector');
   }
@@ -204,6 +204,8 @@ export function createIsolatedG7Realm({ config, ownerAuthority, storeInspectors,
         stores[name] = state;
       } catch { blockers.push(`${name.toUpperCase()}_STORE_UNAVAILABLE`); }
     }
+    if (!Number.isSafeInteger(stores.provisioning?.readyDeviceCount) ||
+        stores.provisioning.readyDeviceCount < 1) blockers.push('NO_APPROVED_READ_ONLY_DEVICE');
     return Object.freeze({ ready: blockers.length === 0,
       blockers: Object.freeze(blockers), realmId: prepared.realmId,
       ownerId: owner?.owner?.ownerId ?? null,

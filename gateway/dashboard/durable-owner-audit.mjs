@@ -28,6 +28,10 @@ const EXACT_OUTCOME_V3 = 'approvalEventId,at,bindingRevisionAfter,bindingRevisio
 const EXACT_AUTHORITY_INTENT = 'actorClientId,actorKeyId,actorScope,approval,at,event,eventId,expectedRevision,operation,ownerDigest,ownerId,ownerIssuer,phase,version';
 const EXACT_AUTHORITY_OUTCOME = 'actorClientId,actorKeyId,actorScope,approval,at,event,eventId,expectedRevision,operation,outcome,ownerDigest,ownerId,ownerIssuer,phase,recoveryApproval,revisionAfter,version';
 const EXACT_AUTHORITY_APPROVAL = 'eventId,expectedRevision,expiresAt,issuedAt,keyId,operation,ownerDigest,realmId,signature,targetDigest,version';
+const EXACT_REALM_APPROVAL_INTENT = 'approval,at,deviceId,event,eventId,expectedRevision,fingerprint,operation,ownerDigest,ownerId,phase,realmId,targetDigest,verifiedAt,version';
+const EXACT_REALM_APPROVAL_OUTCOME = 'approval,at,deviceId,event,eventId,expectedRevision,fingerprint,operation,outcome,ownerDigest,ownerId,phase,realmId,targetDigest,verifiedAt,version';
+const REALM_APPROVAL_OPERATIONS = ['device.approve','device.revoke','binding.create',
+  'grant.issue','grant.revoke'];
 const MACHINE_CLIENT = /^[A-Za-z0-9_.-]{8,256}$/;
 const AUTHORITY_KEY_ID = /^[A-Za-z0-9_.-]{1,128}$/;
 
@@ -134,9 +138,9 @@ function canonicalEvent(e) {
        !Number.isSafeInteger(e.trustRevision)||e.trustRevision<e.trustRevisionAfter||
        !Number.isSafeInteger(e.bindingRevisionBefore)||e.bindingRevisionBefore<0||
        !['intent','outcome'].includes(e.phase)||
-       (e.phase==='outcome'&&(e.outcome!=='accepted'||
+       (e.phase==='outcome'&&(!['accepted','not_applied'].includes(e.outcome)||
          !Number.isSafeInteger(e.bindingRevisionAfter)||
-         e.bindingRevisionAfter!==e.bindingRevisionBefore+1))||
+         e.bindingRevisionAfter!==e.bindingRevisionBefore+(e.outcome==='accepted'?1:0)))||
        !validTimestamp(e.at)){
       throw new TypeError('Invalid machine binding audit event');
     }
@@ -205,6 +209,42 @@ function canonicalEvent(e) {
         expiresAt:e.recoveryApproval.expiresAt,keyId:e.recoveryApproval.keyId,
         signature:e.recoveryApproval.signature}};
   }
+  if(e.event==='g7_realm_owner_approval'&&e.version===1){
+    const approval=e.approval;
+    if(!['intent','outcome'].includes(e.phase)||Object.keys(e).sort().join(',')!==
+       (e.phase==='intent'?EXACT_REALM_APPROVAL_INTENT:EXACT_REALM_APPROVAL_OUTCOME)||
+       !UUID.test(e.eventId??'')||!UUID.test(e.realmId??'')||
+       !REALM_APPROVAL_OPERATIONS.includes(e.operation)||!HEX24.test(e.ownerId??'')||
+       !HEX64.test(e.ownerDigest??'')||e.ownerId!==e.ownerDigest.slice(0,24)||
+       !UUID.test(e.deviceId??'')||!HEX64.test(e.fingerprint??'')||
+       !Number.isSafeInteger(e.expectedRevision)||e.expectedRevision<0||
+       !HEX64.test(e.targetDigest??'')||!validTimestamp(e.at)||
+       !Number.isSafeInteger(e.verifiedAt)||
+       !approval||Object.keys(approval).sort().join(',')!==EXACT_AUTHORITY_APPROVAL||
+       approval.version!==1||approval.eventId!==e.eventId||
+       approval.operation!==e.operation||approval.realmId!==e.realmId||
+       approval.ownerDigest!==e.ownerDigest||approval.expectedRevision!==e.expectedRevision||
+       approval.targetDigest!==e.targetDigest||!Number.isSafeInteger(approval.issuedAt)||
+       !Number.isSafeInteger(approval.expiresAt)||approval.expiresAt<=approval.issuedAt||
+       approval.expiresAt-approval.issuedAt>300||!AUTHORITY_KEY_ID.test(approval.keyId??'')||
+       e.verifiedAt<approval.issuedAt-30||e.verifiedAt>approval.expiresAt||
+       typeof approval.signature!=='string'||!/^[A-Za-z0-9_-]{86}$/.test(approval.signature)||
+       e.phase==='outcome'&&!['applied','not_applied'].includes(e.outcome)){
+      throw new TypeError('Invalid isolated realm Owner approval event');
+    }
+    const base={event:'g7_realm_owner_approval',version:1,at:e.at,
+      eventId:e.eventId.toLowerCase(),realmId:e.realmId.toLowerCase(),
+      operation:e.operation,ownerId:e.ownerId,ownerDigest:e.ownerDigest,
+      deviceId:e.deviceId.toLowerCase(),fingerprint:e.fingerprint,
+      expectedRevision:e.expectedRevision,targetDigest:e.targetDigest,verifiedAt:e.verifiedAt,
+      approval:{version:1,eventId:approval.eventId.toLowerCase(),
+        operation:approval.operation,realmId:approval.realmId.toLowerCase(),
+        ownerDigest:approval.ownerDigest,expectedRevision:approval.expectedRevision,
+        targetDigest:approval.targetDigest,issuedAt:approval.issuedAt,
+        expiresAt:approval.expiresAt,keyId:approval.keyId,signature:approval.signature},
+      phase:e.phase};
+    return e.phase==='intent'?base:{...base,outcome:e.outcome};
+  }
   if(e.event!=='g7_owner_pairing'||e.version!==2||
      keys!==(e.phase==='intent'?EXACT_INTENT_V2:EXACT_OUTCOME_V2)||
      !UUID.test(e.eventId)||!HEX24.test(e.ownerId)||
@@ -244,6 +284,28 @@ function digest(seq, previous, event,version=event.version) {
     .digest('hex');
 }
 function advance(state, event) {
+  if(event.event==='g7_realm_owner_approval'){
+    if(event.phase==='intent'){
+      if(state.pending.size!==0||state.completed.has(event.eventId)){
+        throw new Error('Unresolved or duplicate isolated realm Owner approval');
+      }
+      state.pending.set(event.eventId,event);
+      return;
+    }
+    const prior=state.pending.get(event.eventId);
+    if(!prior||prior.event!=='g7_realm_owner_approval'||prior.version!==1||
+       prior.operation!==event.operation||prior.realmId!==event.realmId||
+       prior.ownerId!==event.ownerId||prior.ownerDigest!==event.ownerDigest||
+       prior.expectedRevision!==event.expectedRevision||prior.targetDigest!==event.targetDigest||
+       prior.verifiedAt!==event.verifiedAt||
+       JSON.stringify(prior.approval)!==JSON.stringify(event.approval)||
+       state.pending.size!==1||!['applied','not_applied'].includes(event.outcome)){
+      throw new Error('Isolated realm Owner approval outcome without matching intent');
+    }
+    state.pending.delete(event.eventId);
+    state.completed.add(event.eventId);
+    return;
+  }
   if(event.event==='g7_owner_authority'){
     if(event.phase==='intent'){
       const owner=state.ownerAuthority;
@@ -302,7 +364,7 @@ function advance(state, event) {
         prior.trustRevisionAfter===event.trustRevisionAfter&&
         prior.trustRevision===event.trustRevision&&
         prior.bindingRevisionBefore===event.bindingRevisionBefore&&
-        event.bindingRevisionAfter===event.bindingRevisionBefore+1;
+        event.bindingRevisionAfter===event.bindingRevisionBefore+(event.outcome==='accepted'?1:0);
     }
     if (!sameDecision) {
       throw new Error('Pairing audit outcome without matching intent');
@@ -445,7 +507,7 @@ export function createDurableOwnerAudit({ directory } = {}) {
       if (blocked) return; // preserve lock on any uncertainty
       removeOwnedDurableProcessLock({directory,name:LOCK,owner:lockOwner});
     }
-    return Object.freeze({ auditWrite, inspect, close });
+    return Object.freeze({ directory, auditWrite, inspect, close });
   } catch (error) {
     if (fd !== undefined) closeSync(fd);
     // Never auto-remove lock after an uncertain startup/replay failure.

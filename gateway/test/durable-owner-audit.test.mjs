@@ -84,6 +84,21 @@ test('strict schema refuses secrets, unknown keys and malicious payloads',t=>{
   s.close();
   assert.equal(readFileSync(f.log,'utf8'),'');
 });
+test('isolated realm approval audit rejects unknown phases',t=>{
+  const f=fixture();t.after(f.clean);
+  const s=createDurableOwnerAudit({directory:f.directory});
+  const eventId=randomUUID(),realmId='95bdac79-90de-4abc-b667-401087631b37';
+  assert.throws(()=>s.auditWrite({event:'g7_realm_owner_approval',version:1,
+    at:now,eventId,realmId,operation:'grant.issue',ownerId:'c'.repeat(24),
+    ownerDigest:'c'.repeat(64),deviceId:'f69ec00e-f225-43df-bdc7-c2cbf8f4a9f3',
+    fingerprint:'b'.repeat(64),expectedRevision:0,targetDigest:'d'.repeat(64),verifiedAt:2,
+    approval:{version:1,eventId,operation:'grant.issue',realmId,
+      ownerDigest:'c'.repeat(64),expectedRevision:0,targetDigest:'d'.repeat(64),
+      issuedAt:1,expiresAt:301,keyId:'test-key',signature:'A'.repeat(86)},
+    phase:'pending',outcome:'applied'}),/Invalid isolated realm Owner approval event/);
+  assert.equal(s.inspect().sequence,0);
+  s.close();
+});
 test('outcome requires matching intent, and an intent prevents concurrent decisions',t=>{
   const f=fixture();t.after(f.clean);
   const s=createDurableOwnerAudit({directory:f.directory});

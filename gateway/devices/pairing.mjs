@@ -35,9 +35,10 @@ export function pairingProofMessage(requestId, nonce, fingerprint) {
 
 export function createPairingCoordinator({
   registry, now = Date.now, ttlMs = 120_000, maxPending = 16,
+  preallocateDeviceId = false,
 } = {}) {
   if (!registry || typeof registry.trustDevice !== 'function' ||
-      typeof now !== 'function' ||
+      typeof now !== 'function' || typeof preallocateDeviceId !== 'boolean' ||
       !Number.isSafeInteger(ttlMs) || ttlMs < 10_000 || ttlMs > 600_000 ||
       !Number.isSafeInteger(maxPending) || maxPending < 1 || maxPending > 128) {
     throw new TypeError('Invalid pairing coordinator options');
@@ -67,10 +68,12 @@ export function createPairingCoordinator({
     const nonce = randomBytes(32).toString('base64url');
     const displayCode = randomBytes(5).toString('hex').toUpperCase();
     const createdAt = current();
-    pending.set(requestId,{name:name.trim(),platform,publicKeyPem,publicKey,
+    const deviceId=preallocateDeviceId?randomUUID():null;
+    pending.set(requestId,{name:name.trim(),platform,publicKeyPem,publicKey,deviceId,
       fingerprint,nonce,displayCode,createdAt,proved:false});
     // The code is comparison-only and cannot authorize pairing.
-    return Object.freeze({requestId,nonce,fingerprint,displayCode,expiresInMs:ttlMs});
+    return Object.freeze({requestId,nonce,fingerprint,displayCode,expiresInMs:ttlMs,
+      ...(deviceId?{deviceId}:{})});
   }
   function provePossession(requestId, signatureBase64url) {
     prune();
@@ -95,6 +98,7 @@ export function createPairingCoordinator({
     prune();
     return Array.from(pending, ([requestId,item]) => Object.freeze({
       requestId,name:item.name,platform:item.platform,
+      ...(item.deviceId?{deviceId:item.deviceId}:{}),
       fingerprint:item.fingerprint,displayCode:item.displayCode,
       proofVerified:item.proved,createdAt:new Date(item.createdAt).toISOString(),
     })).sort((a,b)=>a.createdAt.localeCompare(b.createdAt));
@@ -104,6 +108,7 @@ export function createPairingCoordinator({
     const record=pending.get(requestId);
     if(!record)return null;
     return Object.freeze({requestId,fingerprint:record.fingerprint,proofVerified:record.proved,
+      ...(record.deviceId?{deviceId:record.deviceId}:{}),
       name:record.name,platform:record.platform,createdAt:new Date(record.createdAt).toISOString()});
   }
   function trustRevision() {
@@ -132,6 +137,7 @@ export function createPairingCoordinator({
     }
     const trusted = registry.trustDevice({
       name:record.name,platform:record.platform,publicKeyPem:record.publicKeyPem,
+      ...(record.deviceId?{deviceId:record.deviceId}:{}),
     },trustOptions);
     pending.delete(requestId);
     return trusted;
@@ -140,6 +146,6 @@ export function createPairingCoordinator({
     prune();
     return pending.delete(requestId);
   }
-  return Object.freeze({startPairing,provePossession,listPending,inspectPairing,
+  return Object.freeze({registry,preallocateDeviceId,startPairing,provePossession,listPending,inspectPairing,
     trustRevision,approvePairing,rejectPairing});
 }

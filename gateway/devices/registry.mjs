@@ -67,7 +67,7 @@ export function createDeviceRegistry({
 
   // Only an already-authorized owner workflow may call this operation in G7.2.
   // Never expose registration directly to an unauthenticated agent.
-  function trustDevice({ name, platform, publicKeyPem } = {}) {
+  function trustDevice({ name, platform, publicKeyPem, deviceId: requestedDeviceId } = {}) {
     if (typeof name !== 'string' || !NAME_RE.test(name.trim()) ||
         !PLATFORMS.has(platform) || typeof publicKeyPem !== 'string' ||
         Buffer.byteLength(publicKeyPem, 'utf8') > 1024) throw new TypeError('Invalid device metadata');
@@ -77,7 +77,8 @@ export function createDeviceRegistry({
     if (key.asymmetricKeyType !== 'ed25519') throw new TypeError('Ed25519 public key required');
     const fingerprint = createHash('sha256').update(key.export({ type: 'spki', format: 'der' })).digest('hex');
     if (fingerprints.has(fingerprint)) throw new Error('Duplicate device public key');
-    const deviceId = randomUUID();
+    const deviceId = requestedDeviceId ?? randomUUID();
+    if (!validUuid(deviceId) || devices.has(deviceId)) throw new Error('Invalid or duplicate device ID');
     devices.set(deviceId, {
       deviceId, name: name.trim(), platform, key, fingerprint,
       trustedAt: timestamp(), challenge: null, session: null, lastSeenAt: null,

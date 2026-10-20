@@ -17,18 +17,20 @@ function validReceipt(value,deviceId){
 // first enforce its own origin and CSRF boundary; this module does not expose a
 // route or mint a browser capability.
 export function createOwnerMachineBindingService({accessVerifier,auditWrite,
-  readApprovalReceipt,machineBindingStore,now=()=>new Date()}={}){
+  readApprovalReceipt,machineBindingStore,now=()=>new Date(),testHooks}={}){
   if(typeof accessVerifier?.verifyPrincipal!=='function'||typeof auditWrite!=='function'||
      typeof readApprovalReceipt!=='function'||typeof machineBindingStore?.bind!=='function'||
      typeof machineBindingStore?.resolve!=='function'||typeof machineBindingStore?.revision!=='function'||
-     typeof now!=='function')throw new TypeError('Verified Owner, durable audit, I2 receipt, and binding store required');
+     typeof now!=='function'||testHooks!==undefined&&(!process.env.NODE_TEST_CONTEXT||
+       typeof testHooks?.afterDurableWrite!=='function'))throw new TypeError('Verified Owner, durable audit, I2 receipt, and binding store required');
   let poisoned=false;
-  return Object.freeze({
-    async bind({ownerAssertion,clientId,deviceId,expectedRevision}={}){
+  return Object.freeze({machineBindingStore,auditWrite,
+    async bind({ownerAssertion,clientId,deviceId,expectedRevision,eventId:requestedEventId}={}){
       if(poisoned)throw fail('BINDING_UNAVAILABLE','Owner machine binding service is unavailable');
       if(typeof ownerAssertion!=='string'||ownerAssertion.length>16*1024||
          typeof clientId!=='string'||!CLIENT.test(clientId)||!UUID.test(deviceId??'')||
-         !Number.isSafeInteger(expectedRevision)||expectedRevision<0){
+         !Number.isSafeInteger(expectedRevision)||expectedRevision<0||
+         requestedEventId!==undefined&&!UUID.test(requestedEventId??'')){
         throw fail('INVALID','Invalid Owner machine binding request');
       }
       let owner;
@@ -55,7 +57,7 @@ export function createOwnerMachineBindingService({accessVerifier,auditWrite,
       if(machineBindingStore.revision()!==expectedRevision){
         throw fail('REVISION_CONFLICT','Machine binding revision conflict');
       }
-      const eventId=randomUUID();
+      const eventId=requestedEventId??randomUUID();
       const at=now().toISOString();
       const intent=Object.freeze({event:'g7_owner_machine_binding',version:3,at,eventId,
         operation:'bind',ownerId,ownerDigest,clientId,deviceId,
@@ -66,6 +68,7 @@ export function createOwnerMachineBindingService({accessVerifier,auditWrite,
         phase:'intent'});
       try{
         if(auditWrite(intent)!==true)throw Error('Machine binding audit intent not committed');
+        if(testHooks)testHooks.afterDurableWrite('after-intent');
       }catch{
         poisoned=true;
         throw fail('AUDIT_UNAVAILABLE','Machine binding intent could not be committed');
@@ -79,6 +82,7 @@ export function createOwnerMachineBindingService({accessVerifier,auditWrite,
            committed.binding.bindingRevision!==expectedRevision+1){
           throw Error('Machine binding commit returned unexpected revision');
         }
+        if(testHooks)testHooks.afterDurableWrite('after-store-commit');
       }catch(error){
         poisoned=true;
         throw Object.assign(fail('BINDING_OUTCOME_UNKNOWN',

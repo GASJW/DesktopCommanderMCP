@@ -73,7 +73,7 @@ function createActivationRealm(f) {
   const paths = { storageRoot: f.root, configFile: path.join(f.root, 'config.json'),
     ownerAuthorityDirectory: f.directory };
   for (const name of ['auditDirectory', 'bindingDirectory', 'grantDirectory', 'ledgerDirectory',
-    'policyDirectory', 'runtimeDirectory', 'trustDirectory']) {
+    'policyDirectory', 'provisioningDirectory', 'runtimeDirectory', 'trustDirectory']) {
     paths[name] = path.join(f.root, name);
     mkdirSync(paths[name], { mode: 0o700 });
     chmodSync(paths[name], 0o700);
@@ -90,6 +90,7 @@ function createActivationRealm(f) {
     protectedKeyFingerprints: ['f'.repeat(64)], protectedPaths: [legacyRoot] };
   const inspectors = Object.fromEntries(['audit', 'binding', 'grant', 'ledger', 'policy', 'trust']
     .map(name => [name, () => ({ healthy: true, pending: 0, revision: 0 })]));
+  inspectors.provisioning = () => ({ healthy: true, pending: 0, revision: 0, readyDeviceCount: 1 });
   let starts = 0;
   const realm = createIsolatedG7Realm({ config, ownerAuthority: f.authority,
     storeInspectors: inspectors, startLoopback: async options => {

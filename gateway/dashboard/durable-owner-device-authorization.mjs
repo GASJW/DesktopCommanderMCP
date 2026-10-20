@@ -105,7 +105,7 @@ export function createDurableOwnerDeviceApprovalByIdReader({auditDirectory,trust
   if(typeof auditDirectory!=='string'||typeof trustDirectory!=='string'){
     throw new TypeError('Audit and trust directories are required');
   }
-  return function readDeviceApprovalById(ownerId,deviceId){
+  const readDeviceApprovalById=function(ownerId,deviceId){
     try{
       let recoveryState=analyzeOwnerPairingRecovery({auditDirectory,trustDirectory});
       const audit=inspectDurableOwnerAudit({directory:auditDirectory});
@@ -114,6 +114,9 @@ export function createDurableOwnerDeviceApprovalByIdReader({auditDirectory,trust
       return ownerDeviceApprovalReceiptById({ownerId,deviceId,recoveryState,audit,trust});
     }catch{return null;}
   };
+  Object.defineProperties(readDeviceApprovalById,{auditDirectory:{value:auditDirectory},
+    trustDirectory:{value:trustDirectory}});
+  return readDeviceApprovalById;
 }
 
 export function createDurableOwnerDeviceAuthorizer(options={}){
