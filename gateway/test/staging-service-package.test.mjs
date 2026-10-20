@@ -43,6 +43,7 @@ test('inert config examples are loopback-only and contain no usable credentials'
   const agent=JSON.parse(read('deploy/g7-staging/config/agent.json.example'));
   assert.equal(gateway.listen.host,'127.0.0.1');
   assert.equal(gateway.listen.port,18443);
+  assert.equal(Object.hasOwn(gateway,'chatgptBridge'),false);
   assert.equal(agent.port,18443);
   assert.equal(gateway.machine.clientId,agent.clientId);
   assert.equal(gateway.owner.issuer,'https://g7-owner-staging.cloudflareaccess.com');
