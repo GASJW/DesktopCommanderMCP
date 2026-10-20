@@ -66,6 +66,18 @@ export function validateChatGptBridgeConfig(config,owner){
   return {keys,clientIds:new Set(config.clientIds)};
 }
 
+export function validateIsolatedChatGptBridgeConfig(config,ownerAuthority){
+  if(!exact(config,'issuer,resource,resourceMetadataUrl')||
+     !httpsUrl(config.issuer)||!httpsUrl(config.resource)||!httpsUrl(config.resourceMetadataUrl)||
+     new URL(config.resourceMetadataUrl).pathname!==getChatGptResourceMetadataPath(config.resource)||
+     config.issuer!==ownerAuthority?.issuer||config.resource!==ownerAuthority?.resource||
+     !Array.isArray(ownerAuthority?.authorizedClientIds)||ownerAuthority.authorizedClientIds.length===0||
+     typeof ownerAuthority?.verifyReadPrincipal!=='function'){
+    throw new Error('Invalid isolated ChatGPT bridge Owner authority configuration');
+  }
+  return true;
+}
+
 function decodeJson(segment){
   if(typeof segment!=='string'||!segment||!/^[A-Za-z0-9_-]+$/.test(segment)||segment.length>16384)
     throw new Error('Invalid JWT segment');
@@ -155,12 +167,21 @@ function sendJson(res,status,body,headers={}){
   res.end(JSON.stringify(body));
 }
 
-export function createChatGptReadOnlyBridge({oauth,owner,...gateway}={}){
-  const {keys,clientIds}=validateChatGptBridgeConfig(oauth,owner);
+export function createChatGptReadOnlyBridge({oauth,owner,ownerAuthority,...gateway}={}){
+  let keys,clientIds,resolveOwner,authorizeOwner;
+  if(ownerAuthority){
+    if(owner!==undefined)throw new Error('Isolated ChatGPT bridge cannot be mapped to an external Owner');
+    validateIsolatedChatGptBridgeConfig(oauth,ownerAuthority);
+    resolveOwner=req=>ownerAuthority.verifyReadPrincipal(bearerToken(req));
+    authorizeOwner=ownerAuthority.isCurrentReadPrincipal;
+  }else{
+    ({keys,clientIds}=validateChatGptBridgeConfig(oauth,owner));
+    resolveOwner=req=>validAccessToken(bearerToken(req),oauth,{keys,clientIds});
+  }
   const resourceMetadataPath=getChatGptResourceMetadataPath(oauth.resource);
-  const resolveOwner=async req=>validAccessToken(bearerToken(req),oauth,{keys,clientIds});
   const challenge=authChallenge(oauth);
   const mcpHandler=createRemoteDeviceMcpHandler({...gateway,resolveOwner,
+    ...(authorizeOwner?{authorizeOwner}:{}),
     route:CHATGPT_MCP_ROUTE,allowedTools:['read_file'],
     supportedProtocolVersions:['2025-11-25','2025-06-18','2025-03-26'],
     requireStreamableAccept:true,validateProtocolVersionHeader:true,

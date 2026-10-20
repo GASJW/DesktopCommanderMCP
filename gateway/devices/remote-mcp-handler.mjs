@@ -118,7 +118,7 @@ function accepts(accept,mediaType){
 }
 
 export function createRemoteDeviceMcpHandler({accessVerifier,resolveOwner,deviceRegistry,trustStore,router,
-  authorizeDevice,grantStore,policySigningKey,getTrustRevision,getDeviceApprovalReceipt,onDiagnostic,
+  authorizeDevice,authorizeOwner,grantStore,policySigningKey,getTrustRevision,getDeviceApprovalReceipt,onDiagnostic,
   route='/mcp',allowedTools=Object.keys(TOOL_SCHEMAS),supportedProtocolVersions=[MCP_PROTOCOL_VERSION],
   toolMetadata={},unauthenticatedMethods=[],onAuthenticationRequired,requestIdFactory,
   requireStreamableAccept=false,validateProtocolVersionHeader=false}={}){
@@ -128,6 +128,7 @@ export function createRemoteDeviceMcpHandler({accessVerifier,resolveOwner,device
      typeof trustStore?.acquireDispatchPermit!=='function'||
      typeof trustStore?.withCurrentSession!=='function'||
      !router||typeof router.callDevice!=='function'||typeof authorizeDevice!=='function'||
+     authorizeOwner!==undefined&&typeof authorizeOwner!=='function'||
      !grantStore||typeof grantStore.authorizeAndPermit!=='function'||
      typeof grantStore.withCurrentAuthorization!=='function'||!policySigningKey||
      typeof getTrustRevision!=='function'||typeof getDeviceApprovalReceipt!=='function'||
@@ -274,6 +275,9 @@ export function createRemoteDeviceMcpHandler({accessVerifier,resolveOwner,device
           if(res.destroyed||controller.signal.aborted){
             throw Object.assign(Error('Owner request disconnected before authorization'),{code:'CANCELLED'});
           }
+          if(authorizeOwner&&authorizeOwner(owner)!==true){
+            throw Object.assign(Error('Owner authority changed before dispatch'),{code:'OWNER_AUTHORIZATION_CHANGED'});
+          }
           let authorized;
           try{authorized=await authorizeDevice(owner,deviceId)===true;}
           catch{throw Object.assign(Error('Owner-device authorization unavailable'),{code:'OWNER_AUTH_UNAVAILABLE'});}
@@ -338,6 +342,7 @@ export function createRemoteDeviceMcpHandler({accessVerifier,resolveOwner,device
             currentApprovalReceipt.trustRevisionBefore===responseFenceContext.approvalReceipt.trustRevisionBefore&&
             currentApprovalReceipt.trustRevisionAfter===responseFenceContext.approvalReceipt.trustRevisionAfter;
           if(currentTrustRevision!==responseFenceContext.trustRevision||!receiptMatches||
+             authorizeOwner&&authorizeOwner(responseFenceContext.owner)!==true||
              !deviceRegistry.listDevices().some(device=>device.deviceId===responseFenceContext.deviceId)||
              !deviceRegistry.isLiveSession(responseFenceContext.deviceId,responseFenceContext.sessionId)){
             throw Object.assign(Error('Device trust, approval or session changed after dispatch'),
@@ -364,7 +369,7 @@ export function createRemoteDeviceMcpHandler({accessVerifier,resolveOwner,device
         return jsonError(res,403,message.id,-32009,'Owner is not authorized for this tool operation');
       }
       if(error?.code==='OWNER_AUTH_UNAVAILABLE'||error?.code==='TRUST_CHANGED'||
-         error?.code==='APPROVAL_UNAVAILABLE'){
+         error?.code==='APPROVAL_UNAVAILABLE'||error?.code==='OWNER_AUTHORIZATION_CHANGED'){
         return jsonError(res,503,message.id,-32002,'Device authorization evidence unavailable');
       }
       const code=typeof error?.code==='string'&&/^[A-Z_]{1,48}$/.test(error.code)
