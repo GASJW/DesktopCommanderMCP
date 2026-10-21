@@ -1,0 +1,28 @@
+# Offline checklist only. Do not import this file into Auth0.
+authorizationServer:
+  issuer: <EXACT_HTTPS_AUTH0_ISSUER>
+  discoveryUrl: <ISSUER>/.well-known/openid-configuration
+  jwksUri: <PUBLIC_JWKS_URI>
+  clientRegistration: CIMD
+  grantTypes:
+    - authorization_code
+    - refresh_token # Confirm required by ChatGPT; do not infer issuance.
+  pkce: S256
+  resource: <EXACT_I8_OWNER_AUTHORITY_RESOURCE>
+  accessToken:
+    algorithm: RS256
+    requiredScope: g7.read
+    allowedClientClaim: <ONE_VERIFIED_CLIENT_ID_OR_AZP_VALUE>
+    maxLifetimeSeconds: 3600
+  chatGptClient:
+    delegatedScopes:
+      - g7.read
+    forbiddenScopes:
+      - g7.owner
+    offlineAccessSetting: <VERIFY_BEFORE_ACTIVATION>
+    refreshTokenRotation: <VERIFY_BEFORE_ACTIVATION>
+  ownerMapping:
+    issuer: <VERIFIED_AUTH0_ISSUER>
+    subject: <APPROVED_STABLE_SUBJECT_REFERENCE>
+    isolatedRealm: <I8_REALM_UUID>
+    approvalEvidenceRef: <INDEPENDENT_SIGNED_OWNER_APPROVAL_REFERENCE>
