@@ -124,6 +124,8 @@ test('grants reject unknown fields, unsafe scopes and unbounded tool constraints
     {...grantInput(),scope:{root:'/'}},
     {...grantInput(),scope:{root:'/srv/commander/approved',extra:true}},
     {...grantInput(),scope:{root:'/srv/commander/../secret'}},
+    {...grantInput(),scope:{root:'C:\\'}},
+    {...grantInput(),scope:{root:'\\\\server\\share\\approved'}},
     {...grantInput(),constraints:{maxBytes:65537,maxLength:100,maxOffset:10000}},
     {...grantInput(),constraints:{maxBytes:32768,maxLength:100,maxOffset:10000,extra:1}},
     {...grantInput(),tool:'list_directory',scope:{root:'/srv/commander/approved'},
@@ -136,6 +138,51 @@ test('grants reject unknown fields, unsafe scopes and unbounded tool constraints
     assert.throws(()=>store.grant(input,{expectedRevision:0,eventId:EVENT()}));
   }
   assert.equal(store.revision(),0);
+});
+
+test('Windows drive grant stays within its canonical root on a Linux Gateway',async t=>{
+  const {directory}=fixture(t),store=createStore(directory);
+  const root='C:\\Users\\synthetic\\approved';
+  const grant=store.grant({...grantInput(),scope:{root}},{expectedRevision:0,eventId:EVENT()});
+  const request=authorizeInput({arguments:{path:`${root}\\docs\\readme.txt`,offset:5,length:50}});
+  const permit=await store.authorizeAndPermit(request,{signCapability:signer()});
+  assert.equal(permit.grantId,grant.grantId);
+  assert.equal(permit.authorization.claims.scope.root,root);
+  permit.release();
+  for(const args of [
+    {path:`${root}-outside\\secret.txt`,offset:0,length:10},
+    {path:`${root}\\..\\secret.txt`,offset:0,length:10},
+    {path:`${root}/docs/readme.txt`,offset:0,length:10},
+  ]){
+    await assert.rejects(store.authorizeAndPermit(authorizeInput({arguments:args}),{
+      signCapability:signer(),
+    }));
+  }
+  assert.equal(store.revision(),1);
+  assert.equal(store.inspect().grants[0].scope.root,root);
+});
+
+test('Windows grants preserve drive semantics and reject mixed-format or escaping paths',async t=>{
+  const {directory}=fixture(t),store=createStore(directory);
+  const root='C:\\Users\\synthetic\\approved';
+  const created=store.grant({...grantInput(),scope:{root}},
+    {expectedRevision:0,eventId:EVENT()});
+  const request=authorizeInput({arguments:{path:`${root}\\docs\\readme.txt`,offset:0,length:10}});
+  const permit=await store.authorizeAndPermit(request,{signCapability:signer()});
+  assert.equal(permit.grantId,created.grantId);
+  assert.equal(permit.authorization.claims.scope.root,root);
+  permit.release();
+  for(const args of [
+    {path:`${root}-outside\\secret.txt`,offset:0,length:10},
+    {path:`${root}\\..\\secret.txt`,offset:0,length:10},
+    {path:`${root}/docs/readme.txt`,offset:0,length:10},
+  ]){
+    await assert.rejects(store.authorizeAndPermit(authorizeInput({arguments:args}),{
+      signCapability:signer(),
+    }));
+  }
+  assert.equal(store.revision(),1);
+  assert.equal(store.inspect().grants[0].scope.root,root);
 });
 
 test('authorization persists exact scoped claims and holds a permit until release',async t=>{

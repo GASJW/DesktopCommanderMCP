@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { analyzeDeviceIdentityBindingRecovery, bindApprovedDeviceIdentity,
   clearStaleDeviceIdentityBindingLock, loadOrCreateDeviceIdentity } from '../src/identity-store.mjs';
+import { analyzeI4ExecutionRecovery } from '../src/governed-executor.mjs';
 import { createWindowsDurableProcessLock, createWindowsFileBeneath,
   inspectWindowsFileLock, listWindowsDirectoryBeneath, moveWindowsFileWriteThrough,
   readWindowsFileBeneath, removeDeadWindowsFileLock, removeOwnedWindowsDurableProcessLock,
@@ -47,6 +48,41 @@ test('Windows Ed25519 identity survives DPAPI reload, durable binding replacemen
     const stored=JSON.parse(readFileSync(path.join(directory,'identity-v1.json'),'utf8'));
     assert.equal(stored.encoding,'dpapi-current-user');
     assert.equal(stored.key.includes('PRIVATE KEY'),false);
+  });
+});
+
+test('Windows I7 and I8 worker profiles keep DPAPI identities, bindings and ledgers separate',windowsOnly,async()=>{
+  await sandbox(base=>{
+    const profiles=['i7','i8'].map(name=>{
+      const directory=path.join(base,name),identityDirectory=path.join(directory,'identity'),
+        ledgerDirectory=path.join(directory,'ledger'),allowedRoot=path.join(directory,'approved');
+      for(const value of [directory,identityDirectory,ledgerDirectory,allowedRoot]){
+        mkdirSync(value);securePrivateWindowsDirectory(value);
+      }
+      const identity=loadOrCreateDeviceIdentity({directory:identityDirectory});
+      const binding={deviceId:randomUUID(),clientId:`g7-${name}.synthetic`,fingerprint:identity.fingerprint,
+        approvalEventId:randomUUID(),bindingEventId:randomUUID(),bindingRevision:2,
+        ownerId:'a'.repeat(24),ownerDigest:'b'.repeat(64),trustRevisionBefore:4,
+        trustRevisionAfter:5,trustRevision:5};
+      const bound=bindApprovedDeviceIdentity({directory:identityDirectory,machineBinding:binding});
+      const stored=JSON.parse(readFileSync(path.join(identityDirectory,'identity-v1.json'),'utf8'));
+      return {name,directory,identityDirectory,ledgerDirectory,allowedRoot,identity,binding,bound,stored};
+    });
+    const [i7,i8]=profiles;
+    assert.notEqual(i7.identity.fingerprint,i8.identity.fingerprint);
+    assert.notEqual(i7.binding.deviceId,i8.binding.deviceId);
+    assert.notEqual(i7.binding.clientId,i8.binding.clientId);
+    assert.notEqual(i7.identityDirectory,i8.identityDirectory);
+    assert.notEqual(i7.ledgerDirectory,i8.ledgerDirectory);
+    for(const profile of profiles){
+      assert.equal(profile.stored.encoding,'dpapi-current-user');
+      assert.equal(profile.stored.key.includes('PRIVATE KEY'),false);
+      assert.equal(loadOrCreateDeviceIdentity({directory:profile.identityDirectory}).fingerprint,
+        profile.identity.fingerprint);
+      assert.equal(loadOrCreateDeviceIdentity({directory:profile.identityDirectory})
+        .deviceBinding.bindingEventId,profile.binding.bindingEventId);
+      assert.equal(analyzeI4ExecutionRecovery({ledgerDirectory:profile.ledgerDirectory}).status,'consistent');
+    }
   });
 });
 

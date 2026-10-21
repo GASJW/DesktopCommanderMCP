@@ -17,20 +17,28 @@ function windowsSegmentsAreSafe(parts){
     !/[<>:"|?*\x00-\x1f]/.test(part)&&!/[. ]$/.test(part));
 }
 function grantPathApi(value){
-  if(process.platform!=='win32')return path;
   if(typeof value!=='string')return null;
-  if(path.posix.isAbsolute(value)&&path.posix.normalize(value)===value&&
-     !value.includes('\\')&&!value.startsWith('//')&&
-     windowsSegmentsAreSafe(value.slice(1).split('/')))return path.posix;
   if(/^[A-Za-z]:\\/.test(value)&&path.win32.isAbsolute(value)&&
      path.win32.resolve(value)===value&&
      windowsSegmentsAreSafe(value.slice(3).split('\\')))return path.win32;
+  if(path.posix.isAbsolute(value)&&path.posix.normalize(value)===value&&
+     !value.includes('\\')&&!value.startsWith('//')&&
+     (process.platform!=='win32'||windowsSegmentsAreSafe(value.slice(1).split('/'))))return path.posix;
   return null;
 }
+export function isWindowsToolGrantPath(value){return grantPathApi(value)===path.win32;}
+export function toolGrantPathApi(value){return grantPathApi(value);}
+export function toolGrantPathsWithin(root,target,{allowRoot=false}={}){
+  const api=grantPathApi(root);
+  if(!api||grantPathApi(target)!==api)return false;
+  const relative=api.relative(root,target);
+  return (allowRoot&&relative==='')||relative!==''&&relative!=='..'&&
+    !relative.startsWith('..'+api.sep)&&!api.isAbsolute(relative);
+}
 function validGrantPath(value,{normalized=false}={}){
-  return typeof value==='string'&&value.length<=4096&&!value.includes('\0')&&
-    (process.platform==='win32'?grantPathApi(value)!==null:
-      path.isAbsolute(value)&&(!normalized||path.normalize(value)===value));
+  const api=grantPathApi(value);
+  return typeof value==='string'&&value.length<=4096&&!value.includes('\0')&&api!==null&&
+    (!normalized||api.normalize(value)===value)&&value!==api.parse(value).root;
 }
 function windowsGrantPath(allowedRoot,value){
   const api=grantPathApi(value);
@@ -123,7 +131,8 @@ function inside(root,target,{allowRoot=false,pathApi=path}={}){
 function pathAllowed(root,filename,{allowRoot=false}={}){
   const pathApi=process.platform==='win32'?grantPathApi(filename):path;
   if(!validGrantPath(root,{normalized:true})||!validGrantPath(filename)||
-     process.platform==='win32'&&grantPathApi(root)!==pathApi)return false;
+     process.platform==='win32'&&grantPathApi(root)!==pathApi||
+     process.platform!=='win32'&&(grantPathApi(root)!==path.posix||grantPathApi(filename)!==path.posix))return false;
   const absolute=pathApi.resolve(filename);
   return inside(root,absolute,{allowRoot,pathApi});
 }

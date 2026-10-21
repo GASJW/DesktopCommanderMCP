@@ -4,7 +4,7 @@ import {
   constants, closeSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync,
   readFileSync, readdirSync, renameSync, writeSync,
 } from 'node:fs';
-import { toolArgumentsDigest } from './tool-grant-capability.mjs';
+import { toolArgumentsDigest, toolGrantPathApi, toolGrantPathsWithin } from './tool-grant-capability.mjs';
 import { createDurableProcessLock, inspectDurableProcessLock,
   removeOwnedDurableProcessLock } from '../common/durable-process-lock.mjs';
 import { removeDeadDurableProcessLock } from '../common/durable-process-lock.mjs';
@@ -142,9 +142,11 @@ function validateRecordHash(record){
   return expected===record.hash;
 }
 function validateRoot(value){
+  const api=toolGrantPathApi(value);
   if(typeof value!=='string'||value.length===0||value.length>4096||value.includes('\0')||
-     !path.isAbsolute(value)||path.resolve(value)!==value||value===path.parse(value).root||
-     value.startsWith('//'))throw fail('INVALID','Tool grant root must be a normalized non-root absolute path');
+     !api||api.resolve(value)!==value||value===api.parse(value).root){
+    throw fail('INVALID','Tool grant root must be a normalized non-root absolute path');
+  }
   return value;
 }
 function boundedInt(value,min,max){return Number.isSafeInteger(value)&&value>=min&&value<=max;}
@@ -227,10 +229,6 @@ function validateApproval(input){
   return {eventId:receipt.eventId,trustRevisionBefore:receipt.trustRevisionBefore,
     trustRevisionAfter:receipt.trustRevisionAfter,trustRevision:receipt.trustRevision};
 }
-function insideScope(root,target){
-  const relative=path.relative(root,target);
-  return relative===''||relative!=='..'&&!relative.startsWith('..'+path.sep)&&!path.isAbsolute(relative);
-}
 function validateArguments(tool,args,grant){
   if(!args||Object.getPrototypeOf(args)!==Object.prototype){
     throw fail('DENIED','Tool arguments must be a plain object');
@@ -241,8 +239,8 @@ function validateArguments(tool,args,grant){
       keys.every(key=>required.includes(key)||optional.includes(key));
   };
   const pathIsGranted=({allowRoot=false}={})=>typeof args.path==='string'&&args.path.length<=4096&&
-    !args.path.includes('\0')&&path.isAbsolute(args.path)&&path.resolve(args.path)===args.path&&
-    !args.path.startsWith('//')&&insideScope(grant.scope.root,args.path)&&
+    !args.path.includes('\0')&&toolGrantPathApi(args.path)===toolGrantPathApi(grant.scope.root)&&
+    toolGrantPathsWithin(grant.scope.root,args.path,{allowRoot})&&
     (allowRoot||args.path!==grant.scope.root);
   if(tool==='read_file'){
     if(!exact(['path'],['offset','length'])||!pathIsGranted()||
