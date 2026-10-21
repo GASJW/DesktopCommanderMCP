@@ -146,7 +146,7 @@
       "classification": "intentional pre-fix regression reproduction",
       "result": "combined g7.read plus g7.owner was accepted before the bridge scope fence; corrected and covered by passing suites",
       "exitCode": 1,
-      "logSha256": "d697dd1dbf46181cfc4f5c296be27591fd0a6815c45dc95357c219e1ce9609c"
+      "logSha256": "d697dd1dbf46181cffc4f5c296be27591fd0a6815c45dc95357c219e1ce9609c"
     },
     {
       "runId": "20261021T133954Z-windows-oauth-e2e-ce2fadbffcd448e098efb1b8e17c56a7",
