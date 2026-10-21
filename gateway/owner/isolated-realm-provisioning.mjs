@@ -15,6 +15,7 @@ import { createDurableProcessLock, inspectDurableProcessLock,
   removeOwnedDurableProcessLock } from '../common/durable-process-lock.mjs';
 import { ownerAuthorityTargetDigest } from './durable-owner-authority.mjs';
 import { validateIsolatedG7RealmConfig } from './isolated-realm.mjs';
+import { isWindowsToolGrantPath, toolGrantPathApi } from '../devices/tool-grant-capability.mjs';
 
 const APPROVAL_EVENT='g7_realm_owner_approval';
 const operations=new Set(['device.approve','device.revoke','binding.create','grant.issue','grant.revoke']);
@@ -210,11 +211,16 @@ export function createIsolatedRealmProvisioning({realmId,realmConfig,ownerAuthor
     if(poisoned)throw fail('PROVISIONING_UNAVAILABLE','Provisioning requires reconciliation');
     const owner=ownerAuthority.verifyAdminPrincipal(accessToken);
     const binding=machineBindingStore.list().find(value=>value.deviceId===deviceId);
+    const device=trustStore.registry.listDevices().find(value=>value.deviceId===deviceId);
+    const rootApi=toolGrantPathApi(root);
     const receipt=owner&&readApprovalById(owner.ownerId,deviceId);
-    if(!owner||!binding||binding.ownerDigest!==owner.ownerDigest||
+    if(typeof root!=='string'||root.length>4096||root.includes('\0')||!rootApi||
+       root===rootApi.parse(root).root||!owner||!device||!['linux','win32','darwin'].includes(device.platform)||
+       (device.platform==='win32')!==isWindowsToolGrantPath(root)||
+       !binding||binding.ownerDigest!==owner.ownerDigest||
        binding.fingerprint!==fingerprint||!receipt||receipt.fingerprint!==fingerprint||
        !Number.isSafeInteger(expectedRevision)||grantStore.revision()!==expectedRevision){
-      throw fail('GRANT_DENIED','Current Owner, binding, pairing receipt and expected policy revision are required');
+      throw fail('GRANT_DENIED','Current Owner, device platform, binding, pairing receipt and expected policy revision are required');
     }
     const grant={ownerDigest:owner.ownerDigest,deviceId,fingerprint,tool:'read_file',
       scope:{root},constraints};

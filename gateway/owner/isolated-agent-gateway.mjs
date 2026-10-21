@@ -83,6 +83,11 @@ export async function startIsolatedG7AgentGateway({ config, realmConfig, ownerAu
   }
 
   const realm = validateIsolatedG7RealmConfig(realmConfig, { requireExisting: true });
+  if (config.listen.host !== realm.listen.host || config.listen.port !== realm.listen.port) {
+    throw Object.assign(new Error('Isolated Gateway listener must match the realm configuration'), {
+      code: 'REALM_LISTENER_MISMATCH',
+    });
+  }
   if (ownerAuthority.directory !== realm.paths.ownerAuthorityDirectory ||
       trustStore.directory !== realm.paths.trustDirectory ||
       machineBindingStore.directory !== realm.paths.bindingDirectory ||

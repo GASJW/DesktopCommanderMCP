@@ -79,3 +79,16 @@ test('grant scope maps to the approved Windows drive and still rejects path esca
     deviceId:DEVICE,requestId:REQUEST,fingerprint:FINGERPRINT,tool:'read_file',
     arguments:outsideArgs,allowedRoot:f.root}),/scope|outside/i);
 });
+
+test('Linux agent rejects a correctly signed Windows-drive grant',{
+  skip:process.platform!=='linux'&&'requires Linux path semantics',
+},()=>{
+  const f=fixture();
+  const root='C:\\Users\\synthetic\\approved';
+  const args={path:`${root}\\proof.txt`,offset:0,length:10};
+  const authorization=signToolGrantCapability({...f.claims,scope:{root},
+    argumentsDigest:toolArgumentsDigest('read_file',args)},f.privateKey);
+  assert.throws(()=>verifyToolGrantCapability(authorization,f.publicKey,{now,
+    deviceId:DEVICE,requestId:REQUEST,fingerprint:FINGERPRINT,tool:'read_file',
+    arguments:args,allowedRoot:f.root}),/scope|outside|approved root/i);
+});

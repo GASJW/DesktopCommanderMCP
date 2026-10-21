@@ -38,11 +38,43 @@ also fences a completed result after grant revocation and checks device and
 Owner revocation without replay. `packages/vpsc-agent/test/windows-security.test.mjs`
 checks separate Windows DPAPI identities, bindings and clean ledgers.
 
-This does not certify a Windows-hosted Gateway or a full Windows I8 network
-deployment. Gateway durable-store composition is exercised on nonroot Linux;
-Windows coverage here establishes worker identity/ledger separation and the
-existing Windows agent security suite. It also does not install either worker
-or activate the isolated realm in a live environment.
+## Native Windows-to-Linux network certification
+
+`gateway/test/isolated-realm-provisioning.test.mjs` includes an opt-in native
+Windows worker test. Run it from a nonroot WSL2 ext4 checkout with Windows
+interop enabled and the same commit present in the Windows checkout:
+
+```sh
+VPSC_I8I_WINDOWS_TO_LINUX_E2E=1 \
+VPSC_WINDOWS_REPO_ROOT='C:\\path\\to\\DesktopCommanderMCP' \
+node --test --test-name-pattern='native Windows I8 worker' \
+  gateway/test/isolated-realm-provisioning.test.mjs
+```
+
+The disposable Linux Gateway binds only to the realm's configured
+`127.0.0.1:<port>`. A temporary WSL-side relay binds to the private `eth0`
+address, accepts only the Windows host's WSL route address, and forwards to
+that fixed loopback Gateway port. Each TCP stream starts with a fresh random
+challenge and an HMAC proof using a test-only key passed over the parent/child
+pipe. The native Windows controller exposes its relay only on
+`127.0.0.1`; the worker continues to use the pinned TLS hostname and CA. TLS
+terminates only at the Gateway, where the existing machine credential and
+signed Ed25519 frames are verified. The relay never accepts a caller-selected
+upstream host or port.
+
+The test performs synthetic Owner approval, Windows DPAPI identity creation,
+pairing, binding and `read_file` grant issuance; READY/ONLINE and a content-hash
+checked read; hostname, CA, machine-credential, path and tool denials;
+cancellation, result-delivery fencing, worker restart, transport loss/recovery,
+grant/device revocation and ledger no-replay checks. It also runs the existing
+disposable I7 pilot concurrently. Both the Windows worker and temporary relay
+are stopped and their disposable state is removed by test teardown. No host
+file, proxy, firewall, SSH, production credential, public listener or live G7
+configuration is changed.
+
+The test is opt-in because it requires native Windows Node, WSL2 private
+network reachability and a nonroot Linux Gateway runtime. A Linux-only mock or
+loopback-only fixture is not a substitute for this network certification.
 
 ## Future live rollout — separate approval required
 

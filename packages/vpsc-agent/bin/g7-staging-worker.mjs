@@ -143,7 +143,7 @@ try{
       const requestId=frame?.requestId,tool=frame?.params?.name;
       const fixturePath=frame?.params?.arguments?.path;
       if(fixtureScenario==='owner-cancel'&&tool==='read_file'&&!firstReadHeld&&
-         typeof fixturePath==='string'&&fixturePath.endsWith('/cancel-before-execution-probe.txt')){
+         typeof fixturePath==='string'&&path.basename(fixturePath)==='cancel-before-execution-probe.txt'){
         firstReadHeld=true;
         emitFixture('FIXTURE_OPERATION_RECEIVED',{requestId,tool});
         await waitForFixtureAbort(options.signal);
