@@ -1,0 +1,170 @@
+{
+  "manifestVersion": 1,
+  "releaseId": "G7-I8J-CHATGPT-MCP-RC1",
+  "status": "offline-synthetic-candidate",
+  "source": {
+    "repository": "GASJW/DesktopCommanderMCP",
+    "branch": "codex/g7-i8j-chatgpt-mcp",
+    "baseCommit": "3ac3cbed25f31396633adf17b0ec4c8b681923ed",
+    "implementationCommit": "065481610bfc4ace149bd31d0b39560af27d0979",
+    "parentPR": 44,
+    "parentBranch": "codex/g7-i8i-isolated-dual-worker"
+  },
+  "runtime": {
+    "gatewayDirectDependencies": "Node.js standard library only",
+    "agentPackage": {
+      "path": "packages/vpsc-agent/package.json",
+      "version": "0.0.0-dev",
+      "directDependencies": [],
+      "sha256": "8f4cf578a27dfacfbae491bae8b74828d5d9bc7c88dcc9fd06960faad18a592f"
+    },
+    "repositoryBuildInventory": [
+      {
+        "path": "package.json",
+        "sha256": "938c7e2a5e0b8d1f3fa97a59e46fe10087ed7e6a95b2d202003c8ac9fa1c86ab"
+      },
+      {
+        "path": "package-lock.json",
+        "sha256": "1303aaab05d83f0770ac7d0a24e7a55a0564eb4a4703b2145adfe76fb3a43f67",
+        "note": "Used for the disposable Desktop Commander build in the Linux agent suite; not a direct I8 Gateway dependency."
+      }
+    ],
+    "certifiedNodeVersions": {
+      "linux": "v22.22.1",
+      "windows": "v24.16.0"
+    }
+  },
+  "files": [
+    {
+      "path": "gateway/chatgpt/read-only-bridge.mjs",
+      "sha256": "35610b9131fb78c3694640fc86224e9c5c2eeba07f2cf4b471b272b71f857119"
+    },
+    {
+      "path": "gateway/owner/isolated-agent-gateway.mjs",
+      "sha256": "b0e0724033ad96352c9303b6950aced38ff9b62b0ce89fa03a66f9cb6c994be4"
+    },
+    {
+      "path": "gateway/test/chatgpt-read-only-bridge.test.mjs",
+      "sha256": "2c0b779cf3cafc3f9350856ed7f2c51e7369bf0af0578f7b77dcd1c7967067a3"
+    },
+    {
+      "path": "gateway/test/isolated-realm-provisioning.test.mjs",
+      "sha256": "fef0819a181c09642b77bfeb27dc971e6f38a2af3c80fa3826a7300acc75e6da"
+    },
+    {
+      "path": "gateway/chatgpt/README.md",
+      "sha256": "17b3a572145e74cb1b48f1b5b22e6ef69c68e5798b8a085009b2f5d56e652fc7"
+    },
+    {
+      "path": "docs/G7-I8J-CHATGPT-MCP-INTEGRATION.md",
+      "sha256": "c8e866f201d61c9efc35688797271bf405d50069e2d6a038f26a70951bd06774"
+    },
+    {
+      "path": "config/g7-i8j/gateway.example.yaml",
+      "sha256": "b39a98916b504e1eec0b9076ce5a455cb0d2994458ba8da98c96976e4c3c0b61"
+    },
+    {
+      "path": "config/g7-i8j/auth0.example.yaml",
+      "sha256": "e83d512797d10b7e0c010a3105ae1c38425a4ab8d6af7f4c28392d976e2313f7"
+    }
+  ],
+  "certification": {
+    "linuxGatewaySuite": {
+      "runId": "20261021T143300Z-linux-gateway-final-98972a0a274d4b7baf0045484859dc93",
+      "command": "node --test gateway/test/*.test.mjs",
+      "runner": "nonroot WSL2 Linux, uid 1000, Node v22.22.1",
+      "tests": 447,
+      "passed": 444,
+      "failed": 0,
+      "skipped": 3,
+      "exitCode": 0,
+      "logSha256": "84c5445c7cf07f0c58cd21e57fdbf7f67378c30dbc2aef6a3fd6d8577c43e9e5"
+    },
+    "linuxAgentSuite": {
+      "runId": "20261021T141200Z-linux-agent-full-8c715887606f4b5e8dd74ab3417bfbad",
+      "command": "npm ci --ignore-scripts --no-audit --no-fund; npm run build; VPSC_STAGING_MCP_ENTRYPOINT=dist/index.js node --test packages/vpsc-agent/test/*.test.mjs",
+      "runner": "nonroot WSL2 Linux, uid 1000, Node v22.22.1",
+      "tests": 123,
+      "passed": 115,
+      "failed": 0,
+      "skipped": 8,
+      "installExitCode": 0,
+      "buildExitCode": 0,
+      "testExitCode": 0,
+      "logSha256": "3e36f442de1b117cf607d52742b8ee17e61b9921e613b65adb0d7d5f01c2fb8f"
+    },
+    "windowsAgentSuite": {
+      "runId": "20261021T140000Z-windows-agent-full-8f3d5ac68b744c369c778c90fd29885f",
+      "command": "node --test test/*.test.mjs (packages/vpsc-agent)",
+      "runner": "native Windows, Node v24.16.0",
+      "tests": 123,
+      "passed": 100,
+      "failed": 0,
+      "skipped": 23,
+      "exitCode": 0,
+      "skipClasses": [
+        "POSIX modes, process identity, symlink and process-group-only coverage",
+        "optional installed Desktop Commander integration not configured"
+      ],
+      "logSha256": "aa767de60e7adb7304ad60e1eb0cf48d9c3e764fce046f0ca94b81818f89d20b"
+    },
+    "windowsToLinuxOAuthE2E": {
+      "runId": "20261021T142500Z-windows-oauth-final-0df6e66d00314b1cacfbfcb5c657a713",
+      "command": "VPSC_I8I_WINDOWS_TO_LINUX_E2E=1 node --test --test-name-pattern='native Windows I8 worker uses private authenticated forwarding to an isolated Linux Gateway' gateway/test/isolated-realm-provisioning.test.mjs",
+      "runner": "native Windows Node v24.16.0 worker plus disposable nonroot WSL2 Linux Node v22.22.1 Gateway",
+      "tests": 1,
+      "passed": 1,
+      "failed": 0,
+      "skipped": 0,
+      "exitCode": 0,
+      "logSha256": "5c0b9b204c94f1af2b68d917e364bf394ba9642aeb8cc911adcbcdc1e1c651a4"
+    },
+    "chatgptBridgeAndOwnerSecurity": {
+      "runId": "20261021T142330Z-windows-readscope-green-3dbdd4c09a714fe4873ad8db673f106a",
+      "command": "node --test gateway/test/chatgpt-read-only-bridge.test.mjs gateway/test/isolated-chatgpt-owner.test.mjs",
+      "runner": "native Windows, Node v24.16.0",
+      "tests": 19,
+      "passed": 19,
+      "failed": 0,
+      "skipped": 0,
+      "exitCode": 0,
+      "logSha256": "3f5958ed66e2e2cb70e600e6ea59a3139914bfe31d2ea7edf08c5d2281ff6733"
+    },
+    "staticAndDiffChecks": {
+      "runId": "20261021T143700Z-static-final-cbfb4100e73a4265be8e33254e727084",
+      "checks": [
+        "node --check on modified modules and tests",
+        "git diff --check"
+      ],
+      "exitCode": 0,
+      "logSha256": "2fa66e12c2903a11d61e7ddc1670f7023746454fbf3148264ad68e9b06b1d4a7"
+    }
+  },
+  "diagnosticRuns": [
+    {
+      "runId": "20261021T141800Z-readscope-red-1e7a0c815c27444fa135e419d0092db2",
+      "classification": "intentional pre-fix regression reproduction",
+      "result": "combined g7.read plus g7.owner was accepted before the bridge scope fence; corrected and covered by passing suites",
+      "exitCode": 1,
+      "logSha256": "d697dd1dbf46181cfc4f5c296be27591fd0a6815c45dc95357c219e1ce9609c"
+    },
+    {
+      "runId": "20261021T133954Z-windows-oauth-e2e-ce2fadbffcd448e098efb1b8e17c56a7",
+      "classification": "test expectation corrected; runtime no-replay guard behaved as designed",
+      "result": "an exact duplicate was rejected with DUPLICATE_REQUEST before a second executor handoff; the E2E originally expected the wrong error/status",
+      "exitCode": 1,
+      "logSha256": "1541eff7a769d74efe7cff3411d5d3b68bdaa618225b1de78a87ea9e2bbda9f5"
+    }
+  ],
+  "liveState": "unchanged; no VPS access, real OAuth exchange, tunnel-client start, or live provisioning performed",
+  "openIncidents": [
+    "Historical STALE_LOCK root cause remains unknown; the Linux agent test log contains only its disposable injected unknown-lock fail-closed scenario and does not resolve the historical incident.",
+    "Historical ECONNRESET root cause remains unknown and was not reclassified."
+  ],
+  "notVerified": [
+    "Real Auth0 client_id/azp, audience and scope claims from token issuance",
+    "Real refresh-token issuance and effective Allow Offline Access setting",
+    "Selected Secure MCP Tunnel metadata/path forwarding and TLS trust",
+    "Remote Windows-to-VPS worker /agent transport"
+  ]
+}
