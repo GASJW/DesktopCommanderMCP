@@ -82,11 +82,11 @@ function fixture(t,{testHooks,bindingTestHooks,realtime=false}={}){
   const verifier=createAuth0OwnerVerifier(verifierConfig,{now});
   const payload={iss:ISSUER,sub:'google-oauth2|synthetic-i8h-owner',aud:RESOURCE,
     client_id:CLIENT,iat:seconds,exp:seconds+600};
-  const tokenFor=(scope='g7.owner',sub=payload.sub)=>{
-    const header=b64({alg:'RS256',kid:authJwk.kid,typ:'JWT'});
+  const tokenFor=(scope='g7.owner',sub=payload.sub,claims={},headerClaims={})=>{
+    const header=b64({alg:'RS256',kid:authJwk.kid,typ:'JWT',...headerClaims});
     const issuedAt=Math.floor(now()/1000);
-    const claims=b64({...payload,sub,scope,...(realtime?{iat:issuedAt,exp:issuedAt+600}:{})});
-    const input=`${header}.${claims}`;
+    const tokenClaims=b64({...payload,sub,scope,...(realtime?{iat:issuedAt,exp:issuedAt+600}:{}),...claims});
+    const input=`${header}.${tokenClaims}`;
     return `${input}.${sign('RSA-SHA256',Buffer.from(input),auth.privateKey).toString('base64url')}`;
   };
   const principal=verifier.verifyAdminPrincipal(tokenFor());
@@ -226,12 +226,12 @@ function startSyntheticWorker(configPath){
   }};
 }
 
-function httpsJson({port,hostname,ca,pathname,payload,headers={},signal,timeoutMs=10_000}){
-  const body=Buffer.from(JSON.stringify(payload));
+function httpsJson({port,hostname,ca,pathname,payload,method='POST',headers={},signal,timeoutMs=10_000}){
+  const body=payload===undefined?null:Buffer.from(JSON.stringify(payload));
   return new Promise((resolve,reject)=>{
-    const request=httpsRequest({hostname:'127.0.0.1',port,servername:hostname,method:'POST',
+    const request=httpsRequest({hostname:'127.0.0.1',port,servername:hostname,method,
       path:pathname,ca,rejectUnauthorized:true,headers:{host:hostname,
-        'content-type':'application/json','content-length':body.length,...headers}},response=>{
+        ...(body?{'content-type':'application/json','content-length':body.length}:{}),...headers}},response=>{
       const chunks=[];let size=0;
       response.on('data',chunk=>{size+=chunk.length;if(size>2*1024*1024){request.destroy(Error('response limit'));return;}chunks.push(chunk);});
       response.on('end',()=>{
@@ -243,7 +243,7 @@ function httpsJson({port,hostname,ca,pathname,payload,headers={},signal,timeoutM
     if(signal?.aborted)abort();else signal?.addEventListener('abort',abort,{once:true});
     request.once('error',reject);request.once('close',()=>signal?.removeEventListener('abort',abort));
     request.setTimeout(timeoutMs,()=>request.destroy(Error('HTTPS test request timeout')));
-    request.end(body);
+    request.end(body??undefined);
   });
 }
 
@@ -510,7 +510,7 @@ test('isolated Auth0 realm serves two independent workers while the synthetic I7
     };
     let triggerLateGrantRevocation=false,lateGrantRevoked=false,lateGrantRevocation=null;
     let gateway=null,i7Pilot=null;
-    const routerDiagnostics=[];
+    const routerDiagnostics=[],ownerDispatches=[];
     const workers=[];
     const readDeviceApproval=createDurableOwnerDeviceApprovalReader({
       auditDirectory:f.paths.audit,trustDirectory:f.paths.trust});
@@ -530,6 +530,7 @@ test('isolated Auth0 realm serves two independent workers while the synthetic I7
           acceptCancellation:value=>baseRouter.acceptCancellation(value),
           rejectBeforeDelivery:value=>baseRouter.rejectBeforeDelivery(value),
           callDevice:async value=>{
+            ownerDispatches.push({requestId:value.requestId,deviceId:value.deviceId,name:value.name});
             const result=await baseRouter.callDevice(value);
             if(triggerLateGrantRevocation&&!lateGrantRevoked&&value.name==='read_file'&&
                value.arguments.path===profiles[0].proofFile){
@@ -542,6 +543,7 @@ test('isolated Auth0 realm serves two independent workers while the synthetic I7
         };
         gateway=await startIsolatedG7AgentGateway({
           config:{hostname,listen:{host:options.host,port:options.port},machine,
+            chatgpt:{resourceMetadataUrl:'https://g7-i8i-tunnel.example.test/.well-known/oauth-protected-resource/chatgpt/mcp'},
             tls:{certificate:tls.certificate,key:tls.key}},
           realmConfig:f.realmConfig,ownerAuthority:f.authority,trustStore:f.trustStore,
           machineBindingStore:f.machineBindingStore,grantStore:f.grantStore,router,
@@ -576,13 +578,59 @@ test('isolated Auth0 realm serves two independent workers while the synthetic I7
       await worker.waitFor(value=>value.event==='ONLINE','ONLINE');
     }
 
-    const ownerHeaders={authorization:`Bearer ${f.tokenFor('g7.read')}`};
-    const ownerCall=(id,name,args)=>httpsJson({port:gateway.port,hostname,ca:tls.certificate,
-      pathname:'/mcp',payload:{jsonrpc:'2.0',id,method:'tools/call',params:{name,arguments:args}},headers:ownerHeaders});
-    const listed=await httpsJson({port:gateway.port,hostname,ca:tls.certificate,pathname:'/mcp',
-      payload:{jsonrpc:'2.0',id:'tools-list',method:'tools/list'},headers:ownerHeaders});
+    const oauthHeaders={'accept':'application/json, text/event-stream','mcp-protocol-version':'2025-11-25'};
+    const ownerCall=(id,name,args,accessToken=f.tokenFor('g7.read'),session='i8j-linux-chat-session')=>
+      httpsJson({port:gateway.port,hostname,ca:tls.certificate,pathname:'/chatgpt/mcp',
+        payload:{jsonrpc:'2.0',id,method:'tools/call',params:{name,arguments:args,
+          _meta:{'openai/session':session}}},headers:{...oauthHeaders,
+          ...(accessToken?{authorization:`Bearer ${accessToken}`}:{})}});
+    const metadata=await httpsJson({port:gateway.port,hostname,ca:tls.certificate,
+      pathname:'/.well-known/oauth-protected-resource/chatgpt/mcp',method:'GET'});
+    assert.equal(metadata.status,200);
+    assert.deepEqual(metadata.body,{resource:RESOURCE,authorization_servers:[ISSUER],
+      scopes_supported:['g7.read'],bearer_methods_supported:['header']});
+    const initialized=await httpsJson({port:gateway.port,hostname,ca:tls.certificate,
+      pathname:'/chatgpt/mcp',headers:oauthHeaders,payload:{jsonrpc:'2.0',id:'initialize',method:'initialize',
+        params:{protocolVersion:'2025-11-25',capabilities:{},clientInfo:{name:'synthetic-chatgpt',version:'1'}}}});
+    assert.equal(initialized.status,200);
+    assert.equal(initialized.body.result.protocolVersion,'2025-11-25');
+    const listed=await httpsJson({port:gateway.port,hostname,ca:tls.certificate,pathname:'/chatgpt/mcp',
+      headers:oauthHeaders,payload:{jsonrpc:'2.0',id:'tools-list',method:'tools/list'}});
     assert.equal(listed.status,200);
     assert.deepEqual(listed.body.result.tools.map(tool=>tool.name),['read_file']);
+    assert.deepEqual(listed.body.result.tools[0].securitySchemes,[{type:'oauth2',scopes:['g7.read']}]);
+    assert.equal(listed.body.result.tools[0].annotations.readOnlyHint,true);
+    const legacyRoute=await httpsJson({port:gateway.port,hostname,ca:tls.certificate,pathname:'/mcp',
+      headers:oauthHeaders,payload:{jsonrpc:'2.0',id:'legacy-route',method:'tools/list'}});
+    assert.equal(legacyRoute.status,404);
+    const unauthenticated=await ownerCall('unauthenticated-read','read_file',
+      {deviceId:profiles[0].challenge.deviceId,path:profiles[0].proofFile,length:100},null);
+    assert.equal(unauthenticated.status,200);
+    assert.equal(unauthenticated.body.result.isError,true);
+    const challenge=unauthenticated.body.result._meta['mcp/www_authenticate'][0];
+    assert.ok(challenge.includes('resource_metadata="https://g7-i8i-tunnel.example.test/.well-known/oauth-protected-resource/chatgpt/mcp"'));
+    assert.ok(challenge.includes('scope="g7.read"'));
+    assert.ok(challenge.includes('error="invalid_token"'));
+    assert.ok(challenge.includes('error_description="A valid G7 Owner authorization is required"'));
+    const deniedTokens=[
+      f.tokenFor('g7.read',undefined,{aud:'https://attacker.example.test/mcp'}),
+      f.tokenFor('g7.read',undefined,{iss:'https://attacker.example.test/'}),
+      f.tokenFor('g7.read',undefined,{client_id:'unregistered-chatgpt-client'}),
+      f.tokenFor('g7.read',undefined,{client_id:CLIENT,azp:'unregistered-chatgpt-client'}),
+      f.tokenFor('profile'),
+      f.tokenFor('g7.read g7.owner'),
+      f.tokenFor('g7.read',undefined,{exp:Math.floor(Date.now()/1000)-1}),
+      f.tokenFor('g7.read',undefined,{}, {kid:'unknown-i8j-kid'}),
+      f.tokenFor('g7.read','synthetic-staging-owner',
+        {iss:'https://g7-owner-staging.cloudflareaccess.com'}),
+      f.tokenFor('g7.owner'),
+    ];
+    for(const [index,token] of deniedTokens.entries()){
+      const rejected=await ownerCall(`denied-owner-${index}`,'read_file',
+        {deviceId:profiles[0].challenge.deviceId,path:profiles[0].proofFile,length:100},token);
+      assert.equal(rejected.body.result.isError,true,`token ${index} was accepted`);
+    }
+    assert.equal(ownerDispatches.length,0);
 
     const first=await ownerCall('read-a-1','read_file',{deviceId:profiles[0].challenge.deviceId,
       path:profiles[0].proofFile,length:100});
@@ -592,6 +640,7 @@ test('isolated Auth0 realm serves two independent workers while the synthetic I7
     assert.equal(second.status,200,JSON.stringify(second.body));
     assert.equal(first.body.result.content[0].text,profiles[0].contents);
     assert.equal(second.body.result.content[0].text,profiles[1].contents);
+    assert.equal(ownerDispatches.length,2);
     assert.notEqual(profiles[0].challenge.deviceId,profiles[1].challenge.deviceId);
     assert.notEqual(profiles[0].identity.fingerprint,profiles[1].identity.fingerprint);
     assert.notEqual(profiles[0].clientId,profiles[1].clientId);
@@ -688,7 +737,10 @@ test('isolated Auth0 realm serves two independent workers while the synthetic I7
       approval:ownerRevocationApproval}).status,'revoked');
     const deniedAfterOwnerRevoke=await ownerCall('owner-revoked','read_file',{
       deviceId:profiles[0].challenge.deviceId,path:profiles[0].proofFile,length:100});
-    assert.equal(deniedAfterOwnerRevoke.status,401);
+    assert.equal(deniedAfterOwnerRevoke.status,200);
+    assert.equal(deniedAfterOwnerRevoke.body.result.isError,true);
+    assert.ok(deniedAfterOwnerRevoke.body.result._meta['mcp/www_authenticate'][0]
+      .includes('scope="g7.read"'));
 
     for(const profile of profiles){
       const ledger=workerLedger(profile.ledgerDirectory);
@@ -1091,6 +1143,7 @@ test('native Windows I8 worker uses private authenticated forwarding to an isola
     const realm=createIsolatedG7Realm({config:f.realmConfig,ownerAuthority:f.authority,
       storeInspectors:inspectors,startLoopback:async options=>{
         const baseConfig={hostname,listen:{host:options.host,port:options.port},machine,
+          chatgpt:{resourceMetadataUrl:'https://g7-i8i-windows-tunnel.example.test/.well-known/oauth-protected-resource/chatgpt/mcp'},
           tls:{certificate:tls.certificate,key:tls.key}};
         await assert.rejects(startIsolatedG7AgentGateway({config:{...baseConfig,
           listen:{host:options.host,port:options.port+1}},realmConfig:f.realmConfig,
@@ -1135,10 +1188,13 @@ test('native Windows I8 worker uses private authenticated forwarding to an isola
     assert.equal(wrongCa.tls,'rejected');
     assert.equal(wrongCredentials.status,403);
 
-    const ownerHeaders={authorization:`Bearer ${f.tokenFor('g7.read')}`};
-    const ownerCall=(id,name,args,signal)=>httpsJson({port:gateway.port,hostname,ca:tls.certificate,
-      pathname:'/mcp',payload:{jsonrpc:'2.0',id,method:'tools/call',params:{name,arguments:args}},
-      headers:ownerHeaders,timeoutMs:35_000,...(signal?{signal}:{})});
+    const oauthHeaders={'accept':'application/json, text/event-stream','mcp-protocol-version':'2025-11-25'};
+    const ownerCall=(id,name,args,signal,accessToken=f.tokenFor('g7.read',undefined,
+      {client_id:undefined,azp:CLIENT}),session='i8j-windows-chat-session')=>httpsJson({port:gateway.port,
+        hostname,ca:tls.certificate,pathname:'/chatgpt/mcp',
+        payload:{jsonrpc:'2.0',id,method:'tools/call',params:{name,arguments:args,
+          _meta:{'openai/session':session}}},headers:{...oauthHeaders,authorization:`Bearer ${accessToken}`},
+        timeoutMs:35_000,...(signal?{signal}:{})});
     const assertSingleDelivery=requestId=>{
       const diagnostics=controller.events.filter(value=>value.type==='worker'&&
         value.event.event==='REQUEST_DIAGNOSTIC'&&value.event.requestId===requestId);
@@ -1148,11 +1204,17 @@ test('native Windows I8 worker uses private authenticated forwarding to an isola
         value.event.phase==='submission'&&value.event.outcomeCode==='STARTED').length,1);
       assert.equal(resultSubmissions.filter(value=>value.requestId===requestId&&value.accepted).length,1);
     };
-    const list=await httpsJson({port:gateway.port,hostname,ca:tls.certificate,pathname:'/mcp',
-      payload:{jsonrpc:'2.0',id:'windows-tools-list',method:'tools/list'},headers:ownerHeaders});
+    const list=await httpsJson({port:gateway.port,hostname,ca:tls.certificate,pathname:'/chatgpt/mcp',
+      payload:{jsonrpc:'2.0',id:'windows-tools-list',method:'tools/list'},headers:oauthHeaders});
     assert.equal(list.status,200);
     assert.deepEqual(list.body.result.tools.map(tool=>tool.name),['read_file']);
     const securityEventOffset=controller.events.length;
+    const ownerScopeDenied=await ownerCall('windows-owner-scope-denied','read_file',{
+      deviceId:challenge.deviceId,path:identity.proofFile,length:100},undefined,
+      f.tokenFor('g7.read g7.owner'));
+    assert.equal(ownerScopeDenied.status,200);
+    assert.equal(ownerScopeDenied.body.result.isError,true);
+    assert.equal(dispatches.length,0);
     const first=await ownerCall('windows-read-1','read_file',{deviceId:challenge.deviceId,
       path:identity.proofFile,length:100});
     const firstRequest=dispatches.at(-1)?.requestId;
@@ -1202,6 +1264,14 @@ test('native Windows I8 worker uses private authenticated forwarding to an isola
     assert.equal(windowsLedger.status,'consistent');
     assert.equal(windowsLedger.automaticReplay,false);
     assert.deepEqual(windowsLedger.requestRecords.map(value=>value.type),['intent','outcome']);
+    const duplicate=await ownerCall('windows-read-1','read_file',{
+      deviceId:challenge.deviceId,path:identity.proofFile,length:100});
+    assert.equal(duplicate.status,503,JSON.stringify(duplicate.body));
+    assert.equal(duplicate.body.error.data.code,'DUPLICATE_REQUEST');
+    assert.equal(dispatches.filter(value=>value.requestId===firstRequest).length,2);
+    assertSingleDelivery(firstRequest);
+    const afterDuplicate=await controller.send({op:'ledger',requestId:firstRequest});
+    assert.deepEqual(afterDuplicate.requestRecords.map(value=>value.type),['intent','outcome']);
 
     const outside=await ownerCall('windows-outside-root','read_file',{deviceId:challenge.deviceId,
       path:identity.outsideFile,length:100});

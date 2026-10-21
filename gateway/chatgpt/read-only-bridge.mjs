@@ -119,6 +119,7 @@ function validAccessToken(token,config,{keys,clientIds}){
        payload.exp<=payload.iat||payload.exp-payload.iat>MAX_ACCESS_TOKEN_SECONDS||
        payload.nbf!==undefined&&(!Number.isSafeInteger(payload.nbf)||payload.nbf>now+CLOCK_SKEW_SECONDS)||
        typeof payload.scope!=='string'||!payload.scope.split(/\s+/).includes(SCOPE)||
+       payload.scope.split(/\s+/).includes('g7.owner')||
        !tokenClientMatches(payload,clientIds))return null;
     const signature=Buffer.from(encodedSignature,'base64url');
     if(!signature.length||signature.toString('base64url')!==encodedSignature||
@@ -172,7 +173,11 @@ export function createChatGptReadOnlyBridge({oauth,owner,ownerAuthority,...gatew
   if(ownerAuthority){
     if(owner!==undefined)throw new Error('Isolated ChatGPT bridge cannot be mapped to an external Owner');
     validateIsolatedChatGptBridgeConfig(oauth,ownerAuthority);
-    resolveOwner=req=>ownerAuthority.verifyReadPrincipal(bearerToken(req));
+    resolveOwner=req=>{
+      const principal=ownerAuthority.verifyReadPrincipal(bearerToken(req));
+      return principal&&Array.isArray(principal.scopes)&&principal.scopes.includes(SCOPE)&&
+        !principal.scopes.includes('g7.owner')?principal:null;
+    };
     authorizeOwner=ownerAuthority.isCurrentReadPrincipal;
   }else{
     ({keys,clientIds}=validateChatGptBridgeConfig(oauth,owner));

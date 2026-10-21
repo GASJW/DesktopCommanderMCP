@@ -1,0 +1,32 @@
+# Planning template only. Not accepted by the runtime as a Gateway config.
+# Generate the actual objects from the isolated realm and secret stores.
+realm:
+  id: <I8_REALM_UUID>
+  storageRoot: <PRIVATE_I8_REALM_ROOT>
+listener:
+  host: 127.0.0.1
+  port: <I8_LOOPBACK_PORT>
+  tlsHostname: <TLS_CERTIFICATE_SAN>
+  upstreamPath: /chatgpt/mcp
+  resourceMetadataUrl: https://<TUNNEL_RESOURCE_HOST>/.well-known/oauth-protected-resource/chatgpt/mcp
+  tlsCertificateRef: <I8_TLS_CERTIFICATE_REFERENCE>
+  tlsPrivateKeyRef: <I8_TLS_PRIVATE_KEY_REFERENCE>
+ownerAuthority:
+  issuer: <EXACT_AUTH0_ISSUER>
+  resource: <EXACT_I8_OAUTH_RESOURCE_AND_AUDIENCE>
+  allowedChatGptClientId: <OBSERVED_CLIENT_ID_OR_AZP>
+  readScope: g7.read
+  ownerSubjectRef: <APPROVED_I8_OWNER_SUBJECT_REFERENCE>
+  jwksPublicKeySetRef: <VERSIONED_PUBLIC_JWKS_REFERENCE>
+  privateKeyRef: <OWNER_AUTHORITY_PRIVATE_KEY_REFERENCE>
+workerTransport:
+  # Separate from the ChatGPT MCP Tunnel; not certified for remote Windows-to-VPS.
+  endpoint: <SEPARATELY_APPROVED_PRIVATE_AGENT_TRANSPORT>
+  credentialsRef: <DEDICATED_I8_MACHINE_CREDENTIAL_REFERENCE>
+stores:
+  trust: <I8_TRUST_DIRECTORY>
+  binding: <I8_BINDING_DIRECTORY>
+  grant: <I8_GRANT_DIRECTORY>
+  audit: <I8_AUDIT_DIRECTORY>
+  ledger: <I8_LEDGER_DIRECTORY>
+  policy: <I8_POLICY_DIRECTORY>

@@ -4,7 +4,8 @@ import { Readable } from 'node:stream';
 import { createDurableOwnerDeviceAuthorizer } from '../dashboard/durable-owner-device-authorization.mjs';
 import { createAuthenticatedMachineIngress } from '../devices/persistent-machine-ingress.mjs';
 import { createMachineAccessVerifier } from '../devices/machine-access.mjs';
-import { createRemoteDeviceMcpHandler } from '../devices/remote-mcp-handler.mjs';
+import { CHATGPT_MCP_ROUTE, createChatGptReadOnlyBridge, getChatGptResourceMetadataPath,
+  validateIsolatedChatGptBridgeConfig } from '../chatgpt/read-only-bridge.mjs';
 import { validateIsolatedG7RealmConfig } from './isolated-realm.mjs';
 
 const AGENT_PATHS = new Set(['/agent/challenge', '/agent/connect', '/agent/heartbeat',
@@ -53,7 +54,9 @@ async function readBody(req) {
 export async function startIsolatedG7AgentGateway({ config, realmConfig, ownerAuthority,
   trustStore, machineBindingStore, grantStore, router, policySigningKey,
   getTrustRevision, getDeviceApprovalReceipt } = {}) {
-  if (!exact(config, 'hostname,listen,machine,tls') ||
+  if (!exact(config, 'chatgpt,hostname,listen,machine,tls') ||
+      !exact(config.chatgpt, 'resourceMetadataUrl') ||
+      typeof config.chatgpt.resourceMetadataUrl !== 'string' ||
       typeof config.hostname !== 'string' || !/^[a-z0-9.-]{6,255}$/.test(config.hostname) ||
       !config.hostname.includes('.') || config.hostname === 'localhost' || config.hostname.endsWith('.local') ||
       !exact(config.listen, 'host,port') || config.listen.host !== '127.0.0.1' ||
@@ -83,6 +86,9 @@ export async function startIsolatedG7AgentGateway({ config, realmConfig, ownerAu
   }
 
   const realm = validateIsolatedG7RealmConfig(realmConfig, { requireExisting: true });
+  const chatgptOAuth = Object.freeze({issuer:ownerAuthority.issuer,resource:ownerAuthority.resource,
+    resourceMetadataUrl:config.chatgpt.resourceMetadataUrl});
+  validateIsolatedChatGptBridgeConfig(chatgptOAuth,ownerAuthority);
   if (config.listen.host !== realm.listen.host || config.listen.port !== realm.listen.port) {
     throw Object.assign(new Error('Isolated Gateway listener must match the realm configuration'), {
       code: 'REALM_LISTENER_MISMATCH',
@@ -138,21 +144,19 @@ export async function startIsolatedG7AgentGateway({ config, realmConfig, ownerAu
     } });
   const authorizeDevice = createDurableOwnerDeviceAuthorizer({
     auditDirectory: realm.paths.auditDirectory, trustDirectory: realm.paths.trustDirectory });
-  const mcpHandler = createRemoteDeviceMcpHandler({
-    resolveOwner: req => {
-      const header = req.headers.authorization;
-      if (typeof header !== 'string' || !/^Bearer [A-Za-z0-9._~-]{30,16384}$/.test(header)) return null;
-      return ownerAuthority.verifyReadPrincipal(header.slice(7));
-    }, authorizeOwner: owner => ownerAuthority.isCurrentReadPrincipal(owner),
+  const mcpHandler = createChatGptReadOnlyBridge({oauth:chatgptOAuth,ownerAuthority,
     deviceRegistry: trustStore.registry, trustStore, router, authorizeDevice,
     grantStore, policySigningKey: policyPrivateKey, getTrustRevision,
-    getDeviceApprovalReceipt, allowedTools: ['read_file'],
+    getDeviceApprovalReceipt,
   });
+  const resourceMetadataPath=getChatGptResourceMetadataPath(chatgptOAuth.resource);
 
   const handle = async (req, res) => {
-    if (req.url === '/mcp') {
-      if (req.headers['cf-access-jwt-assertion'] || req.headers['x-vpsc-owner-id'] ||
-          req.headers['x-vpsc-owner-digest']) return reply(res, 403, { error: 'Unsupported Owner identity header' });
+    if (req.url === resourceMetadataPath || req.url === CHATGPT_MCP_ROUTE || !AGENT_PATHS.has(req.url)) {
+      if (req.url !== resourceMetadataPath && (req.headers['cf-access-jwt-assertion'] ||
+          req.headers['x-vpsc-owner-id'] || req.headers['x-vpsc-owner-digest'])) {
+        return reply(res, 403, { error: 'Unsupported Owner identity header' });
+      }
       return mcpHandler(req, res);
     }
     if (!AGENT_PATHS.has(req.url)) return reply(res, 404, { error: 'Not found' });

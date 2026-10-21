@@ -1,5 +1,11 @@
 # G7 I8A ChatGPT bridge (opt-in, not activated)
 
+The integrated I8J isolated-realm endpoint is documented in
+[`docs/G7-I8J-CHATGPT-MCP-INTEGRATION.md`](../../docs/G7-I8J-CHATGPT-MCP-INTEGRATION.md).
+It mounts `POST /chatgpt/mcp` inside the isolated Gateway and does not expose
+the legacy `/mcp` route as a ChatGPT alias. The historical `chatgptBridge`
+configuration below describes the earlier standalone bridge contract only.
+
 The staging Gateway mounts this route only when its private configuration has a
 `chatgptBridge` object. With the object absent, `/chatgpt/mcp` and the protected
 resource metadata route return 404. The example staging config deliberately

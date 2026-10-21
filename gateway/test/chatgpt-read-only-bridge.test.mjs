@@ -5,7 +5,8 @@ import { generateKeyPairSync, sign } from 'node:crypto';
 import { ownerIdentityDigest } from '../dashboard/owner-identity.mjs';
 import { createChatGptReadOnlyBridge, CHATGPT_MCP_ROUTE,
   CHATGPT_RESOURCE_METADATA_PATH, getChatGptResourceMetadataPath,
-  validateChatGptBridgeConfig } from '../chatgpt/read-only-bridge.mjs';
+  validateChatGptBridgeConfig, validateIsolatedChatGptBridgeConfig }
+  from '../chatgpt/read-only-bridge.mjs';
 
 const OWNER={issuer:'https://g7-owner-test.cloudflareaccess.com',subject:'test-owner-subject'};
 const STAGING_OWNER={issuer:'https://g7-owner-staging.cloudflareaccess.com',subject:'synthetic-owner'};
@@ -93,6 +94,19 @@ function rpc(id,method,params){return {jsonrpc:'2.0',id,method,...(params===unde
 function readCall(id,path='/approved/proof.txt',deviceId=DEVICE,session='chat-session-i8a'){
   return rpc(id,'tools/call',{name:'read_file',arguments:{deviceId,path},_meta:{'openai/session':session}});
 }
+
+test('isolated ChatGPT bridge metadata path and OAuth authority stay pinned to the realm',()=>{
+  const x={issuer:'https://auth.i8j.example.test',resource:'https://g7-i8j.example.test/chatgpt/mcp',
+    resourceMetadataUrl:'https://g7-i8j.example.test/.well-known/oauth-protected-resource/chatgpt/mcp'};
+  const authority={issuer:x.issuer,resource:x.resource,authorizedClientIds:['chatgpt-i8j-client'],
+    verifyReadPrincipal(){}};
+  assert.equal(validateIsolatedChatGptBridgeConfig(x,authority),true);
+  assert.throws(()=>validateIsolatedChatGptBridgeConfig({...x,issuer:'https://other.example.test'},authority));
+  assert.throws(()=>validateIsolatedChatGptBridgeConfig({...x,resource:'https://other.example.test/chatgpt/mcp'},authority));
+  assert.throws(()=>validateIsolatedChatGptBridgeConfig({...x,
+    resourceMetadataUrl:'https://g7-i8j.example.test/.well-known/oauth-protected-resource/wrong'},authority));
+  assert.throws(()=>validateIsolatedChatGptBridgeConfig(x,{...authority,authorizedClientIds:[]}));
+});
 
 test('I8A exposes unauthenticated MCP discovery, one read-only tool and protected-resource metadata',async t=>{
   const x=await setup(t);
@@ -186,6 +200,7 @@ test('I8A rejects missing, forged, stale, wrong-audience, wrong-client and insuf
     {accessToken:x.token({aud:'https://other.example.test/mcp'})},
     {accessToken:x.token({client_id:'unregistered-client'})},
     {accessToken:x.token({scope:'profile'})},
+    {accessToken:x.token({scope:'g7.read g7.owner'})},
     {accessToken:x.token({nbf:Math.floor(Date.now()/1000)+120})},
     {accessToken:x.token({sub:'another-chatgpt-user'})},
   ];
